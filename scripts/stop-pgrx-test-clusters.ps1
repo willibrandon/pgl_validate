@@ -6,17 +6,23 @@ param(
 $ErrorActionPreference = 'Stop'
 
 $workspace = (Resolve-Path -LiteralPath $Root).Path
-$target = Join-Path $workspace 'target\test-pgdata'
-$targetSlash = $target -replace '\\', '/'
-$targetBackslash = $target -replace '/', '\'
+$targets = @(
+    'target\test-pgdata',
+    'target\pglogical-test-pgdata',
+    'target\diag-pgdata'
+) | ForEach-Object { Join-Path $workspace $_ }
 
-$patterns = @(
-    [regex]::Escape($targetSlash),
-    [regex]::Escape($targetBackslash),
-    'target[/\\]test-pgdata'
+$patterns = foreach ($target in $targets) {
+    [regex]::Escape(($target -replace '\\', '/'))
+    [regex]::Escape(($target -replace '/', '\'))
+}
+$patterns += @(
+    'target[/\\]test-pgdata',
+    'target[/\\]pglogical-test-pgdata',
+    'target[/\\]diag-pgdata'
 )
 
-$processNames = @('postgres.exe', 'pg_ctl.exe', 'cmd.exe')
+$processNames = @('postgres.exe', 'pg_ctl.exe', 'cmd.exe', 'psql.exe', 'initdb.exe')
 $procs = Get-CimInstance Win32_Process | Where-Object {
     $commandLine = $_.CommandLine
     ($_.Name -in $processNames) -and
@@ -28,11 +34,29 @@ foreach ($proc in $procs) {
     Stop-Process -Id $proc.ProcessId -Force -ErrorAction SilentlyContinue
 }
 
-if ($RemoveData -and (Test-Path -LiteralPath $target)) {
-    $resolvedTarget = (Resolve-Path -LiteralPath $target).Path
-    if (-not $resolvedTarget.StartsWith($workspace, [System.StringComparison]::OrdinalIgnoreCase)) {
-        throw "Refusing to remove path outside workspace: $resolvedTarget"
-    }
+Start-Sleep -Milliseconds 500
 
-    Remove-Item -LiteralPath $resolvedTarget -Recurse -Force
+if ($RemoveData) {
+    foreach ($target in $targets) {
+        if (Test-Path -LiteralPath $target) {
+            $resolvedTarget = (Resolve-Path -LiteralPath $target).Path
+            if (-not $resolvedTarget.StartsWith($workspace, [System.StringComparison]::OrdinalIgnoreCase)) {
+                throw "Refusing to remove path outside workspace: $resolvedTarget"
+            }
+
+            for ($attempt = 1; $attempt -le 20; $attempt++) {
+                try {
+                    Remove-Item -LiteralPath $resolvedTarget -Recurse -Force
+                    break
+                }
+                catch {
+                    if ($attempt -eq 20) {
+                        throw
+                    }
+
+                    Start-Sleep -Milliseconds 500
+                }
+            }
+        }
+    }
 }

@@ -1750,6 +1750,68 @@ mod tests {
             &format!("DROP DATABASE IF EXISTS {peer_db} WITH (FORCE)"),
         );
     }
+
+    #[pg_test]
+    fn report_and_metrics_include_validation_state() {
+        let backend_pid = Spi::get_one::<i32>("SELECT pg_backend_pid()")
+            .unwrap()
+            .unwrap();
+        let table_name = identifier(&format!("pgl_validate_report_{backend_pid}"));
+
+        Spi::run(&format!(
+            "
+            CREATE TABLE public.{table_name}(id int PRIMARY KEY, value text);
+            INSERT INTO public.{table_name} VALUES (1, 'same');
+            "
+        ))
+        .unwrap();
+
+        let run_id = Spi::get_one::<i64>(&format!(
+            "
+            SELECT (pgl_validate.compare_table('public.{table_name}'::regclass)).run_id
+            "
+        ))
+        .unwrap()
+        .unwrap();
+
+        let report_shape = Spi::get_one::<String>(&format!(
+            "
+            WITH report AS (
+                SELECT pgl_validate.report({run_id}) AS doc
+            )
+            SELECT concat_ws(
+                ';',
+                (doc ? 'run')::text,
+                (doc ? 'tables')::text,
+                (doc ? 'participants')::text,
+                (doc ? 'fence')::text,
+                jsonb_array_length(doc->'tables')::text,
+                COALESCE(doc->'tables'->0->'result'->>'verdict', '<null>')
+            )
+            FROM report
+            "
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(report_shape, "true;true;true;true;1;match");
+
+        let missing_report =
+            Spi::get_one::<String>("SELECT pgl_validate.report(-9223372036854775808)->>'error'")
+                .unwrap()
+                .unwrap();
+        assert_eq!(missing_report, "run not found");
+
+        let metrics_ok = Spi::get_one::<bool>(
+            "
+            SELECT pgl_validate.metrics() ? 'runs'
+               AND pgl_validate.metrics() ? 'tables'
+               AND pgl_validate.metrics()->'tables'->'by_verdict' ? 'match'
+            ",
+        )
+        .unwrap()
+        .unwrap();
+        assert!(metrics_ok);
+    }
 }
 
 #[cfg(test)]

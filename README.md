@@ -45,7 +45,8 @@ For extension validation, use pgrx:
 ```
 
 `scripts\test-pgrx.ps1` always stops repo-local pgrx test clusters in
-`target\test-pgdata`, even when a pg_test fails.
+`target\test-pgdata`, `target\pglogical-test-pgdata`, and
+`target\diag-pgdata`, even when a pg_test fails.
 
 pglogical is a required part of the test environment. Install the packaged
 release into the target pgrx PostgreSQL; do not build from a local pglogical
@@ -66,5 +67,5 @@ bindgen error means that environment is missing from the cargo process.
 The repository is being built from the design outward. The current slice covers
 catalog DDL, row digest framing, LtHash state, pglogical contract discovery,
 edge-specific barrier fencing, pglogical row-filter intersection semantics,
-sequence-window validation, and fenced paths exercised against a real pglogical
-subscription.
+sequence-window validation, structured JSON reports, and fenced paths exercised
+against a real pglogical subscription.
