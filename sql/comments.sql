@@ -79,6 +79,8 @@ COMMENT ON FUNCTION pgl_validate.compare_table(regclass, text[], jsonb) IS
     'Run the current table comparison path and return the persisted table verdict.';
 COMMENT ON FUNCTION pgl_validate.compare_sequence(regclass, text[], jsonb) IS
     'Validate one sequence against peers using the pglogical sequence buffer-window contract.';
+COMMENT ON FUNCTION pgl_validate.generate_repair(bigint, text) IS
+    'Generate reviewable node-labeled DML and sequence setval statements for confirmed divergences using the selected authoritative node.';
 COMMENT ON FUNCTION pgl_validate.run_status(bigint) IS
     'Return the persisted state for a validation run.';
 COMMENT ON FUNCTION pgl_validate.divergences(bigint) IS
@@ -109,7 +111,7 @@ COMMENT ON FUNCTION pgl_validate.row_filter_tree_is_immutable(text) IS
 COMMENT ON FUNCTION pgl_validate.remote_checksum(text, text, integer, integer, integer) IS
     'Execute generated checksum SQL on a named peer DSN via libpq with bounded connect, statement, and lock timeouts.';
 COMMENT ON FUNCTION pgl_validate.remote_localize_rows(text, text, integer, integer, integer) IS
-    'Execute generated row-localization SQL on a named peer DSN via libpq with bounded connect, statement, and lock timeouts.';
+    'Execute generated row-localization SQL on a named peer DSN via libpq with bounded connect, statement, and lock timeouts, returning key, digest, and row JSON.';
 COMMENT ON FUNCTION pgl_validate.remote_sequence_value(text, text, integer, integer, integer) IS
     'Execute generated sequence SQL on a named peer DSN via libpq with bounded connect, statement, and lock timeouts.';
 COMMENT ON FUNCTION pgl_validate.remote_inject_barrier(text, integer, integer, integer) IS

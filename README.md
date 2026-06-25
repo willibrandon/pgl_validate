@@ -68,5 +68,5 @@ The repository is being built from the design outward. The current slice covers
 catalog DDL, row digest framing, LtHash state, pglogical contract discovery,
 edge-specific barrier fencing, pglogical row-filter intersection semantics,
 sequence-window validation, multi-table and replication-set compare
-orchestration, structured JSON reports, and fenced paths exercised against a
-real pglogical subscription.
+orchestration, structured JSON reports, reviewable repair generation, and
+fenced paths exercised against a real pglogical subscription.

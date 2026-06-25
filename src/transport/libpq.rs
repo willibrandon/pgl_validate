@@ -51,6 +51,8 @@ pub(crate) struct LocalizedRowDigest {
     pub(crate) key_bytes: Vec<u8>,
     /// Canonical row digest bytes for the replicated column set.
     pub(crate) row_digest: Vec<u8>,
+    /// JSON text representation of the localized row.
+    pub(crate) row_json: String,
 }
 
 /// Last value fetched from a remote sequence.
@@ -477,15 +479,16 @@ pub(crate) fn fetch_localized_rows(
     let wrapped_sql = format!(
         "SELECT q.key_text, \
                 encode(q.key_bytes, 'hex'), \
-                encode(q.row_digest, 'hex') \
+                encode(q.row_digest, 'hex'), \
+                q.row_json \
          FROM ({localization_sql}) AS q"
     );
 
     let result = conn.exec(&wrapped_sql)?;
     result.require_status(PGRES_TUPLES_OK)?;
-    if result.nfields() != 3 {
+    if result.nfields() != 4 {
         return Err(format!(
-            "remote localization returned {} column(s), expected 3",
+            "remote localization returned {} column(s), expected 4",
             result.nfields()
         ));
     }
@@ -496,6 +499,7 @@ pub(crate) fn fetch_localized_rows(
             key_text: result.value(row, 0)?,
             key_bytes: parse_hex(&result.value(row, 1)?)?,
             row_digest: parse_hex(&result.value(row, 2)?)?,
+            row_json: result.value(row, 3)?,
         });
     }
 

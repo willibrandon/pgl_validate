@@ -946,7 +946,7 @@ BEGIN
      AND NOT a.attisdropped;
 
     RETURN format(
-        'SELECT jsonb_build_object(%s)::text AS key_text, pgl_validate.row_digest(%L::int[], %s) AS key_bytes, pgl_validate.row_digest(%L::int[], %s) AS row_digest FROM %s t WHERE %s ORDER BY %s',
+        'SELECT jsonb_build_object(%s)::text AS key_text, pgl_validate.row_digest(%L::int[], %s) AS key_bytes, pgl_validate.row_digest(%L::int[], %s) AS row_digest, to_jsonb(t)::text AS row_json FROM %s t WHERE %s ORDER BY %s',
         key_text_args,
         key_enc_modes::text,
         key_digest_args,
@@ -1627,12 +1627,13 @@ BEGIN
             node       text NOT NULL,
             key_text   text NOT NULL,
             key_bytes  bytea NOT NULL,
-            row_digest bytea NOT NULL
+            row_digest bytea NOT NULL,
+            row_json   jsonb NOT NULL
         ) ON COMMIT DROP;
 
         EXECUTE format(
-            'INSERT INTO pg_temp.pgl_validate_localized_sample(sample, node, key_text, key_bytes, row_digest)
-             SELECT %L, %L, q.key_text, q.key_bytes, q.row_digest FROM (%s) AS q',
+            'INSERT INTO pg_temp.pgl_validate_localized_sample(sample, node, key_text, key_bytes, row_digest, row_json)
+             SELECT %L, %L, q.key_text, q.key_bytes, q.row_digest, q.row_json::jsonb FROM (%s) AS q',
             'A',
             'local',
             localize_sql
@@ -1648,9 +1649,9 @@ BEGIN
             ORDER BY p.name
         LOOP
             INSERT INTO pg_temp.pgl_validate_localized_sample(
-                sample, node, key_text, key_bytes, row_digest
+                sample, node, key_text, key_bytes, row_digest, row_json
             )
-            SELECT 'A', peer_rec.name, r.key_text, r.key_bytes, r.row_digest
+            SELECT 'A', peer_rec.name, r.key_text, r.key_bytes, r.row_digest, r.row_json::jsonb
             FROM pgl_validate.remote_localize_rows(
                 peer_rec.dsn,
                 remote_localize_sql,
@@ -1681,11 +1682,16 @@ BEGIN
                     ELSE 'candidate'
                 END,
                 initial_epoch,
-                NULL
+                jsonb_build_object(
+                    'local', classified.local_row_json,
+                    'peer', classified.peer_row_json
+                )
             FROM (
                 SELECT
                     COALESCE(l.key_text, r.key_text) AS key_text,
                     COALESCE(l.key_bytes, r.key_bytes) AS key_bytes,
+                    l.row_json AS local_row_json,
+                    r.row_json AS peer_row_json,
                     CASE
                         WHEN r.key_bytes IS NULL THEN 'missing_on'
                         WHEN l.key_bytes IS NULL THEN 'extra_on'
@@ -1695,12 +1701,12 @@ BEGIN
                         ELSE NULL
                     END AS classification
                 FROM (
-                    SELECT key_text, key_bytes, row_digest
+                    SELECT key_text, key_bytes, row_digest, row_json
                     FROM pg_temp.pgl_validate_localized_sample
                     WHERE sample = 'A' AND node = 'local'
                 ) l
                 FULL OUTER JOIN (
-                    SELECT key_text, key_bytes, row_digest
+                    SELECT key_text, key_bytes, row_digest, row_json
                     FROM pg_temp.pgl_validate_localized_sample
                     WHERE sample = 'A' AND node = peer_rec.name
                 ) r USING (key_bytes)
@@ -1709,6 +1715,7 @@ BEGIN
             ON CONFLICT (run_id, schema_name, table_name, key_bytes, node) DO UPDATE
             SET classification = EXCLUDED.classification,
                 status = EXCLUDED.status,
+                tuple = EXCLUDED.tuple,
                 detected_epoch = EXCLUDED.detected_epoch,
                 detected_at = now();
         END LOOP;
@@ -1779,8 +1786,8 @@ BEGIN
             END LOOP;
 
             EXECUTE format(
-                'INSERT INTO pg_temp.pgl_validate_localized_sample(sample, node, key_text, key_bytes, row_digest)
-                 SELECT %L, %L, q.key_text, q.key_bytes, q.row_digest FROM (%s) AS q',
+                'INSERT INTO pg_temp.pgl_validate_localized_sample(sample, node, key_text, key_bytes, row_digest, row_json)
+                 SELECT %L, %L, q.key_text, q.key_bytes, q.row_digest, q.row_json::jsonb FROM (%s) AS q',
                 'B',
                 'local',
                 localize_sql
@@ -1797,9 +1804,9 @@ BEGIN
                 ORDER BY p.name
             LOOP
                 INSERT INTO pg_temp.pgl_validate_localized_sample(
-                    sample, node, key_text, key_bytes, row_digest
+                    sample, node, key_text, key_bytes, row_digest, row_json
                 )
-                SELECT 'B', peer_rec.name, r.key_text, r.key_bytes, r.row_digest
+                SELECT 'B', peer_rec.name, r.key_text, r.key_bytes, r.row_digest, r.row_json::jsonb
                 FROM pgl_validate.remote_localize_rows(
                     peer_rec.dsn,
                     remote_localize_sql,
@@ -2278,6 +2285,250 @@ BEGIN
     FROM pgl_validate.sequence_result sr
     WHERE sr.run_id = v_run_id
     ORDER BY sr.schema_name, sr.seq_name, sr.subscriber_node;
+END
+$$;
+
+CREATE FUNCTION pgl_validate.generate_repair(
+    run_id bigint,
+    authoritative text
+)
+RETURNS SETOF text
+LANGUAGE plpgsql
+STABLE
+AS $$
+DECLARE
+    rec record;
+    source_classification text;
+    source_tuple_doc jsonb;
+    source_row jsonb;
+    key_row jsonb;
+    target_node text;
+    action text;
+    rel_sql text;
+    rel_oid regclass;
+    repair_cols text[];
+    update_cols text[];
+    column_list text;
+    select_list text;
+    update_list text;
+    key_predicate text;
+    statement text;
+BEGIN
+    IF authoritative IS NULL OR btrim(authoritative) = '' THEN
+        RAISE EXCEPTION 'authoritative node is required'
+            USING ERRCODE = '22023';
+    END IF;
+
+    IF NOT EXISTS (SELECT 1 FROM pgl_validate.run r WHERE r.run_id = generate_repair.run_id) THEN
+        RAISE EXCEPTION 'validation run % does not exist', generate_repair.run_id
+            USING ERRCODE = '02000';
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pgl_validate.run_participant rp
+        WHERE rp.run_id = generate_repair.run_id
+          AND rp.node = authoritative
+    ) THEN
+        RAISE EXCEPTION 'authoritative node % is not a participant in run %', authoritative, generate_repair.run_id
+            USING ERRCODE = '22023';
+    END IF;
+
+    FOR rec IN
+        SELECT d.run_id, d.schema_name, d.table_name, d.key_bytes, d.classification,
+               d.node, d.tuple, tp.key_cols, tp.att_list, tp.validated_property
+        FROM pgl_validate.divergence d
+        JOIN pgl_validate.table_plan tp
+          ON tp.run_id = d.run_id
+         AND tp.schema_name = d.schema_name
+         AND tp.table_name = d.table_name
+        WHERE d.run_id = generate_repair.run_id
+          AND d.status = 'confirmed'
+          AND tp.validated_property IN ('full','superset','keys_only')
+        ORDER BY d.schema_name, d.table_name, d.key_text, d.node
+    LOOP
+        rel_sql := format('%I.%I', rec.schema_name, rec.table_name);
+        rel_oid := rel_sql::regclass;
+
+        SELECT array_agg(col_name ORDER BY first_ord)
+        INTO repair_cols
+        FROM (
+            SELECT col_name, min(ord) AS first_ord
+            FROM (
+                SELECT col_name, ord
+                FROM unnest(rec.key_cols) WITH ORDINALITY AS k(col_name, ord)
+                UNION ALL
+                SELECT col_name, ord + 10000
+                FROM unnest(rec.att_list) WITH ORDINALITY AS a(col_name, ord)
+            ) requested
+            GROUP BY col_name
+        ) dedup
+        JOIN pg_attribute attr
+          ON attr.attrelid = rel_oid
+         AND attr.attname = dedup.col_name
+         AND attr.attnum > 0
+         AND NOT attr.attisdropped
+         AND attr.attgenerated = '';
+
+        SELECT array_agg(col_name ORDER BY ordinality)
+        INTO update_cols
+        FROM unnest(repair_cols) WITH ORDINALITY AS c(col_name, ordinality)
+        WHERE NOT (col_name = ANY (rec.key_cols));
+
+        SELECT string_agg(format('%I', col_name), ', ' ORDER BY ordinality),
+               string_agg(format('r.%I', col_name), ', ' ORDER BY ordinality)
+        INTO column_list, select_list
+        FROM unnest(repair_cols) WITH ORDINALITY AS c(col_name, ordinality);
+
+        SELECT string_agg(format('%I = r.%I', col_name, col_name), ', ' ORDER BY ordinality)
+        INTO update_list
+        FROM unnest(update_cols) WITH ORDINALITY AS c(col_name, ordinality);
+
+        SELECT string_agg(format('t.%I IS NOT DISTINCT FROM r.%I', col_name, col_name), ' AND ' ORDER BY ordinality)
+        INTO key_predicate
+        FROM unnest(rec.key_cols) WITH ORDINALITY AS c(col_name, ordinality);
+
+        IF repair_cols IS NULL
+           OR rec.key_cols IS NULL
+           OR cardinality(rec.key_cols) = 0
+           OR key_predicate IS NULL THEN
+            RAISE EXCEPTION 'cannot generate repair for %.% without a usable key and repair column set',
+                rec.schema_name, rec.table_name
+                USING ERRCODE = '0A000';
+        END IF;
+
+        source_row := NULL;
+        key_row := NULL;
+        target_node := NULL;
+        action := NULL;
+
+        IF authoritative = 'local' THEN
+            target_node := rec.node;
+            IF rec.classification = 'missing_on' THEN
+                action := 'insert';
+                source_row := rec.tuple->'local';
+                key_row := source_row;
+            ELSIF rec.classification = 'differs' THEN
+                action := 'update';
+                source_row := rec.tuple->'local';
+                key_row := source_row;
+            ELSIF rec.classification = 'extra_on' THEN
+                action := 'delete';
+                key_row := rec.tuple->'peer';
+            END IF;
+        ELSIF rec.node = authoritative THEN
+            target_node := 'local';
+            IF rec.classification = 'missing_on' THEN
+                action := 'delete';
+                key_row := rec.tuple->'local';
+            ELSIF rec.classification = 'extra_on' THEN
+                action := 'insert';
+                source_row := rec.tuple->'peer';
+                key_row := source_row;
+            ELSIF rec.classification = 'differs' THEN
+                action := 'update';
+                source_row := rec.tuple->'peer';
+                key_row := source_row;
+            END IF;
+        ELSE
+            SELECT d.classification, d.tuple
+            INTO source_classification, source_tuple_doc
+            FROM pgl_validate.divergence d
+            WHERE d.run_id = rec.run_id
+              AND d.schema_name = rec.schema_name
+              AND d.table_name = rec.table_name
+              AND d.key_bytes = rec.key_bytes
+              AND d.node = authoritative
+              AND d.status = 'confirmed';
+
+            target_node := rec.node;
+            IF source_tuple_doc IS NULL THEN
+                source_row := rec.tuple->'local';
+            ELSIF source_classification = 'missing_on' THEN
+                source_row := NULL;
+            ELSE
+                source_row := source_tuple_doc->'peer';
+            END IF;
+
+            IF source_row IS NOT NULL AND jsonb_typeof(source_row) = 'object' THEN
+                action := CASE WHEN rec.classification = 'missing_on' THEN 'insert' ELSE 'update' END;
+                key_row := source_row;
+            ELSE
+                action := 'delete';
+                key_row := rec.tuple->'peer';
+            END IF;
+        END IF;
+
+        IF action IN ('insert','update')
+           AND (source_row IS NULL OR jsonb_typeof(source_row) <> 'object') THEN
+            RAISE EXCEPTION 'confirmed divergence %.% key % lacks authoritative tuple data for node %',
+                rec.schema_name, rec.table_name, encode(rec.key_bytes, 'hex'), authoritative
+                USING ERRCODE = '22023';
+        END IF;
+        IF action = 'delete'
+           AND (key_row IS NULL OR jsonb_typeof(key_row) <> 'object') THEN
+            RAISE EXCEPTION 'confirmed divergence %.% key % lacks key tuple data for delete repair',
+                rec.schema_name, rec.table_name, encode(rec.key_bytes, 'hex')
+                USING ERRCODE = '22023';
+        END IF;
+
+        IF action = 'insert' THEN
+            statement := format(
+                '/* target: %s */ INSERT INTO %s (%s) SELECT %s FROM jsonb_populate_record(NULL::%s, %L::jsonb) AS r;',
+                quote_literal(target_node),
+                rel_sql,
+                column_list,
+                select_list,
+                rel_sql,
+                source_row::text
+            );
+        ELSIF action = 'update' THEN
+            IF update_cols IS NULL OR cardinality(update_cols) = 0 THEN
+                CONTINUE;
+            END IF;
+            statement := format(
+                '/* target: %s */ UPDATE %s AS t SET %s FROM jsonb_populate_record(NULL::%s, %L::jsonb) AS r WHERE %s;',
+                quote_literal(target_node),
+                rel_sql,
+                update_list,
+                rel_sql,
+                source_row::text,
+                key_predicate
+            );
+        ELSIF action = 'delete' THEN
+            statement := format(
+                '/* target: %s */ DELETE FROM %s AS t USING jsonb_populate_record(NULL::%s, %L::jsonb) AS r WHERE %s;',
+                quote_literal(target_node),
+                rel_sql,
+                rel_sql,
+                key_row::text,
+                key_predicate
+            );
+        ELSE
+            CONTINUE;
+        END IF;
+
+        RETURN NEXT statement;
+    END LOOP;
+
+    FOR rec IN
+        SELECT sr.*
+        FROM pgl_validate.sequence_result sr
+        WHERE sr.run_id = generate_repair.run_id
+          AND NOT sr.within_contract
+          AND sr.provider_last_value IS NOT NULL
+          AND authoritative IN ('local', sr.provider_node)
+        ORDER BY sr.schema_name, sr.seq_name, sr.subscriber_node
+    LOOP
+        RETURN NEXT format(
+            '/* target: %s */ DO $pgl_validate_repair$ BEGIN PERFORM setval(%L::regclass, %s, true); END $pgl_validate_repair$;',
+            quote_literal(rec.subscriber_node),
+            format('%I.%I', rec.schema_name, rec.seq_name),
+            rec.provider_last_value
+        );
+    END LOOP;
+
+    RETURN;
 END
 $$;
 

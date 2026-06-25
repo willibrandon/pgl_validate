@@ -194,6 +194,7 @@ mod pgl_validate {
             name!(key_text, String),
             name!(key_bytes, Vec<u8>),
             name!(row_digest, Vec<u8>),
+            name!(row_json, String),
         ),
     > {
         let rows = transport::libpq::fetch_localized_rows(
@@ -207,7 +208,7 @@ mod pgl_validate {
 
         TableIterator::new(
             rows.into_iter()
-                .map(|row| (row.key_text, row.key_bytes, row.row_digest)),
+                .map(|row| (row.key_text, row.key_bytes, row.row_digest, row.row_json)),
         )
     }
 
@@ -1124,25 +1125,35 @@ mod tests {
             &format!(
                 "CREATE EXTENSION pgl_validate;
                  CREATE TABLE public.{table_name}(id int PRIMARY KEY, value text);
-                 INSERT INTO public.{table_name} VALUES (1, 'remote');"
+                 INSERT INTO public.{table_name} VALUES
+                     (1, 'remote'),
+                     (2, 'remote-only');"
             ),
         )
         .unwrap();
 
         Spi::run(&format!(
             "CREATE TABLE public.{table_name}(id int PRIMARY KEY, value text);
-             INSERT INTO public.{table_name} VALUES (1, 'local');
+             INSERT INTO public.{table_name} VALUES
+                 (1, 'local'),
+                 (3, 'local-only');
              INSERT INTO pgl_validate.peer(name, dsn, backend)
              VALUES ('remote_diff', {}, 'native');",
             sql_literal(&remote_dsn)
         ))
         .unwrap();
 
-        let verdict_sql = format!(
-            "SELECT (pgl_validate.compare_table({}::regclass)).verdict",
+        let run_sql = format!(
+            "SELECT (pgl_validate.compare_table({}::regclass)).run_id",
             sql_literal(&format!("public.{table_name}"))
         );
-        let verdict = Spi::get_one::<String>(&verdict_sql).unwrap().unwrap();
+        let run_id = Spi::get_one::<i64>(&run_sql).unwrap().unwrap();
+
+        let verdict = Spi::get_one::<String>(&format!(
+            "SELECT verdict FROM pgl_validate.table_result WHERE run_id = {run_id}"
+        ))
+        .unwrap()
+        .unwrap();
         assert_eq!(verdict, "differ");
 
         let remote_rows = Spi::get_one::<i64>(
@@ -1150,16 +1161,57 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(remote_rows, 1);
+        assert_eq!(remote_rows, 2);
 
-        let divergence = Spi::get_one::<String>(
-            "SELECT classification || ';' || status || ';' || node
-             FROM pgl_validate.divergence
-             WHERE node = 'remote_diff'",
-        )
+        let divergence_summary = Spi::get_one::<String>(&format!(
+            "
+            SELECT string_agg(classification || ':' || status, ',' ORDER BY classification)
+            FROM pgl_validate.divergence
+            WHERE run_id = {run_id}
+              AND node = 'remote_diff'
+            "
+        ))
         .unwrap()
         .unwrap();
-        assert_eq!(divergence, "differs;confirmed;remote_diff");
+        assert_eq!(
+            divergence_summary,
+            "differs:confirmed,extra_on:confirmed,missing_on:confirmed"
+        );
+
+        let tuple_values = Spi::get_one::<String>(&format!(
+            "
+            SELECT (d.tuple->'local'->>'value') || ';' || (d.tuple->'peer'->>'value')
+            FROM pgl_validate.divergence d
+            WHERE d.run_id = {run_id}
+              AND d.classification = 'differs'
+            "
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(tuple_values, "local;remote");
+
+        let repair_batch = Spi::get_one::<String>(&format!(
+            "
+            SELECT string_agg(stmt, E'\\n' ORDER BY stmt)
+            FROM pgl_validate.generate_repair({run_id}, 'local') AS stmt
+            "
+        ))
+        .unwrap()
+        .unwrap();
+        assert!(repair_batch.contains("/* target: 'remote_diff' */ UPDATE"));
+        assert!(repair_batch.contains("/* target: 'remote_diff' */ INSERT"));
+        assert!(repair_batch.contains("/* target: 'remote_diff' */ DELETE"));
+
+        crate::transport::libpq::execute_command(&remote_dsn, &repair_batch).unwrap();
+
+        let repaired_verdict_sql = format!(
+            "SELECT (pgl_validate.compare_table({}::regclass)).verdict",
+            sql_literal(&format!("public.{table_name}"))
+        );
+        let repaired_verdict = Spi::get_one::<String>(&repaired_verdict_sql)
+            .unwrap()
+            .unwrap();
+        assert_eq!(repaired_verdict, "match");
 
         let _ = crate::transport::libpq::execute_command(
             &local_dsn,
@@ -1913,6 +1965,50 @@ mod tests {
         );
         let matched = Spi::get_one::<String>(&compare_sql).unwrap().unwrap();
         assert_eq!(matched, "match;true");
+
+        crate::transport::libpq::execute_command(
+            &remote_dsn,
+            &format!(
+                "DO $$
+                 BEGIN
+                     PERFORM setval('public.{sequence_name}'::regclass, 9, true);
+                 END
+                 $$;"
+            ),
+        )
+        .unwrap();
+        let behind_sql = format!(
+            "
+            SELECT run_id::text || ';' || verdict || ';' || within_contract::text
+            FROM pgl_validate.compare_sequence(
+                'public.{sequence_name}'::regclass,
+                ARRAY['remote_sequence'],
+                '{{\"sequence_buffer_multiplier\":2}}'::jsonb
+            )
+            "
+        );
+        let behind = Spi::get_one::<String>(&behind_sql).unwrap().unwrap();
+        let (behind_run_id, behind_result) = behind
+            .split_once(';')
+            .expect("sequence result should include run id");
+        assert_eq!(behind_result, "behind;false");
+
+        let sequence_repair = Spi::get_one::<String>(&format!(
+            "
+            SELECT string_agg(stmt, E'\\n' ORDER BY stmt)
+            FROM pgl_validate.generate_repair({behind_run_id}::bigint, 'local') AS stmt
+            "
+        ))
+        .unwrap()
+        .unwrap();
+        assert!(
+            sequence_repair.contains("/* target: 'remote_sequence' */ DO $pgl_validate_repair$")
+        );
+        assert!(sequence_repair.contains(", 10, true)"));
+        crate::transport::libpq::execute_command(&remote_dsn, &sequence_repair).unwrap();
+
+        let repaired_sequence = Spi::get_one::<String>(&compare_sql).unwrap().unwrap();
+        assert_eq!(repaired_sequence, "match;true");
 
         crate::transport::libpq::execute_command(
             &remote_dsn,
