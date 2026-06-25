@@ -588,6 +588,61 @@ SELECT EXISTS (
         throw 'pglogical filtered-table presence difference was not recorded as advisory'
     }
 
+    Write-Step 'Validating pglogical sequence buffer-window semantics'
+    Invoke-Sql -Database 'provider' -Sql @"
+CREATE SEQUENCE public.account_seq CACHE 5;
+SELECT pglogical.replication_set_add_sequence(
+    'default',
+    'public.account_seq'::regclass,
+    true
+);
+"@ | Out-Null
+    Invoke-Sql -Database 'target' -Sql 'CREATE SEQUENCE public.account_seq CACHE 5' | Out-Null
+    Invoke-Sql -Database 'provider' -Sql @"
+SELECT setval('public.account_seq'::regclass, 10, true);
+SELECT pglogical.synchronize_sequence('public.account_seq'::regclass);
+"@ | Out-Null
+    Wait-SqlEquals `
+        -Database 'target' `
+        -Sql 'SELECT (last_value >= 10)::text FROM public.account_seq' `
+        -Expected 'true' `
+        -TimeoutSeconds $TimeoutSeconds
+
+    $sequenceVerdict = Invoke-Sql -Database 'provider' -Sql @"
+SELECT verdict || ';' || within_contract::text
+FROM pgl_validate.compare_sequence(
+    'public.account_seq'::regclass,
+    ARRAY['target'],
+    jsonb_build_object(
+        'provider_dsn', $providerDsnSql,
+        'provider_node', 'provider',
+        'fence_timeout_ms', 30000,
+        'fence_poll_interval_ms', 100
+    )
+)
+"@
+    if ($sequenceVerdict -ne 'match;true') {
+        throw "unexpected sequence compare result: $sequenceVerdict"
+    }
+
+    Invoke-Sql -Database 'target' -Sql "SELECT setval('public.account_seq'::regclass, 1, true)" | Out-Null
+    $sequenceBehind = Invoke-Sql -Database 'provider' -Sql @"
+SELECT verdict || ';' || within_contract::text
+FROM pgl_validate.compare_sequence(
+    'public.account_seq'::regclass,
+    ARRAY['target'],
+    jsonb_build_object(
+        'provider_dsn', $providerDsnSql,
+        'provider_node', 'provider',
+        'fence_timeout_ms', 30000,
+        'fence_poll_interval_ms', 100
+    )
+)
+"@
+    if ($sequenceBehind -ne 'behind;false') {
+        throw "subscriber-behind sequence drift was not detected: $sequenceBehind"
+    }
+
     Write-Step 'Creating subscriber-side drift and confirming key-level divergence'
     Invoke-Sql -Database 'target' -Sql "UPDATE public.accounts SET value = 'target-drift' WHERE id = 1" | Out-Null
     $driftVerdict = Invoke-Sql -Database 'provider' -Sql @"

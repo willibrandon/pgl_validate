@@ -962,6 +962,31 @@ BEGIN
 END
 $$;
 
+-- Generate the planner-visible SQL used to read a sequence last_value on each
+-- participant. The returned SQL is safe to send to a peer with the same schema.
+CREATE FUNCTION pgl_validate.plan_sequence_sql(seq regclass)
+RETURNS text
+LANGUAGE plpgsql
+STABLE
+AS $$
+DECLARE
+    seq_sql text;
+BEGIN
+    SELECT format('%I.%I', n.nspname, c.relname)
+    INTO seq_sql
+    FROM pg_class c
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE c.oid = seq
+      AND c.relkind = 'S';
+
+    IF seq_sql IS NULL THEN
+        RAISE EXCEPTION 'relation % is not a sequence', seq;
+    END IF;
+
+    RETURN format('SELECT last_value::bigint AS last_value FROM %s', seq_sql);
+END
+$$;
+
 -- First executable comparison path: compute and persist the local node's table
 -- checksum using the same generated SQL that the coordinator will send to
 -- remote peers. Multi-peer transport layers build on this catalog contract.
@@ -1733,6 +1758,291 @@ BEGIN
       AND node = 'local';
 
     RETURN result_row;
+END
+$$;
+
+CREATE FUNCTION pgl_validate.compare_sequence(
+    sequence_name regclass,
+    peers text[] DEFAULT NULL,
+    options jsonb DEFAULT '{}'
+)
+RETURNS SETOF pgl_validate.sequence_result
+LANGUAGE plpgsql
+VOLATILE
+AS $$
+DECLARE
+    v_run_id bigint;
+    v_schema_name text;
+    v_seq_name text;
+    peer_names text[];
+    missing_peers text[];
+    peer_rec record;
+    remote_seq_rec record;
+    subscription_rec record;
+    fence_rec pgl_validate.fence_attempt;
+    provider_dsn text := NULLIF(options->>'provider_dsn', '');
+    provider_node text := COALESCE(NULLIF(options->>'provider_node', ''), 'local');
+    fence_timeout_ms int := COALESCE((NULLIF(options->>'fence_timeout_ms', ''))::int, 300000);
+    fence_poll_interval_ms int := COALESCE((NULLIF(options->>'fence_poll_interval_ms', ''))::int, 100);
+    buffer_multiplier int := COALESCE((NULLIF(options->>'sequence_buffer_multiplier', ''))::int, 2);
+    edge_seq int := 0;
+    sequence_sql text;
+    provider_last_value bigint;
+    subscriber_last_value bigint;
+    cache_size int;
+    window_max numeric;
+    verdict text;
+    within_contract boolean;
+BEGIN
+    SELECT n.nspname, c.relname
+    INTO v_schema_name, v_seq_name
+    FROM pg_class c
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE c.oid = sequence_name
+      AND c.relkind = 'S';
+
+    IF v_schema_name IS NULL THEN
+        RAISE EXCEPTION 'relation % is not a sequence', sequence_name;
+    END IF;
+    IF fence_timeout_ms <= 0 THEN
+        RAISE EXCEPTION 'fence_timeout_ms must be greater than zero';
+    END IF;
+    IF fence_poll_interval_ms <= 0 THEN
+        RAISE EXCEPTION 'fence_poll_interval_ms must be greater than zero';
+    END IF;
+    IF buffer_multiplier <= 0 THEN
+        RAISE EXCEPTION 'sequence_buffer_multiplier must be greater than zero';
+    END IF;
+
+    IF peers IS NULL OR cardinality(peers) = 0 THEN
+        SELECT COALESCE(array_agg(p.name ORDER BY p.name), ARRAY[]::text[])
+        INTO peer_names
+        FROM pgl_validate.peer p;
+    ELSE
+        SELECT array_agg(DISTINCT requested.peer_name ORDER BY requested.peer_name)
+        INTO peer_names
+        FROM unnest(peers) AS requested(peer_name);
+
+        SELECT array_agg(requested.peer_name ORDER BY requested.peer_name)
+        INTO missing_peers
+        FROM unnest(peer_names) AS requested(peer_name)
+        LEFT JOIN pgl_validate.peer p ON p.name = requested.peer_name
+        WHERE p.name IS NULL;
+
+        IF missing_peers IS NOT NULL THEN
+            RAISE EXCEPTION 'unknown pgl_validate peer(s): %', array_to_string(missing_peers, ', ');
+        END IF;
+    END IF;
+
+    INSERT INTO pgl_validate.run(status, options, tables_total)
+    VALUES ('running', options, 0)
+    RETURNING pgl_validate.run.run_id INTO v_run_id;
+
+    INSERT INTO pgl_validate.run_participant(run_id, node, role, backend, pg_version, status)
+    VALUES (v_run_id, 'local', 'coordinator', 'pglogical', current_setting('server_version_num')::int, 'connected');
+
+    IF EXISTS (
+        SELECT 1
+        FROM pgl_validate.peer p
+        WHERE p.name = ANY (peer_names)
+          AND p.backend = 'pglogical'
+    ) THEN
+        IF provider_dsn IS NULL THEN
+            RAISE EXCEPTION
+                'options.provider_dsn is required when comparing pglogical peers'
+                USING ERRCODE = '0A000';
+        END IF;
+
+        INSERT INTO pgl_validate.fence_epoch(run_id, epoch_seq)
+        VALUES (v_run_id, 1);
+
+        UPDATE pgl_validate.run
+        SET status = 'fencing'
+        WHERE pgl_validate.run.run_id = v_run_id;
+
+        FOR peer_rec IN
+            SELECT p.name, p.dsn, p.backend, p.subscription_name,
+                   p.connect_timeout_seconds,
+                   p.statement_timeout_ms,
+                   p.lock_timeout_ms
+            FROM pgl_validate.peer p
+            WHERE p.name = ANY (peer_names)
+              AND p.backend = 'pglogical'
+            ORDER BY p.name
+        LOOP
+            IF peer_rec.subscription_name IS NULL THEN
+                RAISE EXCEPTION
+                    'pglogical peer % requires subscription_name for exact barrier fencing',
+                    peer_rec.name
+                    USING ERRCODE = '0A000';
+            END IF;
+
+            SELECT *
+            INTO subscription_rec
+            FROM pgl_validate.remote_pglogical_subscription_status(
+                peer_rec.dsn,
+                peer_rec.subscription_name::text,
+                peer_rec.connect_timeout_seconds,
+                peer_rec.statement_timeout_ms,
+                peer_rec.lock_timeout_ms
+            );
+
+            IF subscription_rec.status <> 'replicating' THEN
+                RAISE EXCEPTION
+                    'pglogical peer % subscription % is %, not replicating',
+                    peer_rec.name,
+                    peer_rec.subscription_name,
+                    subscription_rec.status
+                    USING ERRCODE = '57014';
+            END IF;
+
+            IF NOT (subscription_rec.replication_sets_json::jsonb ? 'pgl_validate_barrier') THEN
+                RAISE EXCEPTION
+                    'pglogical peer % subscription % does not include pgl_validate_barrier',
+                    peer_rec.name,
+                    peer_rec.subscription_name
+                    USING ERRCODE = '0A000';
+            END IF;
+
+            edge_seq := edge_seq + 1;
+            SELECT *
+            INTO fence_rec
+            FROM pgl_validate.fence_pglogical_edge(
+                v_run_id,
+                1,
+                edge_seq,
+                provider_node,
+                peer_rec.name,
+                provider_dsn,
+                peer_rec.dsn,
+                peer_rec.subscription_name::text,
+                subscription_rec.slot_name,
+                subscription_rec.slot_name,
+                ARRAY['pgl_validate_barrier'],
+                peer_rec.connect_timeout_seconds,
+                peer_rec.statement_timeout_ms,
+                peer_rec.lock_timeout_ms,
+                fence_timeout_ms,
+                fence_poll_interval_ms
+            );
+
+            IF fence_rec.status <> 'converged' THEN
+                RAISE EXCEPTION
+                    'pglogical peer % failed to converge barrier fence: %',
+                    peer_rec.name,
+                    fence_rec.status
+                    USING ERRCODE = '57014';
+            END IF;
+        END LOOP;
+    END IF;
+
+    UPDATE pgl_validate.run
+    SET status = 'running'
+    WHERE pgl_validate.run.run_id = v_run_id;
+
+    sequence_sql := pgl_validate.plan_sequence_sql(sequence_name);
+    EXECUTE sequence_sql INTO provider_last_value;
+
+    IF to_regclass('pglogical.sequence_state') IS NOT NULL THEN
+        SELECT COALESCE(ss.cache_size, ps.cache_size, 1)::int
+        INTO cache_size
+        FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        LEFT JOIN pglogical.sequence_state ss ON ss.seqoid = c.oid
+        LEFT JOIN pg_sequences ps
+          ON ps.schemaname = n.nspname
+         AND ps.sequencename = c.relname
+        WHERE c.oid = sequence_name;
+    ELSE
+        SELECT COALESCE(ps.cache_size, 1)::int
+        INTO cache_size
+        FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        LEFT JOIN pg_sequences ps
+          ON ps.schemaname = n.nspname
+         AND ps.sequencename = c.relname
+        WHERE c.oid = sequence_name;
+    END IF;
+
+    cache_size := GREATEST(COALESCE(cache_size, 1), 1);
+    window_max := provider_last_value::numeric + (buffer_multiplier::numeric * cache_size::numeric);
+
+    FOR peer_rec IN
+        SELECT p.name, p.dsn, p.backend,
+               p.connect_timeout_seconds,
+               p.statement_timeout_ms,
+               p.lock_timeout_ms
+        FROM pgl_validate.peer p
+        WHERE p.name = ANY (peer_names)
+        ORDER BY p.name
+    LOOP
+        remote_seq_rec := NULL;
+        subscriber_last_value := NULL;
+
+        BEGIN
+            SELECT r.pg_version, r.last_value
+            INTO remote_seq_rec
+            FROM pgl_validate.remote_sequence_value(
+                peer_rec.dsn,
+                sequence_sql,
+                peer_rec.connect_timeout_seconds,
+                peer_rec.statement_timeout_ms,
+                peer_rec.lock_timeout_ms
+            ) AS r;
+
+            subscriber_last_value := remote_seq_rec.last_value;
+
+            IF subscriber_last_value < provider_last_value THEN
+                verdict := 'behind';
+                within_contract := false;
+            ELSIF subscriber_last_value::numeric > window_max THEN
+                verdict := 'ahead_of_window';
+                within_contract := false;
+            ELSE
+                verdict := 'match';
+                within_contract := true;
+            END IF;
+        EXCEPTION WHEN others THEN
+            subscriber_last_value := NULL;
+            verdict := 'error';
+            within_contract := false;
+        END;
+
+        INSERT INTO pgl_validate.run_participant(
+            run_id, node, role, backend, pg_version, dsn_ref, status
+        )
+        VALUES (
+            v_run_id, peer_rec.name, 'participant', peer_rec.backend,
+            COALESCE(remote_seq_rec.pg_version, current_setting('server_version_num')::int),
+            peer_rec.name, 'done'
+        )
+        ON CONFLICT (run_id, node) DO NOTHING;
+
+        INSERT INTO pgl_validate.sequence_result(
+            run_id, schema_name, seq_name, provider_node, provider_last_value,
+            subscriber_node, subscriber_last_value, cache_size, within_contract, verdict
+        )
+        VALUES (
+            v_run_id, v_schema_name, v_seq_name, provider_node, provider_last_value,
+            peer_rec.name, subscriber_last_value, cache_size, within_contract, verdict
+        );
+    END LOOP;
+
+    UPDATE pgl_validate.run
+    SET status = 'completed',
+        finished_at = now()
+    WHERE pgl_validate.run.run_id = v_run_id;
+
+    UPDATE pgl_validate.run_participant
+    SET status = 'done'
+    WHERE pgl_validate.run_participant.run_id = v_run_id
+      AND node = 'local';
+
+    RETURN QUERY
+    SELECT sr.*
+    FROM pgl_validate.sequence_result sr
+    WHERE sr.run_id = v_run_id
+    ORDER BY sr.schema_name, sr.seq_name, sr.subscriber_node;
 END
 $$;
 

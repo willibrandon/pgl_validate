@@ -71,8 +71,12 @@ COMMENT ON FUNCTION pgl_validate.plan_chunk_sql(regclass, text[], bytea, bytea, 
     'Generate planner-visible SQL for a table chunk checksum.';
 COMMENT ON FUNCTION pgl_validate.plan_localize_sql(regclass, text[], text[], text) IS
     'Generate planner-visible SQL for key and row-digest enumeration during divergence localization.';
+COMMENT ON FUNCTION pgl_validate.plan_sequence_sql(regclass) IS
+    'Generate planner-visible SQL for reading a sequence last_value on a participant.';
 COMMENT ON FUNCTION pgl_validate.compare_table(regclass, text[], jsonb) IS
     'Run the current table comparison path and return the persisted table verdict.';
+COMMENT ON FUNCTION pgl_validate.compare_sequence(regclass, text[], jsonb) IS
+    'Validate one sequence against peers using the pglogical sequence buffer-window contract.';
 COMMENT ON FUNCTION pgl_validate.run_status(bigint) IS
     'Return the persisted state for a validation run.';
 COMMENT ON FUNCTION pgl_validate.divergences(bigint) IS
@@ -100,6 +104,8 @@ COMMENT ON FUNCTION pgl_validate.remote_checksum(text, text, integer, integer, i
     'Execute generated checksum SQL on a named peer DSN via libpq with bounded connect, statement, and lock timeouts.';
 COMMENT ON FUNCTION pgl_validate.remote_localize_rows(text, text, integer, integer, integer) IS
     'Execute generated row-localization SQL on a named peer DSN via libpq with bounded connect, statement, and lock timeouts.';
+COMMENT ON FUNCTION pgl_validate.remote_sequence_value(text, text, integer, integer, integer) IS
+    'Execute generated sequence SQL on a named peer DSN via libpq with bounded connect, statement, and lock timeouts.';
 COMMENT ON FUNCTION pgl_validate.remote_inject_barrier(text, integer, integer, integer) IS
     'Insert a barrier token on a remote origin over libpq and return the exact barrier commit end LSN.';
 COMMENT ON FUNCTION pgl_validate.remote_wait_slot_confirm_lsn(text, text, pg_lsn, integer, integer, integer) IS

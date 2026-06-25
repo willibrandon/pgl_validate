@@ -211,6 +211,27 @@ mod pgl_validate {
         )
     }
 
+    /// Execute generated sequence SQL on a remote peer over libpq.
+    #[pg_extern(volatile, parallel_unsafe)]
+    fn remote_sequence_value(
+        dsn: &str,
+        sequence_sql: &str,
+        connect_timeout_seconds: default!(i32, 10),
+        statement_timeout_ms: default!(i32, 600000),
+        lock_timeout_ms: default!(i32, 30000),
+    ) -> TableIterator<'static, (name!(pg_version, i32), name!(last_value, i64))> {
+        let value = transport::libpq::fetch_sequence_value(
+            dsn,
+            sequence_sql,
+            connect_timeout_seconds,
+            statement_timeout_ms,
+            lock_timeout_ms,
+        )
+        .unwrap_or_else(|err| pgrx::error!("{err}"));
+
+        TableIterator::once((value.pg_version, value.last_value))
+    }
+
     /// Insert a barrier token on a remote origin and return its exact end LSN.
     #[pg_extern(
         volatile,
@@ -1635,6 +1656,94 @@ mod tests {
         );
         let divergence = Spi::get_one::<String>(&divergence_sql).unwrap().unwrap();
         assert_eq!(divergence, "missing_on;advisory;remote_filtered");
+
+        let _ = crate::transport::libpq::execute_command(
+            &local_dsn,
+            &format!("DROP DATABASE IF EXISTS {peer_db} WITH (FORCE)"),
+        );
+    }
+
+    #[pg_test]
+    fn compare_sequence_applies_pglogical_buffer_window() {
+        let backend_pid = Spi::get_one::<i32>("SELECT pg_backend_pid()")
+            .unwrap()
+            .unwrap();
+        let peer_db = identifier(&format!("pgl_validate_sequence_peer_{backend_pid}"));
+        let sequence_name = identifier(&format!("pgl_validate_sequence_{backend_pid}"));
+        let local_dsn = local_dsn();
+        let remote_dsn = peer_dsn(&peer_db);
+
+        let _ = crate::transport::libpq::execute_command(
+            &local_dsn,
+            &format!("DROP DATABASE IF EXISTS {peer_db} WITH (FORCE)"),
+        );
+        crate::transport::libpq::execute_command(&local_dsn, &format!("CREATE DATABASE {peer_db}"))
+            .unwrap();
+        crate::transport::libpq::execute_command(
+            &remote_dsn,
+            &format!(
+                "CREATE EXTENSION pgl_validate;
+                 CREATE SEQUENCE public.{sequence_name} CACHE 5;
+                 DO $$
+                 BEGIN
+                     PERFORM setval('public.{sequence_name}'::regclass, 12, true);
+                 END
+                 $$;"
+            ),
+        )
+        .unwrap();
+
+        Spi::run(&format!(
+            "
+            CREATE SEQUENCE public.{sequence_name} CACHE 5;
+            SELECT setval('public.{sequence_name}'::regclass, 10, true);
+            INSERT INTO pgl_validate.peer(name, dsn, backend)
+            VALUES ('remote_sequence', {remote_dsn}, 'native');
+            ",
+            remote_dsn = sql_literal(&remote_dsn)
+        ))
+        .unwrap();
+
+        let compare_sql = format!(
+            "
+            SELECT verdict || ';' || within_contract::text
+            FROM pgl_validate.compare_sequence(
+                'public.{sequence_name}'::regclass,
+                ARRAY['remote_sequence'],
+                '{{\"sequence_buffer_multiplier\":2}}'::jsonb
+            )
+            "
+        );
+        let matched = Spi::get_one::<String>(&compare_sql).unwrap().unwrap();
+        assert_eq!(matched, "match;true");
+
+        crate::transport::libpq::execute_command(
+            &remote_dsn,
+            &format!(
+                "DO $$
+                 BEGIN
+                     PERFORM setval('public.{sequence_name}'::regclass, 9, true);
+                 END
+                 $$;"
+            ),
+        )
+        .unwrap();
+        let behind = Spi::get_one::<String>(&compare_sql).unwrap().unwrap();
+        assert_eq!(behind, "behind;false");
+
+        crate::transport::libpq::execute_command(
+            &remote_dsn,
+            &format!(
+                "DO $$
+                 BEGIN
+                     PERFORM setval('public.{sequence_name}'::regclass, 21, true);
+                 END
+                 $$;"
+            ),
+        )
+        .unwrap();
+        let ahead = Spi::get_one::<String>(&compare_sql).unwrap().unwrap();
+        assert_eq!(ahead, "ahead_of_window;false");
 
         let _ = crate::transport::libpq::execute_command(
             &local_dsn,

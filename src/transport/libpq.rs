@@ -53,6 +53,15 @@ pub(crate) struct LocalizedRowDigest {
     pub(crate) row_digest: Vec<u8>,
 }
 
+/// Last value fetched from a remote sequence.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) struct RemoteSequenceValue {
+    /// Remote server_version_num.
+    pub(crate) pg_version: i32,
+    /// Remote sequence `last_value`.
+    pub(crate) last_value: i64,
+}
+
 /// Barrier token and exact commit-end LSN injected on an origin node.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub(crate) struct BarrierInjection {
@@ -491,6 +500,47 @@ pub(crate) fn fetch_localized_rows(
     }
 
     Ok(rows)
+}
+
+/// Run generated sequence SQL on a remote participant.
+pub(crate) fn fetch_sequence_value(
+    dsn: &str,
+    sequence_sql: &str,
+    connect_timeout_seconds: i32,
+    statement_timeout_ms: i32,
+    lock_timeout_ms: i32,
+) -> Result<RemoteSequenceValue, String> {
+    let conn = Connection::connect_with_timeout(dsn, connect_timeout_seconds)?;
+    conn.set_query_timeouts(statement_timeout_ms, lock_timeout_ms)?;
+    let wrapped_sql = format!(
+        "SELECT current_setting('server_version_num')::int::text, \
+                q.last_value::bigint::text \
+         FROM ({sequence_sql}) AS q"
+    );
+
+    let result = conn.exec(&wrapped_sql)?;
+    result.require_status(PGRES_TUPLES_OK)?;
+    if result.ntuples() != 1 || result.nfields() != 2 {
+        return Err(format!(
+            "remote sequence query returned {} row(s) and {} column(s), expected 1 row and 2 columns",
+            result.ntuples(),
+            result.nfields()
+        ));
+    }
+
+    let pg_version = result
+        .value(0, 0)?
+        .parse::<i32>()
+        .map_err(|err| format!("invalid remote server_version_num: {err}"))?;
+    let last_value = result
+        .value(0, 1)?
+        .parse::<i64>()
+        .map_err(|err| format!("invalid remote sequence last_value: {err}"))?;
+
+    Ok(RemoteSequenceValue {
+        pg_version,
+        last_value,
+    })
 }
 
 unsafe fn c_message(ptr: *const c_char) -> String {
