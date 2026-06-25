@@ -208,8 +208,20 @@ impl Drop for QueryResult {
 /// Execute one SQL command on a remote libpq connection.
 #[cfg(any(test, feature = "pg_test"))]
 pub(crate) fn execute_command(dsn: &str, sql: &str) -> Result<(), String> {
-    let conn = Connection::connect_with_timeout(dsn, 10)?;
-    conn.set_query_timeouts(10_000, 10_000)?;
+    execute_command_with_timeouts(dsn, sql, 10, 10_000, 10_000)
+}
+
+/// Execute one SQL command on a remote libpq connection with explicit timeouts.
+#[cfg(any(test, feature = "pg_test"))]
+pub(crate) fn execute_command_with_timeouts(
+    dsn: &str,
+    sql: &str,
+    connect_timeout_seconds: i32,
+    statement_timeout_ms: i32,
+    lock_timeout_ms: i32,
+) -> Result<(), String> {
+    let conn = Connection::connect_with_timeout(dsn, connect_timeout_seconds)?;
+    conn.set_query_timeouts(statement_timeout_ms, lock_timeout_ms)?;
     conn.exec_command(sql)
 }
 
@@ -297,7 +309,12 @@ pub(crate) fn observe_barrier(
     let barrier_lsn = format_lsn(barrier_end_lsn);
     let result = conn.exec(&format!(
         "WITH observed AS ( \
-             SELECT pg_replication_origin_progress({origin}, true) AS origin_progress_lsn, \
+             SELECT COALESCE( \
+                    (SELECT pg_replication_origin_progress(roname, true) \
+                     FROM pg_replication_origin \
+                     WHERE roname = {origin}), \
+                    '0/0'::pg_lsn \
+                    ) AS origin_progress_lsn, \
                     EXISTS ( \
                         SELECT 1 \
                         FROM pgl_validate.fence_barrier \

@@ -211,7 +211,7 @@ AS 'MODULE_PATHNAME', 'remote_inject_barrier_wrapper';
         sql = r#"
 CREATE FUNCTION pgl_validate.remote_wait_slot_confirm_lsn(
     dsn text,
-    slot_name name,
+    slot_name text,
     barrier_end_lsn pg_lsn,
     connect_timeout_seconds integer DEFAULT 10,
     statement_timeout_ms integer DEFAULT 600000,
@@ -1076,15 +1076,8 @@ mod tests {
                 'pgl_validate_test',
                 'dbname=' || current_database()
             );
-            SELECT pglogical.create_replication_set(
-                'pgl_validate_barrier',
-                true, false, false, false
-            );
-            SELECT pglogical.replication_set_add_table(
-                'pgl_validate_barrier',
-                'pgl_validate.fence_barrier'::regclass,
-                false
-            );
+            SELECT pgl_validate.ensure_pglogical_barrier_repset();
+            SELECT pgl_validate.ensure_pglogical_barrier_repset();
             "#,
         )
         .unwrap();
@@ -1115,6 +1108,56 @@ mod tests {
 
         assert!(!has_row_filter);
         assert_eq!(att_count, 3);
+    }
+
+    #[pg_test]
+    fn pglogical_barrier_repset_rejects_extra_tables() {
+        let backend_pid = Spi::get_one::<i32>("SELECT pg_backend_pid()")
+            .unwrap()
+            .unwrap();
+        let table_name = identifier(&format!("pglogical_barrier_extra_{backend_pid}"));
+        let node_name = identifier(&format!("pgl_validate_barrier_node_{backend_pid}"));
+
+        Spi::run(&format!(
+            "
+            CREATE EXTENSION pglogical;
+            SELECT pglogical.create_node({node}, 'dbname=' || current_database());
+            CREATE TABLE public.{table_name}(id int PRIMARY KEY);
+            SELECT pgl_validate.ensure_pglogical_barrier_repset();
+            SELECT pglogical.replication_set_add_table(
+                'pgl_validate_barrier',
+                'public.{table_name}'::regclass,
+                false
+            );
+            ",
+            node = sql_literal(&node_name),
+        ))
+        .unwrap();
+
+        Spi::run(
+            r#"
+            DO $$
+            DECLARE
+                rejected boolean := false;
+            BEGIN
+                BEGIN
+                    PERFORM pgl_validate.ensure_pglogical_barrier_repset();
+                EXCEPTION WHEN others THEN
+                    IF SQLERRM = 'pglogical replication set pgl_validate_barrier must contain only pgl_validate.fence_barrier' THEN
+                        rejected := true;
+                    ELSE
+                        RAISE;
+                    END IF;
+                END;
+
+                IF NOT rejected THEN
+                    RAISE EXCEPTION 'expected pgl_validate_barrier to reject extra tables';
+                END IF;
+            END
+            $$;
+            "#,
+        )
+        .unwrap();
     }
 
     #[pg_test]

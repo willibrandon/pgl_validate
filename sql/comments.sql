@@ -63,6 +63,10 @@ COMMENT ON FUNCTION pgl_validate.column_encoding_mode(oid) IS
     'Select the coordinator-pushed row_digest encoding mode for a column type.';
 COMMENT ON FUNCTION pgl_validate.pglogical_table_contract(regclass, text[], name) IS
     'Resolve pglogical action masks, effective column list, filter presence, sync state, and validated property for a relation.';
+COMMENT ON FUNCTION pgl_validate.ensure_pglogical_barrier_repset() IS
+    'Create or verify the dedicated insert-only pglogical replication set that carries fence barrier tokens.';
+COMMENT ON FUNCTION pgl_validate.fence_pglogical_edge(bigint, integer, integer, text, text, text, text, text, text, text, text[], integer, integer, integer, integer, integer) IS
+    'Inject and converge an exact pglogical barrier for one provider-to-target run edge.';
 COMMENT ON FUNCTION pgl_validate.plan_chunk_sql(regclass, text[], bytea, bytea, text[], text[]) IS
     'Generate planner-visible SQL for a table chunk checksum.';
 COMMENT ON FUNCTION pgl_validate.compare_table(regclass, text[], jsonb) IS
@@ -92,7 +96,7 @@ COMMENT ON FUNCTION pgl_validate.remote_checksum(text, text, integer, integer, i
     'Execute generated checksum SQL on a named peer DSN via libpq with bounded connect, statement, and lock timeouts.';
 COMMENT ON FUNCTION pgl_validate.remote_inject_barrier(text, integer, integer, integer) IS
     'Insert a barrier token on a remote origin over libpq and return the exact barrier commit end LSN.';
-COMMENT ON FUNCTION pgl_validate.remote_wait_slot_confirm_lsn(text, name, pg_lsn, integer, integer, integer) IS
+COMMENT ON FUNCTION pgl_validate.remote_wait_slot_confirm_lsn(text, text, pg_lsn, integer, integer, integer) IS
     'Call pglogical.wait_slot_confirm_lsn on a provider and return the slot confirmed_flush_lsn.';
 COMMENT ON FUNCTION pgl_validate.remote_observe_barrier(text, text, uuid, pg_lsn, integer, integer, integer) IS
     'Observe target-side replication origin progress, barrier-token visibility, and convergence.';
