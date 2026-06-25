@@ -149,14 +149,7 @@ function Stop-TestCluster {
         }
     }
 
-    $procs = Get-CimInstance Win32_Process | Where-Object {
-        ($_.Name -in @('postgres.exe', 'pg_ctl.exe', 'cmd.exe', 'psql.exe', 'initdb.exe')) -and
-        ($null -ne $_.CommandLine) -and
-        ($_.CommandLine -match 'target[/\\]pglogical-test-pgdata')
-    }
-    foreach ($proc in $procs) {
-        Stop-Process -Id $proc.ProcessId -Force -ErrorAction SilentlyContinue
-    }
+    & (Join-Path $PSScriptRoot 'stop-pgrx-test-clusters.ps1') -Root $root
 
     Start-Sleep -Milliseconds 500
 }
@@ -195,26 +188,22 @@ function Start-CleanupWatchdog {
         $powershell = (Get-Command powershell.exe -ErrorAction Stop).Source
     }
 
+    $cleanupScript = Join-Path $PSScriptRoot 'stop-pgrx-test-clusters.ps1'
     $removeFlag = if ($RemoveData) { '$true' } else { '$false' }
     $watchdogScript = @"
 `$ErrorActionPreference = 'SilentlyContinue'
 `$parentPid = $ParentPid
-`$data = '$($Data.Replace("'", "''"))'
+`$root = '$($root.Replace("'", "''"))'
+`$cleanupScript = '$($cleanupScript.Replace("'", "''"))'
 `$removeData = $removeFlag
 while (Get-Process -Id `$parentPid -ErrorAction SilentlyContinue) {
     Start-Sleep -Seconds 2
 }
-`$procs = Get-CimInstance Win32_Process | Where-Object {
-    (`$_.Name -in @('postgres.exe', 'pg_ctl.exe', 'cmd.exe', 'psql.exe', 'initdb.exe')) -and
-    (`$null -ne `$_.CommandLine) -and
-    (`$_.CommandLine -match 'target[/\\]pglogical-test-pgdata')
+if (`$removeData) {
+    & `$cleanupScript -Root `$root -RemoveData
 }
-foreach (`$proc in `$procs) {
-    Stop-Process -Id `$proc.ProcessId -Force -ErrorAction SilentlyContinue
-}
-Start-Sleep -Seconds 1
-if (`$removeData -and (Test-Path -LiteralPath `$data)) {
-    Remove-Item -LiteralPath `$data -Recurse -Force -ErrorAction SilentlyContinue
+else {
+    & `$cleanupScript -Root `$root
 }
 "@
 
