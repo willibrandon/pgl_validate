@@ -233,6 +233,25 @@ mod pgl_validate {
         TableIterator::once((value.pg_version, value.last_value))
     }
 
+    /// Execute one generated SQL command batch on a remote peer over libpq.
+    #[pg_extern(volatile, parallel_unsafe)]
+    fn remote_execute(
+        dsn: &str,
+        sql: &str,
+        connect_timeout_seconds: default!(i32, 10),
+        statement_timeout_ms: default!(i32, 600000),
+        lock_timeout_ms: default!(i32, 30000),
+    ) {
+        transport::libpq::execute_command_with_timeouts(
+            dsn,
+            sql,
+            connect_timeout_seconds,
+            statement_timeout_ms,
+            lock_timeout_ms,
+        )
+        .unwrap_or_else(|err| pgrx::error!("{err}"));
+    }
+
     /// Insert a barrier token on a remote origin and return its exact end LSN.
     #[pg_extern(
         volatile,
@@ -1202,7 +1221,29 @@ mod tests {
         assert!(repair_batch.contains("/* target: 'remote_diff' */ INSERT"));
         assert!(repair_batch.contains("/* target: 'remote_diff' */ DELETE"));
 
-        crate::transport::libpq::execute_command(&remote_dsn, &repair_batch).unwrap();
+        let repair_status = Spi::get_one::<String>(&format!(
+            "
+            SELECT repair_id::text || ';' || status
+            FROM pgl_validate.apply_repair({run_id}, 'local', 'remote_diff', 'remote_diff')
+            "
+        ))
+        .unwrap()
+        .unwrap();
+        let (repair_id, repair_status) = repair_status
+            .split_once(';')
+            .expect("repair status should include id");
+        assert_eq!(repair_status, "applied");
+
+        let repair_actions = Spi::get_one::<String>(&format!(
+            "
+            SELECT string_agg(action, ',' ORDER BY action)
+            FROM pgl_validate.repair_result
+            WHERE repair_id = {repair_id}
+            "
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(repair_actions, "delete,insert,update");
 
         let repaired_verdict_sql = format!(
             "SELECT (pgl_validate.compare_table({}::regclass)).verdict",
@@ -2005,7 +2046,35 @@ mod tests {
             sequence_repair.contains("/* target: 'remote_sequence' */ DO $pgl_validate_repair$")
         );
         assert!(sequence_repair.contains(", 10, true)"));
-        crate::transport::libpq::execute_command(&remote_dsn, &sequence_repair).unwrap();
+
+        let repair_status = Spi::get_one::<String>(&format!(
+            "
+            SELECT repair_id::text || ';' || status
+            FROM pgl_validate.apply_repair(
+                {behind_run_id}::bigint,
+                'local',
+                'remote_sequence',
+                'remote_sequence'
+            )
+            "
+        ))
+        .unwrap()
+        .unwrap();
+        let (repair_id, repair_status) = repair_status
+            .split_once(';')
+            .expect("sequence repair status should include id");
+        assert_eq!(repair_status, "applied");
+
+        let sequence_repair_action = Spi::get_one::<String>(&format!(
+            "
+            SELECT action
+            FROM pgl_validate.repair_result
+            WHERE repair_id = {repair_id}
+            "
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(sequence_repair_action, "setval");
 
         let repaired_sequence = Spi::get_one::<String>(&compare_sql).unwrap().unwrap();
         assert_eq!(repaired_sequence, "match;true");

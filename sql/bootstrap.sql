@@ -2532,6 +2532,336 @@ BEGIN
 END
 $$;
 
+CREATE FUNCTION pgl_validate.apply_repair(
+    run_id bigint,
+    authoritative text,
+    target text,
+    confirm text,
+    propagation text DEFAULT 'local_only',
+    acknowledge_conflict_policy boolean DEFAULT false
+)
+RETURNS pgl_validate.repair_run
+LANGUAGE plpgsql
+VOLATILE
+AS $$
+DECLARE
+    target_peer pgl_validate.peer%ROWTYPE;
+    repair pgl_validate.repair_run%ROWTYPE;
+    target_prefix text;
+    origin_name text;
+    row_batch text;
+    remote_batch text;
+    sequence_stmt record;
+    statement_count int;
+    repair_error text;
+BEGIN
+    IF authoritative IS NULL OR btrim(authoritative) = '' THEN
+        RAISE EXCEPTION 'authoritative node is required'
+            USING ERRCODE = '22023';
+    END IF;
+
+    IF target IS NULL OR btrim(target) = '' THEN
+        RAISE EXCEPTION 'target node is required'
+            USING ERRCODE = '22023';
+    END IF;
+
+    IF confirm IS DISTINCT FROM target THEN
+        RAISE EXCEPTION 'repair target confirmation must exactly equal target node %', target
+            USING ERRCODE = '22023';
+    END IF;
+
+    IF propagation NOT IN ('local_only','replicate') THEN
+        RAISE EXCEPTION 'propagation must be local_only or replicate'
+            USING ERRCODE = '22023';
+    END IF;
+
+    IF propagation = 'replicate' AND NOT acknowledge_conflict_policy THEN
+        RAISE EXCEPTION 'replicate repair requires acknowledge_conflict_policy = true'
+            USING ERRCODE = '22023';
+    END IF;
+
+    IF authoritative = target THEN
+        RAISE EXCEPTION 'authoritative node and repair target must differ'
+            USING ERRCODE = '22023';
+    END IF;
+
+    IF NOT EXISTS (SELECT 1 FROM pgl_validate.run r WHERE r.run_id = apply_repair.run_id) THEN
+        RAISE EXCEPTION 'validation run % does not exist', apply_repair.run_id
+            USING ERRCODE = '02000';
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pgl_validate.run_participant rp
+        WHERE rp.run_id = apply_repair.run_id
+          AND rp.node = authoritative
+    ) THEN
+        RAISE EXCEPTION 'authoritative node % is not a participant in run %', authoritative, apply_repair.run_id
+            USING ERRCODE = '22023';
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pgl_validate.run_participant rp
+        WHERE rp.run_id = apply_repair.run_id
+          AND rp.node = target
+    ) THEN
+        RAISE EXCEPTION 'target node % is not a participant in run %', target, apply_repair.run_id
+            USING ERRCODE = '22023';
+    END IF;
+
+    IF target <> 'local' THEN
+        SELECT *
+        INTO target_peer
+        FROM pgl_validate.peer p
+        WHERE p.name = target;
+
+        IF NOT FOUND THEN
+            RAISE EXCEPTION 'target node % is not registered in pgl_validate.peer', target
+                USING ERRCODE = '22023';
+        END IF;
+    END IF;
+
+    origin_name := CASE WHEN propagation = 'local_only' THEN 'pgl_validate_repair' ELSE NULL END;
+    INSERT INTO pgl_validate.repair_run(run_id, authoritative, target, propagation, origin_name)
+    VALUES (apply_repair.run_id, authoritative, target, propagation, origin_name)
+    RETURNING * INTO repair;
+
+    BEGIN
+        target_prefix := format('/* target: %s */', quote_literal(target));
+
+        CREATE TEMP TABLE IF NOT EXISTS pgl_validate_apply_statement (
+            ord int NOT NULL,
+            statement text NOT NULL,
+            action text NOT NULL CHECK (action IN ('insert','update','delete','setval'))
+        ) ON COMMIT DROP;
+        TRUNCATE pgl_validate_apply_statement;
+
+        INSERT INTO pgl_validate_apply_statement(ord, statement, action)
+        SELECT classified.ord, classified.stmt, classified.action
+        FROM (
+            SELECT generated.ord,
+                   generated.stmt,
+                   CASE
+                       WHEN generated.stmt LIKE target_prefix || ' INSERT%' THEN 'insert'
+                       WHEN generated.stmt LIKE target_prefix || ' UPDATE%' THEN 'update'
+                       WHEN generated.stmt LIKE target_prefix || ' DELETE%' THEN 'delete'
+                       WHEN generated.stmt LIKE target_prefix || ' DO %' THEN 'setval'
+                       ELSE NULL
+                   END AS action
+            FROM (
+                SELECT row_number() OVER ()::int AS ord, stmt
+                FROM pgl_validate.generate_repair(apply_repair.run_id, authoritative) AS repair_stmt(stmt)
+                WHERE stmt LIKE target_prefix || '%'
+            ) generated
+        ) classified
+        WHERE classified.action IS NOT NULL;
+
+        SELECT count(*) INTO statement_count FROM pgl_validate_apply_statement;
+        IF statement_count = 0 THEN
+            UPDATE pgl_validate.repair_run
+            SET status = 'applied',
+                finished_at = clock_timestamp()
+            WHERE repair_id = repair.repair_id
+            RETURNING * INTO repair;
+            RETURN repair;
+        END IF;
+
+        SELECT string_agg(statement, E'\n' ORDER BY ord)
+        INTO row_batch
+        FROM pgl_validate_apply_statement
+        WHERE action IN ('insert','update','delete');
+
+        IF row_batch IS NOT NULL THEN
+            IF target = 'local' THEN
+                FOR sequence_stmt IN
+                    SELECT statement
+                    FROM pgl_validate_apply_statement
+                    WHERE action IN ('insert','update','delete')
+                    ORDER BY ord
+                LOOP
+                    EXECUTE sequence_stmt.statement;
+                END LOOP;
+            ELSE
+                IF propagation = 'local_only' THEN
+                    remote_batch := format(
+                        'DO $pgl_validate_origin$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_replication_origin WHERE roname = %L) THEN PERFORM pg_replication_origin_create(%L); END IF; END $pgl_validate_origin$;' ||
+                        E'\nDO $pgl_validate_origin$ BEGIN PERFORM pg_replication_origin_session_setup(%L); END $pgl_validate_origin$;' ||
+                        E'\nBEGIN;' ||
+                        E'\n%s' ||
+                        E'\nCOMMIT;' ||
+                        E'\nDO $pgl_validate_origin$ BEGIN PERFORM pg_replication_origin_session_reset(); END $pgl_validate_origin$;',
+                        origin_name,
+                        origin_name,
+                        origin_name,
+                        row_batch
+                    );
+                ELSE
+                    remote_batch := E'BEGIN;\n' || row_batch || E'\nCOMMIT;';
+                END IF;
+
+                PERFORM pgl_validate.remote_execute(
+                    target_peer.dsn,
+                    remote_batch,
+                    target_peer.connect_timeout_seconds,
+                    target_peer.statement_timeout_ms,
+                    target_peer.lock_timeout_ms
+                );
+            END IF;
+        END IF;
+
+        FOR sequence_stmt IN
+            SELECT statement
+            FROM pgl_validate_apply_statement
+            WHERE action = 'setval'
+            ORDER BY ord
+        LOOP
+            IF target = 'local' THEN
+                EXECUTE sequence_stmt.statement;
+            ELSE
+                PERFORM pgl_validate.remote_execute(
+                    target_peer.dsn,
+                    sequence_stmt.statement,
+                    target_peer.connect_timeout_seconds,
+                    target_peer.statement_timeout_ms,
+                    target_peer.lock_timeout_ms
+                );
+            END IF;
+        END LOOP;
+
+        INSERT INTO pgl_validate.repair_result(
+            repair_id, schema_name, table_name, key_bytes, action, statement, post_verdict
+        )
+        SELECT repair.repair_id,
+               d.schema_name,
+               d.table_name,
+               d.key_bytes,
+               CASE d.classification
+                   WHEN 'missing_on' THEN 'insert'
+                   WHEN 'extra_on' THEN 'delete'
+                   ELSE 'update'
+               END AS action,
+               COALESCE((
+                   SELECT string_agg(s.statement, E'\n' ORDER BY s.ord)
+                   FROM pgl_validate_apply_statement s
+                   WHERE s.action = CASE d.classification
+                       WHEN 'missing_on' THEN 'insert'
+                       WHEN 'extra_on' THEN 'delete'
+                       ELSE 'update'
+                   END
+               ), '') AS statement,
+               'indeterminate'
+        FROM pgl_validate.divergence d
+        JOIN pgl_validate.table_plan tp
+          ON tp.run_id = d.run_id
+         AND tp.schema_name = d.schema_name
+         AND tp.table_name = d.table_name
+        WHERE d.run_id = apply_repair.run_id
+          AND d.status = 'confirmed'
+          AND d.node = target
+          AND authoritative = 'local'
+          AND tp.validated_property IN ('full','superset','keys_only')
+          AND EXISTS (
+              SELECT 1
+              FROM pgl_validate_apply_statement s
+              WHERE s.action = CASE d.classification
+                  WHEN 'missing_on' THEN 'insert'
+                  WHEN 'extra_on' THEN 'delete'
+                  ELSE 'update'
+              END
+          )
+        ON CONFLICT DO NOTHING;
+
+        INSERT INTO pgl_validate.repair_result(
+            repair_id, schema_name, table_name, key_bytes, action, statement, post_verdict
+        )
+        SELECT repair.repair_id,
+               d.schema_name,
+               d.table_name,
+               d.key_bytes,
+               CASE d.classification
+                   WHEN 'missing_on' THEN 'delete'
+                   WHEN 'extra_on' THEN 'insert'
+                   ELSE 'update'
+               END AS action,
+               COALESCE((
+                   SELECT string_agg(s.statement, E'\n' ORDER BY s.ord)
+                   FROM pgl_validate_apply_statement s
+                   WHERE s.action = CASE d.classification
+                       WHEN 'missing_on' THEN 'delete'
+                       WHEN 'extra_on' THEN 'insert'
+                       ELSE 'update'
+                   END
+               ), '') AS statement,
+               'indeterminate'
+        FROM pgl_validate.divergence d
+        JOIN pgl_validate.table_plan tp
+          ON tp.run_id = d.run_id
+         AND tp.schema_name = d.schema_name
+         AND tp.table_name = d.table_name
+        WHERE d.run_id = apply_repair.run_id
+          AND d.status = 'confirmed'
+          AND d.node = authoritative
+          AND target = 'local'
+          AND tp.validated_property IN ('full','superset','keys_only')
+          AND EXISTS (
+              SELECT 1
+              FROM pgl_validate_apply_statement s
+              WHERE s.action = CASE d.classification
+                  WHEN 'missing_on' THEN 'delete'
+                  WHEN 'extra_on' THEN 'insert'
+                  ELSE 'update'
+              END
+          )
+        ON CONFLICT DO NOTHING;
+
+        INSERT INTO pgl_validate.repair_result(
+            repair_id, schema_name, table_name, key_bytes, action, statement, post_verdict
+        )
+        SELECT repair.repair_id,
+               sr.schema_name,
+               sr.seq_name,
+               convert_to(format('%I.%I', sr.schema_name, sr.seq_name), 'UTF8'),
+               'setval',
+               COALESCE((
+                   SELECT string_agg(s.statement, E'\n' ORDER BY s.ord)
+                   FROM pgl_validate_apply_statement s
+                   WHERE s.action = 'setval'
+               ), ''),
+               'indeterminate'
+        FROM pgl_validate.sequence_result sr
+        WHERE sr.run_id = apply_repair.run_id
+          AND sr.subscriber_node = target
+          AND NOT sr.within_contract
+          AND sr.provider_last_value IS NOT NULL
+          AND authoritative IN ('local', sr.provider_node)
+          AND EXISTS (
+              SELECT 1
+              FROM pgl_validate_apply_statement s
+              WHERE s.action = 'setval'
+          )
+        ON CONFLICT DO NOTHING;
+
+        UPDATE pgl_validate.repair_run
+        SET status = 'applied',
+            finished_at = clock_timestamp()
+        WHERE repair_id = repair.repair_id
+        RETURNING * INTO repair;
+
+        RETURN repair;
+    EXCEPTION WHEN others THEN
+        GET STACKED DIAGNOSTICS repair_error = MESSAGE_TEXT;
+        UPDATE pgl_validate.repair_run
+        SET status = 'failed',
+            finished_at = clock_timestamp(),
+            error = repair_error
+        WHERE repair_id = repair.repair_id
+        RETURNING * INTO repair;
+        RETURN repair;
+    END;
+END
+$$;
+
 CREATE FUNCTION pgl_validate.run_status(run_id bigint)
 RETURNS pgl_validate.run
 LANGUAGE sql

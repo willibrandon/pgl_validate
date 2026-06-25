@@ -81,6 +81,8 @@ COMMENT ON FUNCTION pgl_validate.compare_sequence(regclass, text[], jsonb) IS
     'Validate one sequence against peers using the pglogical sequence buffer-window contract.';
 COMMENT ON FUNCTION pgl_validate.generate_repair(bigint, text) IS
     'Generate reviewable node-labeled DML and sequence setval statements for confirmed divergences using the selected authoritative node.';
+COMMENT ON FUNCTION pgl_validate.apply_repair(bigint, text, text, text, text, boolean) IS
+    'Apply target-labeled generated repair statements after explicit target confirmation and record repair_run and repair_result audit rows.';
 COMMENT ON FUNCTION pgl_validate.run_status(bigint) IS
     'Return the persisted state for a validation run.';
 COMMENT ON FUNCTION pgl_validate.divergences(bigint) IS
@@ -114,6 +116,8 @@ COMMENT ON FUNCTION pgl_validate.remote_localize_rows(text, text, integer, integ
     'Execute generated row-localization SQL on a named peer DSN via libpq with bounded connect, statement, and lock timeouts, returning key, digest, and row JSON.';
 COMMENT ON FUNCTION pgl_validate.remote_sequence_value(text, text, integer, integer, integer) IS
     'Execute generated sequence SQL on a named peer DSN via libpq with bounded connect, statement, and lock timeouts.';
+COMMENT ON FUNCTION pgl_validate.remote_execute(text, text, integer, integer, integer) IS
+    'Execute a generated SQL command batch on a named peer DSN via libpq with bounded connect, statement, and lock timeouts.';
 COMMENT ON FUNCTION pgl_validate.remote_inject_barrier(text, integer, integer, integer) IS
     'Insert a barrier token on a remote origin over libpq and return the exact barrier commit end LSN.';
 COMMENT ON FUNCTION pgl_validate.remote_wait_slot_confirm_lsn(text, text, pg_lsn, integer, integer, integer) IS

@@ -634,8 +634,9 @@ FROM pgl_validate.compare_sequence(
 
     Write-Step 'Creating subscriber-side drift and confirming key-level divergence'
     Invoke-Sql -Database 'target' -Sql "UPDATE public.accounts SET value = 'target-drift' WHERE id = 1" | Out-Null
-    $driftVerdict = Invoke-Sql -Database 'provider' -Sql @"
-SELECT (pgl_validate.compare_table(
+    $driftResult = Invoke-Sql -Database 'provider' -Sql @"
+SELECT run_id::text || ';' || verdict
+FROM pgl_validate.compare_table(
     'public.accounts'::regclass,
     ARRAY['target'],
     jsonb_build_object(
@@ -645,8 +646,14 @@ SELECT (pgl_validate.compare_table(
         'fence_timeout_ms', 30000,
         'fence_poll_interval_ms', 100
     )
-)).verdict
+)
 "@
+    $driftParts = $driftResult.Split(';', 2)
+    if ($driftParts.Count -ne 2) {
+        throw "unexpected drift compare_table result: $driftResult"
+    }
+    $driftRunId = $driftParts[0]
+    $driftVerdict = $driftParts[1]
     if ($driftVerdict -ne 'differ') {
         throw "unexpected drift compare_table verdict: $driftVerdict"
     }
@@ -659,6 +666,7 @@ SELECT EXISTS (
     JOIN pgl_validate.divergence_recheck dr USING (run_id, schema_name, table_name, key_bytes, node)
     WHERE d.schema_name = 'public'
       AND d.table_name = 'accounts'
+      AND d.run_id = $driftRunId
       AND d.node = 'target'
       AND d.classification = 'differs'
       AND d.status = 'confirmed'
@@ -670,7 +678,48 @@ SELECT EXISTS (
         throw 'subscriber-side drift was not persisted as a confirmed divergence'
     }
 
-    Write-Output "pglogical fence, compare_table, and divergence recheck tests passed on pg$PgMajor using slot $slotName"
+    Write-Step 'Applying audited pglogical repair and revalidating match'
+    $repairResult = Invoke-Sql -Database 'provider' -Sql @"
+SELECT repair_id::text || ';' || status
+FROM pgl_validate.apply_repair($driftRunId, 'local', 'target', 'target')
+"@
+    $repairParts = $repairResult.Split(';', 2)
+    if ($repairParts.Count -ne 2) {
+        throw "unexpected repair result: $repairResult"
+    }
+    $repairId = $repairParts[0]
+    $repairStatus = $repairParts[1]
+    if ($repairStatus -ne 'applied') {
+        throw "unexpected repair status: $repairResult"
+    }
+
+    $repairAudit = Invoke-Sql -Database 'provider' -Sql @"
+SELECT COALESCE(string_agg(action, ',' ORDER BY action), '<none>')
+FROM pgl_validate.repair_result
+WHERE repair_id = $repairId
+"@
+    if ($repairAudit -ne 'update') {
+        throw "unexpected repair audit actions: $repairAudit"
+    }
+
+    $repairedVerdict = Invoke-Sql -Database 'provider' -Sql @"
+SELECT (pgl_validate.compare_table(
+    'public.accounts'::regclass,
+    ARRAY['target'],
+    jsonb_build_object(
+        'provider_dsn', $providerDsnSql,
+        'provider_node', 'provider',
+        'repsets', jsonb_build_array('default'),
+        'fence_timeout_ms', 30000,
+        'fence_poll_interval_ms', 100
+    )
+)).verdict
+"@
+    if ($repairedVerdict -ne 'match') {
+        throw "unexpected post-repair compare_table verdict: $repairedVerdict"
+    }
+
+    Write-Output "pglogical fence, compare_table, divergence recheck, and audited repair tests passed on pg$PgMajor using slot $slotName"
 }
 catch {
     if (Test-Path -LiteralPath $log) {

@@ -251,7 +251,6 @@ pub(crate) fn execute_command(dsn: &str, sql: &str) -> Result<(), String> {
 }
 
 /// Execute one SQL command on a remote libpq connection with explicit timeouts.
-#[cfg(any(test, feature = "pg_test"))]
 pub(crate) fn execute_command_with_timeouts(
     dsn: &str,
     sql: &str,
