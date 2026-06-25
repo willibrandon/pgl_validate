@@ -62,14 +62,14 @@ COMMENT ON VIEW pgl_validate.schema_issues IS
 COMMENT ON FUNCTION pgl_validate.column_encoding_mode(oid) IS
     'Select the coordinator-pushed row_digest encoding mode for a column type.';
 COMMENT ON FUNCTION pgl_validate.pglogical_table_contract(regclass, text[], name) IS
-    'Resolve pglogical action masks, effective column list, filter presence, sync state, and validated property for a relation.';
+    'Resolve pglogical action masks, effective column list, exact filter predicate, sync state, and validated property for a relation.';
 COMMENT ON FUNCTION pgl_validate.ensure_pglogical_barrier_repset() IS
     'Create or verify the dedicated insert-only pglogical replication set that carries fence barrier tokens.';
 COMMENT ON FUNCTION pgl_validate.fence_pglogical_edge(bigint, integer, integer, text, text, text, text, text, text, text, text[], integer, integer, integer, integer, integer) IS
     'Inject and converge an exact pglogical barrier for one provider-to-target run edge.';
-COMMENT ON FUNCTION pgl_validate.plan_chunk_sql(regclass, text[], bytea, bytea, text[], text[]) IS
+COMMENT ON FUNCTION pgl_validate.plan_chunk_sql(regclass, text[], bytea, bytea, text[], text[], text) IS
     'Generate planner-visible SQL for a table chunk checksum.';
-COMMENT ON FUNCTION pgl_validate.plan_localize_sql(regclass, text[], text[]) IS
+COMMENT ON FUNCTION pgl_validate.plan_localize_sql(regclass, text[], text[], text) IS
     'Generate planner-visible SQL for key and row-digest enumeration during divergence localization.';
 COMMENT ON FUNCTION pgl_validate.compare_table(regclass, text[], jsonb) IS
     'Run the current table comparison path and return the persisted table verdict.';
@@ -94,6 +94,8 @@ COMMENT ON FUNCTION pgl_validate.last_commit_lsn() IS
     'Return the backend exact last commit end LSN for barrier fencing.';
 COMMENT ON FUNCTION pgl_validate.hash_digest_array(bytea[]) IS
     'Hash a caller-sorted array of row digests for cryptographic set confirmation.';
+COMMENT ON FUNCTION pgl_validate.row_filter_tree_is_immutable(text) IS
+    'Return whether a serialized PostgreSQL row-filter expression tree contains only immutable functions.';
 COMMENT ON FUNCTION pgl_validate.remote_checksum(text, text, integer, integer, integer) IS
     'Execute generated checksum SQL on a named peer DSN via libpq with bounded connect, statement, and lock timeouts.';
 COMMENT ON FUNCTION pgl_validate.remote_localize_rows(text, text, integer, integer, integer) IS

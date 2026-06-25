@@ -60,6 +60,7 @@ mod pgl_validate {
     use pgrx::aggregate::*;
     use pgrx::prelude::*;
     use serde::{Deserialize, Serialize};
+    use std::ffi::CString;
 
     const LANE_BLOCKS: usize = 32;
     const LANES_PER_BLOCK: usize = 32;
@@ -116,6 +117,20 @@ mod pgl_validate {
             .filter_map(|digest| digest)
             .collect::<Vec<&[u8]>>();
         digest::lthash::hash_digest_array(&refs).to_vec()
+    }
+
+    /// Return true when a serialized PostgreSQL expression tree contains only
+    /// immutable functions.
+    #[pg_extern(stable, parallel_safe)]
+    fn row_filter_tree_is_immutable(filter_tree: &str) -> bool {
+        let c_filter_tree = CString::new(filter_tree)
+            .unwrap_or_else(|_| pgrx::error!("row filter expression tree contains embedded NUL"));
+        let node = unsafe { pg_sys::stringToNode(c_filter_tree.as_ptr()) };
+        if node.is_null() {
+            pgrx::error!("could not parse row filter expression tree");
+        }
+
+        !unsafe { pg_sys::contain_mutable_functions(node.cast::<pg_sys::Node>()) }
     }
 
     /// Combine two LtHash states for parallel aggregate execution and tests.
@@ -1352,6 +1367,100 @@ mod tests {
     }
 
     #[pg_test]
+    fn pglogical_contract_deparses_exact_row_filter() {
+        let backend_pid = Spi::get_one::<i32>("SELECT pg_backend_pid()")
+            .unwrap()
+            .unwrap();
+        let table_name = identifier(&format!("pglogical_filter_contract_{backend_pid}"));
+        let repset_name = identifier(&format!("pgl_validate_filter_contract_{backend_pid}"));
+        let node_name = identifier(&format!("pgl_validate_filter_node_{backend_pid}"));
+
+        Spi::run(&format!(
+            "
+            CREATE EXTENSION pglogical;
+            SELECT pglogical.create_node({node}, 'dbname=' || current_database());
+            CREATE TABLE public.{table_name}(
+                id int PRIMARY KEY,
+                kept text
+            );
+            SELECT pglogical.create_replication_set({repset}, true, true, true, true);
+            SELECT pglogical.replication_set_add_table(
+                {repset},
+                'public.{table_name}'::regclass,
+                false,
+                NULL,
+                'id > 0 AND lower(kept) = kept'
+            );
+            ",
+            node = sql_literal(&node_name),
+            repset = sql_literal(&repset_name)
+        ))
+        .unwrap();
+
+        let contract_sql = format!(
+            "
+            SELECT validated_property || ';' ||
+                   exact_comparable::text || ';' ||
+                   row_filter_exact::text || ';' ||
+                   (row_filter_sql IS NOT NULL)::text
+            FROM pgl_validate.pglogical_table_contract(
+                'public.{table_name}'::regclass,
+                ARRAY[{repset}]
+            )
+            ",
+            repset = sql_literal(&repset_name)
+        );
+        let contract = Spi::get_one::<String>(&contract_sql).unwrap().unwrap();
+
+        assert_eq!(contract, "filtered_intersection;true;true;true");
+    }
+
+    #[pg_test]
+    fn pglogical_contract_skips_session_sensitive_row_filter() {
+        let backend_pid = Spi::get_one::<i32>("SELECT pg_backend_pid()")
+            .unwrap()
+            .unwrap();
+        let table_name = identifier(&format!("pglogical_filter_session_{backend_pid}"));
+        let repset_name = identifier(&format!("pgl_validate_filter_session_{backend_pid}"));
+        let node_name = identifier(&format!("pgl_validate_filter_session_node_{backend_pid}"));
+
+        Spi::run(&format!(
+            "
+            CREATE EXTENSION pglogical;
+            SELECT pglogical.create_node({node}, 'dbname=' || current_database());
+            CREATE TABLE public.{table_name}(id int PRIMARY KEY);
+            SELECT pglogical.create_replication_set({repset}, true, true, true, true);
+            SELECT pglogical.replication_set_add_table(
+                {repset},
+                'public.{table_name}'::regclass,
+                false,
+                NULL,
+                'id > 0 AND current_user = current_user'
+            );
+            ",
+            node = sql_literal(&node_name),
+            repset = sql_literal(&repset_name)
+        ))
+        .unwrap();
+
+        let contract_sql = format!(
+            "
+            SELECT validated_property || ';' ||
+                   exact_comparable::text || ';' ||
+                   row_filter_exact::text
+            FROM pgl_validate.pglogical_table_contract(
+                'public.{table_name}'::regclass,
+                ARRAY[{repset}]
+            )
+            ",
+            repset = sql_literal(&repset_name)
+        );
+        let contract = Spi::get_one::<String>(&contract_sql).unwrap().unwrap();
+
+        assert_eq!(contract, "skipped;false;false");
+    }
+
+    #[pg_test]
     fn compare_table_uses_pglogical_column_projection() {
         let backend_pid = Spi::get_one::<i32>("SELECT pg_backend_pid()")
             .unwrap()
@@ -1432,6 +1541,100 @@ mod tests {
         );
         let planned_cols = Spi::get_one::<String>(&planned_cols_sql).unwrap().unwrap();
         assert_eq!(planned_cols, "id,kept");
+
+        let _ = crate::transport::libpq::execute_command(
+            &local_dsn,
+            &format!("DROP DATABASE IF EXISTS {peer_db} WITH (FORCE)"),
+        );
+    }
+
+    #[pg_test]
+    fn compare_table_marks_filtered_presence_difference_advisory() {
+        let backend_pid = Spi::get_one::<i32>("SELECT pg_backend_pid()")
+            .unwrap()
+            .unwrap();
+        let peer_db = identifier(&format!("pgl_validate_filter_peer_{backend_pid}"));
+        let table_name = identifier(&format!("pglogical_filtered_target_{backend_pid}"));
+        let repset_name = identifier(&format!("pgl_validate_filtered_{backend_pid}"));
+        let node_name = identifier(&format!("pgl_validate_filtered_node_{backend_pid}"));
+        let local_dsn = local_dsn();
+        let remote_dsn = peer_dsn(&peer_db);
+
+        let _ = crate::transport::libpq::execute_command(
+            &local_dsn,
+            &format!("DROP DATABASE IF EXISTS {peer_db} WITH (FORCE)"),
+        );
+        crate::transport::libpq::execute_command(&local_dsn, &format!("CREATE DATABASE {peer_db}"))
+            .unwrap();
+        crate::transport::libpq::execute_command(
+            &remote_dsn,
+            &format!(
+                "CREATE EXTENSION pgl_validate;
+                 CREATE TABLE public.{table_name}(
+                     id int PRIMARY KEY,
+                     include_row boolean NOT NULL,
+                     value text
+                 );
+                 INSERT INTO public.{table_name} VALUES
+                     (1, true, 'same');"
+            ),
+        )
+        .unwrap();
+
+        Spi::run(&format!(
+            "
+            CREATE EXTENSION pglogical;
+            SELECT pglogical.create_node({node}, 'dbname=' || current_database());
+            CREATE TABLE public.{table_name}(
+                id int PRIMARY KEY,
+                include_row boolean NOT NULL,
+                value text
+            );
+            INSERT INTO public.{table_name} VALUES
+                (1, true, 'same'),
+                (6, true, 'entered-filter-locally');
+            SELECT pglogical.create_replication_set({repset}, true, true, true, true);
+            SELECT pglogical.replication_set_add_table(
+                {repset},
+                'public.{table_name}'::regclass,
+                false,
+                NULL,
+                'include_row'
+            );
+            INSERT INTO pgl_validate.peer(name, dsn, backend, replication_sets)
+            VALUES ('remote_filtered', {remote_dsn}, 'native', ARRAY[{repset}]);
+            ",
+            node = sql_literal(&node_name),
+            repset = sql_literal(&repset_name),
+            remote_dsn = sql_literal(&remote_dsn)
+        ))
+        .unwrap();
+
+        let verdict_sql = format!(
+            "
+            SELECT (pgl_validate.compare_table(
+                'public.{table_name}'::regclass,
+                ARRAY['remote_filtered'],
+                '{{\"repsets\":[{repset_json}]}}'::jsonb
+            )).verdict
+            ",
+            repset_json = sql_literal(&repset_name).replace('\'', "\"")
+        );
+        let verdict = Spi::get_one::<String>(&verdict_sql).unwrap().unwrap();
+        assert_eq!(verdict, "match");
+
+        let divergence_sql = format!(
+            "
+            SELECT classification || ';' || status || ';' || node
+            FROM pgl_validate.divergence
+            WHERE table_name = {table_name_lit}
+            ORDER BY detected_at DESC
+            LIMIT 1
+            ",
+            table_name_lit = sql_literal(&table_name)
+        );
+        let divergence = Spi::get_one::<String>(&divergence_sql).unwrap().unwrap();
+        assert_eq!(divergence, "missing_on;advisory;remote_filtered");
 
         let _ = crate::transport::libpq::execute_command(
             &local_dsn,

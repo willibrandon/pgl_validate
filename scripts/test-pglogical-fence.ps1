@@ -517,6 +517,77 @@ SELECT EXISTS (
         throw 'compare_table did not record a converged fence'
     }
 
+    Write-Step 'Validating pglogical row-filter intersection semantics'
+    Invoke-Sql -Database 'provider' -Sql @"
+CREATE TABLE public.filtered_accounts(
+    id int PRIMARY KEY,
+    include_row boolean NOT NULL,
+    value text
+);
+SELECT pglogical.replication_set_add_table(
+    'default',
+    'public.filtered_accounts'::regclass,
+    false,
+    NULL,
+    'include_row'
+);
+"@ | Out-Null
+    Invoke-Sql -Database 'target' -Sql @"
+CREATE TABLE public.filtered_accounts(
+    id int PRIMARY KEY,
+    include_row boolean NOT NULL,
+    value text
+)
+"@ | Out-Null
+    Invoke-Sql -Database 'provider' -Sql @"
+INSERT INTO public.filtered_accounts VALUES
+    (1, true, 'same'),
+    (6, false, 'outside-filter');
+UPDATE public.filtered_accounts
+SET include_row = true,
+    value = 'entered-filter'
+WHERE id = 6;
+"@ | Out-Null
+    Wait-SqlEquals `
+        -Database 'target' `
+        -Sql 'SELECT count(*)::text FROM public.filtered_accounts WHERE id = 1 AND include_row AND value = ''same''' `
+        -Expected '1' `
+        -TimeoutSeconds $TimeoutSeconds
+
+    $filteredVerdict = Invoke-Sql -Database 'provider' -Sql @"
+SELECT (pgl_validate.compare_table(
+    'public.filtered_accounts'::regclass,
+    ARRAY['target'],
+    jsonb_build_object(
+        'provider_dsn', $providerDsnSql,
+        'provider_node', 'provider',
+        'repsets', jsonb_build_array('default'),
+        'fence_timeout_ms', 30000,
+        'fence_poll_interval_ms', 100
+    )
+)).verdict
+"@
+    if ($filteredVerdict -ne 'match') {
+        throw "unexpected filtered compare_table verdict: $filteredVerdict"
+    }
+
+    $filteredAdvisory = Invoke-Sql -Database 'provider' -Sql @"
+SELECT EXISTS (
+    SELECT 1
+    FROM pgl_validate.divergence d
+    JOIN pgl_validate.table_result tr USING (run_id, schema_name, table_name)
+    WHERE d.schema_name = 'public'
+      AND d.table_name = 'filtered_accounts'
+      AND d.node = 'target'
+      AND d.classification = 'missing_on'
+      AND d.status = 'advisory'
+      AND tr.verdict = 'match'
+)::text
+"@
+    if ($filteredAdvisory -ne 'true') {
+        throw 'pglogical filtered-table presence difference was not recorded as advisory'
+    }
+
     Write-Step 'Creating subscriber-side drift and confirming key-level divergence'
     Invoke-Sql -Database 'target' -Sql "UPDATE public.accounts SET value = 'target-drift' WHERE id = 1" | Out-Null
     $driftVerdict = Invoke-Sql -Database 'provider' -Sql @"

@@ -365,6 +365,8 @@ RETURNS TABLE (
     repl_delete boolean,
     repl_truncate boolean,
     has_row_filter boolean,
+    row_filter_sql text,
+    row_filter_exact boolean,
     sync_status "char",
     validated_property text,
     exact_comparable boolean,
@@ -376,6 +378,7 @@ AS $$
 DECLARE
     info record;
     action_rec record;
+    filter_rec record;
     status_text text;
 BEGIN
     IF to_regprocedure('pglogical.show_repset_table_info(regclass,text[])') IS NULL THEN
@@ -416,6 +419,8 @@ BEGIN
         repl_delete := false;
         repl_truncate := false;
         has_row_filter := false;
+        row_filter_sql := NULL;
+        row_filter_exact := true;
         sync_status := NULL;
         validated_property := 'skipped';
         exact_comparable := false;
@@ -437,7 +442,6 @@ BEGIN
           AND a.attnum > 0
           AND NOT a.attisdropped;
     END IF;
-    has_row_filter := COALESCE(info.has_row_filter, false);
 
     SELECT bool_or(rs.replicate_insert) AS repl_insert,
            bool_or(rs.replicate_update) AS repl_update,
@@ -451,6 +455,36 @@ BEGIN
     repl_update := COALESCE(action_rec.repl_update, false);
     repl_delete := COALESCE(action_rec.repl_delete, false);
     repl_truncate := COALESCE(action_rec.repl_truncate, false);
+
+    SELECT
+        COALESCE(bool_or(rst.set_row_filter IS NULL), false) AS has_unfiltered_membership,
+        count(*) FILTER (WHERE rst.set_row_filter IS NOT NULL) AS filtered_memberships,
+        string_agg(
+            format('(%s)', pg_get_expr(rst.set_row_filter, rst.set_reloid)),
+            ' OR '
+            ORDER BY rs.set_name::text
+        ) FILTER (WHERE rst.set_row_filter IS NOT NULL) AS predicate,
+        bool_and(
+            pgl_validate.row_filter_tree_is_immutable(rst.set_row_filter::text)
+            AND pg_get_expr(rst.set_row_filter, rst.set_reloid) !~*
+                '(^|[^[:alnum:]_])(current_user|session_user|current_role|current_setting|set_config|current_schema|current_schemas)([^[:alnum:]_]|$)'
+        ) FILTER (WHERE rst.set_row_filter IS NOT NULL) AS exact
+    INTO filter_rec
+    FROM pglogical.replication_set_table rst
+    JOIN pglogical.replication_set rs ON rs.set_id = rst.set_id
+    WHERE rst.set_reloid = relation
+      AND rs.set_name::text = ANY (repsets);
+
+    IF COALESCE(filter_rec.has_unfiltered_membership, false)
+       OR COALESCE(filter_rec.filtered_memberships, 0) = 0 THEN
+        has_row_filter := false;
+        row_filter_sql := NULL;
+        row_filter_exact := true;
+    ELSE
+        has_row_filter := true;
+        row_filter_sql := filter_rec.predicate;
+        row_filter_exact := COALESCE(filter_rec.exact, false);
+    END IF;
 
     sync_status := 'r';
     IF subscription_name IS NOT NULL THEN
@@ -481,10 +515,14 @@ BEGIN
         validated_property := 'unsupported_mask';
         exact_comparable := false;
         reason := 'replicate_insert=false means the provider row set does not bound the subscriber';
-    ELSIF has_row_filter AND repl_update THEN
+    ELSIF has_row_filter AND repl_update AND row_filter_exact THEN
         validated_property := 'filtered_intersection';
+        exact_comparable := true;
+        reason := 'pglogical row filter is immutable/context-free; validating content intersection with advisory presence differences';
+    ELSIF has_row_filter AND repl_update THEN
+        validated_property := 'skipped';
         exact_comparable := false;
-        reason := 'pglogical row filters allow legitimate presence differences; localization is required';
+        reason := 'pglogical row filter is not immutable/context-free; exact validation would be session-sensitive';
     ELSIF has_row_filter THEN
         validated_property := 'filtered_advisory';
         exact_comparable := false;
@@ -495,11 +533,11 @@ BEGIN
         reason := 'full pglogical action mask with no row filter';
     ELSIF repl_update THEN
         validated_property := 'superset';
-        exact_comparable := false;
+        exact_comparable := true;
         reason := 'delete or truncate is not replicated, so subscriber extras are legitimate';
     ELSE
         validated_property := 'keys_only';
-        exact_comparable := false;
+        exact_comparable := true;
         reason := 'updates are not replicated, so content drift is contract-permitted';
     END IF;
 
@@ -743,7 +781,8 @@ CREATE FUNCTION pgl_validate.plan_chunk_sql(
     lo bytea,
     hi bytea,
     cols text[],
-    repsets text[] DEFAULT NULL
+    repsets text[] DEFAULT NULL,
+    row_filter_sql text DEFAULT NULL
 )
 RETURNS text
 LANGUAGE plpgsql
@@ -807,10 +846,14 @@ BEGIN
       AND NOT a.attisdropped;
 
     RETURN format(
-        'SELECT count(*)::bigint AS n_rows, pgl_validate.lthash_bytes(pgl_validate.lthash(pgl_validate.row_digest(%L::int[], %s))) AS lthash FROM %s t WHERE true',
+        'SELECT count(*)::bigint AS n_rows, pgl_validate.lthash_bytes(pgl_validate.lthash(pgl_validate.row_digest(%L::int[], %s))) AS lthash FROM %s t WHERE %s',
         enc_modes::text,
         digest_args,
-        rel_sql
+        rel_sql,
+        CASE
+            WHEN row_filter_sql IS NULL OR btrim(row_filter_sql) = '' THEN 'true'
+            ELSE format('(%s)', row_filter_sql)
+        END
     );
 END
 $$;
@@ -821,7 +864,8 @@ $$;
 CREATE FUNCTION pgl_validate.plan_localize_sql(
     rel regclass,
     key_cols text[],
-    cols text[]
+    cols text[],
+    row_filter_sql text DEFAULT NULL
 )
 RETURNS text
 LANGUAGE plpgsql
@@ -902,13 +946,17 @@ BEGIN
      AND NOT a.attisdropped;
 
     RETURN format(
-        'SELECT jsonb_build_object(%s)::text AS key_text, pgl_validate.row_digest(%L::int[], %s) AS key_bytes, pgl_validate.row_digest(%L::int[], %s) AS row_digest FROM %s t ORDER BY %s',
+        'SELECT jsonb_build_object(%s)::text AS key_text, pgl_validate.row_digest(%L::int[], %s) AS key_bytes, pgl_validate.row_digest(%L::int[], %s) AS row_digest FROM %s t WHERE %s ORDER BY %s',
         key_text_args,
         key_enc_modes::text,
         key_digest_args,
         enc_modes::text,
         digest_args,
         rel_sql,
+        CASE
+            WHEN row_filter_sql IS NULL OR btrim(row_filter_sql) = '' THEN 'true'
+            ELSE format('(%s)', row_filter_sql)
+        END,
         order_args
     );
 END
@@ -941,6 +989,8 @@ DECLARE
     repl_delete boolean := true;
     repl_truncate boolean := true;
     has_row_filter boolean := false;
+    row_filter_sql text;
+    row_filter_exact boolean := true;
     sync_status "char" := 'r';
     validated_property text := 'full';
     exact_comparable boolean := true;
@@ -960,7 +1010,9 @@ DECLARE
     peer_rec record;
     remote_rec record;
     checksum_sql text;
+    remote_checksum_sql text;
     localize_sql text;
+    remote_localize_sql text;
     n_rows bigint;
     lthash bytea;
     differ_count int := 0;
@@ -1079,6 +1131,8 @@ BEGIN
         repl_delete := contract_rec.repl_delete;
         repl_truncate := contract_rec.repl_truncate;
         has_row_filter := contract_rec.has_row_filter;
+        row_filter_sql := contract_rec.row_filter_sql;
+        row_filter_exact := contract_rec.row_filter_exact;
         sync_status := contract_rec.sync_status;
         validated_property := contract_rec.validated_property;
         exact_comparable := contract_rec.exact_comparable;
@@ -1104,6 +1158,21 @@ BEGIN
     );
 
     IF NOT exact_comparable THEN
+        IF has_row_filter AND NOT row_filter_exact THEN
+            INSERT INTO pgl_validate.schema_issue(
+                run_id, node, schema_name, table_name, issue_code, detail
+            )
+            VALUES (
+                v_run_id,
+                provider_node,
+                v_schema_name,
+                v_rel_name,
+                'NONDETERMINISTIC_ROW_FILTER',
+                contract_reason
+            )
+            ON CONFLICT DO NOTHING;
+        END IF;
+
         verdict := CASE
             WHEN validated_property IN ('skipped','unsupported_mask') THEN 'skipped'
             ELSE 'partial'
@@ -1241,7 +1310,24 @@ BEGIN
     SET status = 'running'
     WHERE pgl_validate.run.run_id = v_run_id;
 
-    checksum_sql := pgl_validate.plan_chunk_sql(p_table_name, key_cols, NULL, NULL, cols, NULL);
+    checksum_sql := pgl_validate.plan_chunk_sql(
+        p_table_name,
+        key_cols,
+        NULL,
+        NULL,
+        cols,
+        NULL,
+        CASE WHEN validated_property = 'filtered_intersection' THEN row_filter_sql ELSE NULL END
+    );
+    remote_checksum_sql := pgl_validate.plan_chunk_sql(
+        p_table_name,
+        key_cols,
+        NULL,
+        NULL,
+        cols,
+        NULL,
+        NULL
+    );
     EXECUTE checksum_sql INTO n_rows, lthash;
 
     INSERT INTO pgl_validate.table_node_result(
@@ -1262,7 +1348,7 @@ BEGIN
         INTO remote_rec
         FROM pgl_validate.remote_checksum(
             peer_rec.dsn,
-            checksum_sql,
+            remote_checksum_sql,
             peer_rec.connect_timeout_seconds,
             peer_rec.statement_timeout_ms,
             peer_rec.lock_timeout_ms
@@ -1299,7 +1385,18 @@ BEGIN
         VALUES (v_run_id, 1)
         ON CONFLICT DO NOTHING;
 
-        localize_sql := pgl_validate.plan_localize_sql(p_table_name, key_cols, cols);
+        localize_sql := pgl_validate.plan_localize_sql(
+            p_table_name,
+            key_cols,
+            cols,
+            CASE WHEN validated_property = 'filtered_intersection' THEN row_filter_sql ELSE NULL END
+        );
+        remote_localize_sql := pgl_validate.plan_localize_sql(
+            p_table_name,
+            key_cols,
+            cols,
+            NULL
+        );
 
         IF to_regclass('pg_temp.pgl_validate_localized_sample') IS NOT NULL THEN
             DROP TABLE pg_temp.pgl_validate_localized_sample;
@@ -1335,7 +1432,7 @@ BEGIN
             SELECT 'A', peer_rec.name, r.key_text, r.key_bytes, r.row_digest
             FROM pgl_validate.remote_localize_rows(
                 peer_rec.dsn,
-                localize_sql,
+                remote_localize_sql,
                 peer_rec.connect_timeout_seconds,
                 peer_rec.statement_timeout_ms,
                 peer_rec.lock_timeout_ms
@@ -1483,7 +1580,7 @@ BEGIN
                 SELECT 'B', peer_rec.name, r.key_text, r.key_bytes, r.row_digest
                 FROM pgl_validate.remote_localize_rows(
                     peer_rec.dsn,
-                    localize_sql,
+                    remote_localize_sql,
                     peer_rec.connect_timeout_seconds,
                     peer_rec.statement_timeout_ms,
                     peer_rec.lock_timeout_ms
