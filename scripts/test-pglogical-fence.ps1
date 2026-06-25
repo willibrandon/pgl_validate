@@ -313,6 +313,29 @@ SELECT COALESCE((
     throw "timed out waiting for pglogical subscription readiness: $last"
 }
 
+function Wait-SqlEquals {
+    param(
+        [string] $Database,
+        [string] $Sql,
+        [string] $Expected,
+        [int] $TimeoutSeconds
+    )
+
+    $deadline = [DateTimeOffset]::Now.AddSeconds($TimeoutSeconds)
+    $last = ''
+
+    while ([DateTimeOffset]::Now -lt $deadline) {
+        $last = Invoke-Sql -Database $Database -Sql $Sql
+        if ($last -eq $Expected) {
+            return
+        }
+
+        Start-Sleep -Milliseconds 250
+    }
+
+    throw "timed out waiting for SQL result '$Expected' on ${Database}; last result: $last"
+}
+
 $pgConfig = Get-PgrxPgConfig -PgMajor $PgMajor
 $pgBin = Split-Path -Parent $pgConfig
 $script:InitDb = Join-Path $pgBin 'initdb.exe'
@@ -373,16 +396,21 @@ try {
     Invoke-Sql -Database 'provider' -Sql 'CREATE EXTENSION pglogical' | Out-Null
     Invoke-Sql -Database 'provider' -Sql "SELECT pglogical.create_node('provider', $providerDsnSql)" | Out-Null
     Invoke-Sql -Database 'provider' -Sql 'SELECT pgl_validate.ensure_pglogical_barrier_repset()' | Out-Null
+    Invoke-Sql -Database 'provider' -Sql @"
+CREATE TABLE public.accounts(id int PRIMARY KEY, value text);
+SELECT pglogical.replication_set_add_table('default', 'public.accounts'::regclass, false);
+"@ | Out-Null
 
     Write-Step 'Creating pglogical target node and subscription'
     Invoke-Sql -Database 'target' -Sql 'CREATE EXTENSION pgl_validate' | Out-Null
     Invoke-Sql -Database 'target' -Sql 'CREATE EXTENSION pglogical' | Out-Null
+    Invoke-Sql -Database 'target' -Sql 'CREATE TABLE public.accounts(id int PRIMARY KEY, value text)' | Out-Null
     Invoke-Sql -Database 'target' -Sql "SELECT pglogical.create_node('target', $targetDsnSql)" | Out-Null
     Invoke-Sql -Database 'target' -Sql @"
 SELECT pglogical.create_subscription(
     'sub',
     $providerDsnSql,
-    ARRAY['pgl_validate_barrier'],
+    ARRAY['default','pgl_validate_barrier'],
     false,
     false,
     ARRAY['all']
@@ -392,6 +420,14 @@ SELECT pglogical.create_subscription(
     Write-Step 'Waiting for pglogical subscription readiness'
     $slotName = Wait-SubscriptionReady -TimeoutSeconds $TimeoutSeconds
     $slotNameSql = Sql-Literal $slotName
+
+    Write-Step 'Replicating user table row for compare_table validation'
+    Invoke-Sql -Database 'provider' -Sql "INSERT INTO public.accounts VALUES (1, 'same')" | Out-Null
+    Wait-SqlEquals `
+        -Database 'target' `
+        -Sql 'SELECT count(*)::text FROM public.accounts WHERE id = 1 AND value = ''same''' `
+        -Expected '1' `
+        -TimeoutSeconds $TimeoutSeconds
 
     Write-Step "Fencing provider->target edge through slot $slotName"
     $observed = Invoke-Sql -Database 'postgres' -Sql @"
@@ -444,7 +480,44 @@ SELECT EXISTS (
         throw "fence catalog rows were not recorded"
     }
 
-    Write-Output "pglogical fence test passed on pg$PgMajor using slot $slotName"
+    Write-Step 'Running compare_table through real pglogical fencing'
+    Invoke-Sql -Database 'provider' -Sql @"
+INSERT INTO pgl_validate.peer(name, dsn, backend, subscription_name, replication_sets)
+VALUES ('target', $targetDsnSql, 'pglogical', 'sub', ARRAY['default'])
+"@ | Out-Null
+    $compareVerdict = Invoke-Sql -Database 'provider' -Sql @"
+SELECT (pgl_validate.compare_table(
+    'public.accounts'::regclass,
+    ARRAY['target'],
+    jsonb_build_object(
+        'provider_dsn', $providerDsnSql,
+        'provider_node', 'provider',
+        'repsets', jsonb_build_array('default'),
+        'fence_timeout_ms', 30000,
+        'fence_poll_interval_ms', 100
+    )
+)).verdict
+"@
+    if ($compareVerdict -ne 'match') {
+        throw "unexpected compare_table verdict: $compareVerdict"
+    }
+
+    $compareFenceRecorded = Invoke-Sql -Database 'provider' -Sql @"
+SELECT EXISTS (
+    SELECT 1
+    FROM pgl_validate.table_result tr
+    JOIN pgl_validate.fence_attempt fa USING (run_id)
+    WHERE tr.schema_name = 'public'
+      AND tr.table_name = 'accounts'
+      AND tr.verdict = 'match'
+      AND fa.status = 'converged'
+)::text
+"@
+    if ($compareFenceRecorded -ne 'true') {
+        throw 'compare_table did not record a converged fence'
+    }
+
+    Write-Output "pglogical fence and compare_table tests passed on pg$PgMajor using slot $slotName"
 }
 catch {
     if (Test-Path -LiteralPath $log) {

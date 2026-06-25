@@ -63,6 +63,7 @@ bindgen error means that environment is missing from the cargo process.
 
 ## Status
 
-The repository is being built from the design outward. The first slice covers
-the extension scaffold, catalog DDL, row digest framing, LtHash state, and the
-barrier metadata invariants that pglogical-backed validation relies on.
+The repository is being built from the design outward. The current slice covers
+catalog DDL, row digest framing, LtHash state, pglogical contract discovery,
+edge-specific barrier fencing, and a fenced `compare_table` path exercised
+against a real pglogical subscription.

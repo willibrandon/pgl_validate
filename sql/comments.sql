@@ -100,6 +100,8 @@ COMMENT ON FUNCTION pgl_validate.remote_wait_slot_confirm_lsn(text, text, pg_lsn
     'Call pglogical.wait_slot_confirm_lsn on a provider and return the slot confirmed_flush_lsn.';
 COMMENT ON FUNCTION pgl_validate.remote_observe_barrier(text, text, uuid, pg_lsn, integer, integer, integer) IS
     'Observe target-side replication origin progress, barrier-token visibility, and convergence.';
+COMMENT ON FUNCTION pgl_validate.remote_pglogical_subscription_status(text, text, integer, integer, integer) IS
+    'Fetch pglogical subscription status from a remote target over libpq with bounded timeouts.';
 COMMENT ON TYPE pgl_validate.lthash_state IS
     'Internal varlena state for the LtHash multiset accumulator.';
 COMMENT ON FUNCTION pgl_validate.lthash_state_in(cstring) IS

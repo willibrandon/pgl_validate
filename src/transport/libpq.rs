@@ -69,6 +69,23 @@ pub(crate) struct BarrierObservation {
     pub(crate) converged: bool,
 }
 
+/// pglogical subscription status fetched from a remote target node.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) struct SubscriptionStatus {
+    /// Subscription lifecycle status, such as `replicating`.
+    pub(crate) status: String,
+    /// Provider node name reported by pglogical.
+    pub(crate) provider_node: String,
+    /// Provider DSN stored by the subscription.
+    pub(crate) provider_dsn: String,
+    /// Logical replication slot name used by the subscription.
+    pub(crate) slot_name: String,
+    /// JSON text for the subscription replication-set array.
+    pub(crate) replication_sets_json: String,
+    /// JSON text for the subscription forward-origins array.
+    pub(crate) forward_origins_json: String,
+}
+
 struct Connection {
     raw: *mut PGconn,
 }
@@ -339,6 +356,46 @@ pub(crate) fn observe_barrier(
         origin_progress_lsn: parse_lsn(&result.value(0, 0)?)?,
         token_visible: parse_bool(&result.value(0, 1)?)?,
         converged: parse_bool(&result.value(0, 2)?)?,
+    })
+}
+
+/// Fetch pglogical subscription status from a remote target node.
+pub(crate) fn fetch_subscription_status(
+    dsn: &str,
+    subscription_name: &str,
+    connect_timeout_seconds: i32,
+    statement_timeout_ms: i32,
+    lock_timeout_ms: i32,
+) -> Result<SubscriptionStatus, String> {
+    let conn = Connection::connect_with_timeout(dsn, connect_timeout_seconds)?;
+    conn.set_query_timeouts(statement_timeout_ms, lock_timeout_ms)?;
+
+    let subscription_name = sql_literal(subscription_name);
+    let result = conn.exec(&format!(
+        "SELECT status, \
+                provider_node, \
+                provider_dsn, \
+                slot_name, \
+                COALESCE(to_json(replication_sets)::text, '[]') AS replication_sets_json, \
+                COALESCE(to_json(forward_origins)::text, '[]') AS forward_origins_json \
+         FROM pglogical.show_subscription_status({subscription_name}::name)"
+    ))?;
+    result.require_status(PGRES_TUPLES_OK)?;
+    if result.ntuples() != 1 || result.nfields() != 6 {
+        return Err(format!(
+            "expected one pglogical subscription status row with 6 columns, got {} row(s) and {} column(s)",
+            result.ntuples(),
+            result.nfields()
+        ));
+    }
+
+    Ok(SubscriptionStatus {
+        status: result.value(0, 0)?,
+        provider_node: result.value(0, 1)?,
+        provider_dsn: result.value(0, 2)?,
+        slot_name: result.value(0, 3)?,
+        replication_sets_json: result.value(0, 4)?,
+        forward_origins_json: result.value(0, 5)?,
     })
 }
 

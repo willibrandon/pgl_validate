@@ -310,6 +310,69 @@ AS 'MODULE_PATHNAME', 'remote_observe_barrier_wrapper';
         ))
     }
 
+    /// Fetch pglogical subscription status from a remote target node.
+    #[pg_extern(
+        volatile,
+        parallel_unsafe,
+        sql = r#"
+CREATE FUNCTION pgl_validate.remote_pglogical_subscription_status(
+    dsn text,
+    subscription_name text,
+    connect_timeout_seconds integer DEFAULT 10,
+    statement_timeout_ms integer DEFAULT 600000,
+    lock_timeout_ms integer DEFAULT 30000
+)
+RETURNS TABLE (
+    status text,
+    provider_node text,
+    provider_dsn text,
+    slot_name text,
+    replication_sets_json text,
+    forward_origins_json text
+)
+LANGUAGE c
+STRICT
+VOLATILE
+PARALLEL UNSAFE
+AS 'MODULE_PATHNAME', 'remote_pglogical_subscription_status_wrapper';
+"#
+    )]
+    fn remote_pglogical_subscription_status(
+        dsn: &str,
+        subscription_name: &str,
+        connect_timeout_seconds: default!(i32, 10),
+        statement_timeout_ms: default!(i32, 600000),
+        lock_timeout_ms: default!(i32, 30000),
+    ) -> TableIterator<
+        'static,
+        (
+            name!(status, String),
+            name!(provider_node, String),
+            name!(provider_dsn, String),
+            name!(slot_name, String),
+            name!(replication_sets_json, String),
+            name!(forward_origins_json, String),
+        ),
+    > {
+        let status = transport::libpq::fetch_subscription_status(
+            dsn,
+            subscription_name,
+            connect_timeout_seconds,
+            statement_timeout_ms,
+            lock_timeout_ms,
+        )
+        .unwrap_or_else(|err| pgrx::error!("{err}"));
+
+        TableIterator::once((
+            status.status,
+            status.provider_node,
+            status.provider_dsn,
+            status.slot_name,
+            status.replication_sets_json,
+            status.forward_origins_json,
+        ))
+    }
+
     #[pg_aggregate]
     impl Aggregate<lthash_state> for lthash_state {
         type State = PgVarlena<Self>;
@@ -837,7 +900,8 @@ mod tests {
         .unwrap();
 
         Spi::run(&format!(
-            "INSERT INTO pgl_validate.peer(name, dsn) VALUES ('self_peer', {})",
+            "INSERT INTO pgl_validate.peer(name, dsn, backend)
+             VALUES ('self_peer', {}, 'native')",
             sql_literal(&dsn)
         ))
         .unwrap();
@@ -855,6 +919,44 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(participants, 2);
+    }
+
+    #[pg_test]
+    fn compare_table_refuses_unfenced_pglogical_peer() {
+        Spi::run(
+            "
+            CREATE TABLE unfenced_pglogical_peer(id int PRIMARY KEY, value text);
+            INSERT INTO unfenced_pglogical_peer VALUES (1, 'same');
+            INSERT INTO pgl_validate.peer(name, dsn, backend, subscription_name)
+            VALUES ('pglogical_without_provider', 'dbname=' || current_database(), 'pglogical', 'sub');
+            ",
+        )
+        .unwrap();
+
+        Spi::run(
+            r#"
+            DO $$
+            DECLARE
+                rejected boolean := false;
+            BEGIN
+                BEGIN
+                    PERFORM pgl_validate.compare_table('unfenced_pglogical_peer'::regclass);
+                EXCEPTION WHEN others THEN
+                    IF SQLERRM = 'options.provider_dsn is required when comparing pglogical peers' THEN
+                        rejected := true;
+                    ELSE
+                        RAISE;
+                    END IF;
+                END;
+
+                IF NOT rejected THEN
+                    RAISE EXCEPTION 'expected compare_table to reject an unfenced pglogical peer';
+                END IF;
+            END
+            $$;
+            "#,
+        )
+        .unwrap();
     }
 
     #[pg_test]
@@ -886,7 +988,8 @@ mod tests {
         Spi::run(&format!(
             "CREATE TABLE public.{table_name}(id int PRIMARY KEY, value text);
              INSERT INTO public.{table_name} VALUES (1, 'local');
-             INSERT INTO pgl_validate.peer(name, dsn) VALUES ('remote_diff', {});",
+             INSERT INTO pgl_validate.peer(name, dsn, backend)
+             VALUES ('remote_diff', {}, 'native');",
             sql_literal(&remote_dsn)
         ))
         .unwrap();
@@ -1257,8 +1360,8 @@ mod tests {
                 false,
                 ARRAY['id','kept']
             );
-            INSERT INTO pgl_validate.peer(name, dsn, replication_sets)
-            VALUES ('remote_projection', {remote_dsn}, ARRAY[{repset}]);
+            INSERT INTO pgl_validate.peer(name, dsn, backend, replication_sets)
+            VALUES ('remote_projection', {remote_dsn}, 'native', ARRAY[{repset}]);
             ",
             node = sql_literal(&node_name),
             repset = sql_literal(&repset_name),

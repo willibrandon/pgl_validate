@@ -849,6 +849,13 @@ DECLARE
     pglogical_available boolean;
     table_in_pglogical boolean := false;
     requested_backend text;
+    provider_dsn text;
+    provider_node text;
+    fence_timeout_ms int;
+    fence_poll_interval_ms int;
+    edge_seq int := 0;
+    subscription_rec record;
+    fence_rec pgl_validate.fence_attempt;
     peer_names text[];
     missing_peers text[];
     peer_rec record;
@@ -888,8 +895,19 @@ BEGIN
       AND i.indisprimary;
 
     requested_backend := COALESCE(NULLIF(options->>'backend', ''), 'pglogical');
+    provider_dsn := NULLIF(options->>'provider_dsn', '');
+    provider_node := COALESCE(NULLIF(options->>'provider_node', ''), 'local');
+    fence_timeout_ms := COALESCE((NULLIF(options->>'fence_timeout_ms', ''))::int, 300000);
+    fence_poll_interval_ms := COALESCE((NULLIF(options->>'fence_poll_interval_ms', ''))::int, 100);
     contract_subscription := NULLIF(options->>'subscription', '')::name;
     pglogical_available := to_regprocedure('pglogical.show_repset_table_info(regclass,text[])') IS NOT NULL;
+
+    IF fence_timeout_ms <= 0 THEN
+        RAISE EXCEPTION 'fence_timeout_ms must be greater than zero';
+    END IF;
+    IF fence_poll_interval_ms <= 0 THEN
+        RAISE EXCEPTION 'fence_poll_interval_ms must be greater than zero';
+    END IF;
 
     IF peers IS NULL OR cardinality(peers) = 0 THEN
         SELECT COALESCE(array_agg(p.name ORDER BY p.name), ARRAY[]::text[])
@@ -1015,6 +1033,110 @@ BEGIN
 
         RETURN result_row;
     END IF;
+
+    IF EXISTS (
+        SELECT 1
+        FROM pgl_validate.peer p
+        WHERE p.name = ANY (peer_names)
+          AND p.backend = 'pglogical'
+    ) THEN
+        IF provider_dsn IS NULL THEN
+            RAISE EXCEPTION
+                'options.provider_dsn is required when comparing pglogical peers'
+                USING ERRCODE = '0A000';
+        END IF;
+
+        INSERT INTO pgl_validate.fence_epoch(run_id, epoch_seq)
+        VALUES (v_run_id, 1);
+
+        UPDATE pgl_validate.run
+        SET status = 'fencing'
+        WHERE pgl_validate.run.run_id = v_run_id;
+
+        FOR peer_rec IN
+            SELECT p.name, p.dsn, p.backend, p.subscription_name,
+                   p.connect_timeout_seconds,
+                   p.statement_timeout_ms,
+                   p.lock_timeout_ms
+            FROM pgl_validate.peer p
+            WHERE p.name = ANY (peer_names)
+              AND p.backend = 'pglogical'
+            ORDER BY p.name
+        LOOP
+            IF peer_rec.subscription_name IS NULL THEN
+                RAISE EXCEPTION
+                    'pglogical peer % requires subscription_name for exact barrier fencing',
+                    peer_rec.name
+                    USING ERRCODE = '0A000';
+            END IF;
+
+            SELECT *
+            INTO subscription_rec
+            FROM pgl_validate.remote_pglogical_subscription_status(
+                peer_rec.dsn,
+                peer_rec.subscription_name::text,
+                peer_rec.connect_timeout_seconds,
+                peer_rec.statement_timeout_ms,
+                peer_rec.lock_timeout_ms
+            );
+
+            IF subscription_rec.status <> 'replicating' THEN
+                RAISE EXCEPTION
+                    'pglogical peer % subscription % is %, not replicating',
+                    peer_rec.name,
+                    peer_rec.subscription_name,
+                    subscription_rec.status
+                    USING ERRCODE = '57014';
+            END IF;
+
+            IF NOT (subscription_rec.replication_sets_json::jsonb ? 'pgl_validate_barrier') THEN
+                RAISE EXCEPTION
+                    'pglogical peer % subscription % does not include pgl_validate_barrier',
+                    peer_rec.name,
+                    peer_rec.subscription_name
+                    USING ERRCODE = '0A000';
+            END IF;
+
+            edge_seq := edge_seq + 1;
+            SELECT *
+            INTO fence_rec
+            FROM pgl_validate.fence_pglogical_edge(
+                v_run_id,
+                1,
+                edge_seq,
+                provider_node,
+                peer_rec.name,
+                provider_dsn,
+                peer_rec.dsn,
+                peer_rec.subscription_name::text,
+                subscription_rec.slot_name,
+                subscription_rec.slot_name,
+                ARRAY['pgl_validate_barrier'],
+                peer_rec.connect_timeout_seconds,
+                peer_rec.statement_timeout_ms,
+                peer_rec.lock_timeout_ms,
+                fence_timeout_ms,
+                fence_poll_interval_ms
+            );
+
+            IF fence_rec.status <> 'converged' THEN
+                RAISE EXCEPTION
+                    'pglogical peer % failed to converge barrier fence: %',
+                    peer_rec.name,
+                    fence_rec.status
+                    USING ERRCODE = '57014';
+            END IF;
+        END LOOP;
+
+        UPDATE pgl_validate.run_participant
+        SET status = 'converged'
+        WHERE pgl_validate.run_participant.run_id = v_run_id
+          AND node = 'local';
+    END IF;
+
+    UPDATE pgl_validate.run
+    SET status = 'running'
+    WHERE pgl_validate.run.run_id = v_run_id;
 
     checksum_sql := pgl_validate.plan_chunk_sql(table_name, key_cols, NULL, NULL, cols, NULL);
     EXECUTE checksum_sql INTO n_rows, lthash;
