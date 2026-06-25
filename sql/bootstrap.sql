@@ -5,6 +5,8 @@ CREATE TABLE pgl_validate.peer (
     dsn                     text NOT NULL,
     backend                 text NOT NULL DEFAULT 'pglogical'
                             CHECK (backend IN ('pglogical','native','standby')),
+    subscription_name       name,
+    replication_sets        text[],
     connect_timeout_seconds int NOT NULL DEFAULT 10
                             CHECK (connect_timeout_seconds > 0),
     statement_timeout_ms    int NOT NULL DEFAULT 600000
@@ -344,6 +346,167 @@ AS $$
     WHERE t.oid = type_oid
 $$;
 
+-- Resolve the pglogical replication contract for one relation. The effective
+-- column list is taken from pglogical.show_repset_table_info(), because that is
+-- pglogical's own resolved bitmap after combining all covering repsets.
+CREATE FUNCTION pgl_validate.pglogical_table_contract(
+    relation regclass,
+    input_repsets text[] DEFAULT NULL,
+    subscription_name name DEFAULT NULL
+)
+RETURNS TABLE (
+    schema_name text,
+    table_name text,
+    key_cols text[],
+    att_list text[],
+    repsets text[],
+    repl_insert boolean,
+    repl_update boolean,
+    repl_delete boolean,
+    repl_truncate boolean,
+    has_row_filter boolean,
+    sync_status "char",
+    validated_property text,
+    exact_comparable boolean,
+    reason text
+)
+LANGUAGE plpgsql
+STABLE
+AS $$
+DECLARE
+    info record;
+    action_rec record;
+    status_text text;
+BEGIN
+    IF to_regprocedure('pglogical.show_repset_table_info(regclass,text[])') IS NULL THEN
+        RAISE EXCEPTION 'pglogical extension is not installed in this database'
+            USING ERRCODE = '0A000';
+    END IF;
+
+    SELECT n.nspname, c.relname
+    INTO schema_name, table_name
+    FROM pg_class c
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE c.oid = relation;
+
+    SELECT array_agg(a.attname ORDER BY ord.ordinality)
+    INTO key_cols
+    FROM pg_index i
+    CROSS JOIN LATERAL unnest(i.indkey) WITH ORDINALITY AS ord(attnum, ordinality)
+    JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ord.attnum
+    WHERE i.indrelid = relation
+      AND i.indisprimary;
+
+    IF input_repsets IS NULL OR cardinality(input_repsets) = 0 THEN
+        SELECT array_agg(DISTINCT rs.set_name::text ORDER BY rs.set_name::text)
+        INTO repsets
+        FROM pglogical.replication_set_table rst
+        JOIN pglogical.replication_set rs ON rs.set_id = rst.set_id
+        WHERE rst.set_reloid = relation;
+    ELSE
+        SELECT array_agg(DISTINCT requested.repset ORDER BY requested.repset)
+        INTO repsets
+        FROM unnest(input_repsets) AS requested(repset);
+    END IF;
+
+    IF repsets IS NULL OR cardinality(repsets) = 0 THEN
+        att_list := NULL;
+        repl_insert := false;
+        repl_update := false;
+        repl_delete := false;
+        repl_truncate := false;
+        has_row_filter := false;
+        sync_status := NULL;
+        validated_property := 'skipped';
+        exact_comparable := false;
+        reason := 'table is not a member of any selected pglogical replication set';
+        RETURN NEXT;
+        RETURN;
+    END IF;
+
+    SELECT *
+    INTO info
+    FROM pglogical.show_repset_table_info(relation, repsets);
+
+    att_list := info.att_list;
+    IF att_list IS NULL OR cardinality(att_list) = 0 THEN
+        SELECT array_agg(a.attname ORDER BY a.attname)
+        INTO att_list
+        FROM pg_attribute a
+        WHERE a.attrelid = relation
+          AND a.attnum > 0
+          AND NOT a.attisdropped;
+    END IF;
+    has_row_filter := COALESCE(info.has_row_filter, false);
+
+    SELECT bool_or(rs.replicate_insert) AS repl_insert,
+           bool_or(rs.replicate_update) AS repl_update,
+           bool_or(rs.replicate_delete) AS repl_delete,
+           bool_or(rs.replicate_truncate) AS repl_truncate
+    INTO action_rec
+    FROM pglogical.replication_set rs
+    WHERE rs.set_name::text = ANY (repsets);
+
+    repl_insert := COALESCE(action_rec.repl_insert, false);
+    repl_update := COALESCE(action_rec.repl_update, false);
+    repl_delete := COALESCE(action_rec.repl_delete, false);
+    repl_truncate := COALESCE(action_rec.repl_truncate, false);
+
+    sync_status := 'r';
+    IF subscription_name IS NOT NULL THEN
+        SELECT s.status
+        INTO status_text
+        FROM pglogical.show_subscription_table(subscription_name, relation) AS s;
+
+        IF status_text IS NOT NULL THEN
+            sync_status := left(status_text, 1)::"char";
+        END IF;
+    ELSE
+        SELECT lss.sync_status
+        INTO sync_status
+        FROM pglogical.local_sync_status lss
+        WHERE lss.sync_nspname = schema_name::name
+          AND lss.sync_relname = table_name::name
+        ORDER BY lss.sync_statuslsn DESC
+        LIMIT 1;
+
+        sync_status := COALESCE(sync_status, 'r');
+    END IF;
+
+    IF sync_status <> 'r' THEN
+        validated_property := 'skipped';
+        exact_comparable := false;
+        reason := format('pglogical sync status is %s, not ready', sync_status);
+    ELSIF NOT repl_insert THEN
+        validated_property := 'unsupported_mask';
+        exact_comparable := false;
+        reason := 'replicate_insert=false means the provider row set does not bound the subscriber';
+    ELSIF has_row_filter AND repl_update THEN
+        validated_property := 'filtered_intersection';
+        exact_comparable := false;
+        reason := 'pglogical row filters allow legitimate presence differences; localization is required';
+    ELSIF has_row_filter THEN
+        validated_property := 'filtered_advisory';
+        exact_comparable := false;
+        reason := 'pglogical filtered table without update replication is advisory only';
+    ELSIF repl_update AND repl_delete AND repl_truncate THEN
+        validated_property := 'full';
+        exact_comparable := true;
+        reason := 'full pglogical action mask with no row filter';
+    ELSIF repl_update THEN
+        validated_property := 'superset';
+        exact_comparable := false;
+        reason := 'delete or truncate is not replicated, so subscriber extras are legitimate';
+    ELSE
+        validated_property := 'keys_only';
+        exact_comparable := false;
+        reason := 'updates are not replicated, so content drift is contract-permitted';
+    END IF;
+
+    RETURN NEXT;
+END
+$$;
+
 -- Generate the planner-visible SQL used to checksum a table chunk. Columns are
 -- sorted by name before they are passed as heterogeneous VARIADIC row_digest
 -- arguments; callers may EXPLAIN the returned SQL directly on a participant.
@@ -443,6 +606,22 @@ DECLARE
     rel_name text;
     cols text[];
     key_cols text[];
+    contract_repsets text[];
+    contract_subscription name;
+    contract_rec record;
+    plan_repsets text[];
+    repl_insert boolean := true;
+    repl_update boolean := true;
+    repl_delete boolean := true;
+    repl_truncate boolean := true;
+    has_row_filter boolean := false;
+    sync_status "char" := 'r';
+    validated_property text := 'full';
+    exact_comparable boolean := true;
+    contract_reason text := 'direct full-table comparison';
+    pglogical_available boolean;
+    table_in_pglogical boolean := false;
+    requested_backend text;
     peer_names text[];
     missing_peers text[];
     peer_rec record;
@@ -481,6 +660,10 @@ BEGIN
     WHERE i.indrelid = table_name
       AND i.indisprimary;
 
+    requested_backend := COALESCE(NULLIF(options->>'backend', ''), 'pglogical');
+    contract_subscription := NULLIF(options->>'subscription', '')::name;
+    pglogical_available := to_regprocedure('pglogical.show_repset_table_info(regclass,text[])') IS NOT NULL;
+
     IF peers IS NULL OR cardinality(peers) = 0 THEN
         SELECT COALESCE(array_agg(p.name ORDER BY p.name), ARRAY[]::text[])
         INTO peer_names
@@ -501,6 +684,59 @@ BEGIN
         END IF;
     END IF;
 
+    IF options ? 'repsets' THEN
+        SELECT array_agg(DISTINCT elem.value ORDER BY elem.value)
+        INTO contract_repsets
+        FROM jsonb_array_elements_text(options->'repsets') AS elem(value);
+    END IF;
+
+    IF contract_repsets IS NULL OR cardinality(contract_repsets) = 0 THEN
+        SELECT array_agg(DISTINCT peer_repset.repset ORDER BY peer_repset.repset)
+        INTO contract_repsets
+        FROM pgl_validate.peer p
+        CROSS JOIN LATERAL unnest(p.replication_sets) AS peer_repset(repset)
+        WHERE p.name = ANY (peer_names);
+    END IF;
+
+    IF pglogical_available THEN
+        SELECT EXISTS (
+            SELECT 1
+            FROM pglogical.replication_set_table rst
+            WHERE rst.set_reloid = table_name
+        )
+        INTO table_in_pglogical;
+    ELSIF options ? 'backend' AND requested_backend = 'pglogical' THEN
+        RAISE EXCEPTION 'backend=pglogical requested but pglogical is not installed in this database'
+            USING ERRCODE = '0A000';
+    END IF;
+
+    IF requested_backend = 'pglogical'
+       AND pglogical_available
+       AND (table_in_pglogical
+            OR contract_repsets IS NOT NULL
+            OR contract_subscription IS NOT NULL) THEN
+        SELECT *
+        INTO contract_rec
+        FROM pgl_validate.pglogical_table_contract(
+            table_name,
+            contract_repsets,
+            contract_subscription
+        );
+
+        cols := contract_rec.att_list;
+        key_cols := contract_rec.key_cols;
+        plan_repsets := contract_rec.repsets;
+        repl_insert := contract_rec.repl_insert;
+        repl_update := contract_rec.repl_update;
+        repl_delete := contract_rec.repl_delete;
+        repl_truncate := contract_rec.repl_truncate;
+        has_row_filter := contract_rec.has_row_filter;
+        sync_status := contract_rec.sync_status;
+        validated_property := contract_rec.validated_property;
+        exact_comparable := contract_rec.exact_comparable;
+        contract_reason := contract_rec.reason;
+    END IF;
+
     INSERT INTO pgl_validate.run(status, options, tables_total)
     VALUES ('running', options, 1)
     RETURNING pgl_validate.run.run_id INTO v_run_id;
@@ -514,10 +750,44 @@ BEGIN
         has_row_filter, sync_status, validated_property
     )
     VALUES (
-        v_run_id, schema_name, rel_name, key_cols, cols, NULL,
-        true, true, true, true,
-        false, 'r', 'full'
+        v_run_id, schema_name, rel_name, key_cols, cols, plan_repsets,
+        repl_insert, repl_update, repl_delete, repl_truncate,
+        has_row_filter, sync_status, validated_property
     );
+
+    IF NOT exact_comparable THEN
+        verdict := CASE
+            WHEN validated_property IN ('skipped','unsupported_mask') THEN 'skipped'
+            ELSE 'partial'
+        END;
+        result_reason := format(
+            'pglogical contract %s is not yet exact-comparable by the checksum-only path: %s',
+            validated_property,
+            contract_reason
+        );
+
+        INSERT INTO pgl_validate.table_result(
+            run_id, schema_name, table_name, verdict, reason, finished_at
+        )
+        VALUES (
+            v_run_id, schema_name, rel_name, verdict, result_reason, now()
+        )
+        RETURNING * INTO result_row;
+
+        UPDATE pgl_validate.run
+        SET status = 'completed',
+            finished_at = now(),
+            tables_matched = 0,
+            tables_differ = 0
+        WHERE pgl_validate.run.run_id = v_run_id;
+
+        UPDATE pgl_validate.run_participant
+        SET status = 'done'
+        WHERE pgl_validate.run_participant.run_id = v_run_id
+          AND node = 'local';
+
+        RETURN result_row;
+    END IF;
 
     checksum_sql := pgl_validate.plan_chunk_sql(table_name, key_cols, NULL, NULL, cols, NULL);
     EXECUTE checksum_sql INTO n_rows, lthash;
@@ -573,9 +843,16 @@ BEGIN
     IF differ_count = 0 THEN
         verdict := 'match';
         IF participant_count = 1 THEN
-            result_reason := 'single local participant; no peers registered or requested';
+            result_reason := format(
+                'single local participant; no peers registered or requested; validated_property=%s',
+                validated_property
+            );
         ELSE
-            result_reason := format('all %s participants have matching row count and LtHash', participant_count);
+            result_reason := format(
+                'all %s participants have matching row count and LtHash; validated_property=%s',
+                participant_count,
+                validated_property
+            );
         END IF;
     ELSE
         verdict := 'differ';

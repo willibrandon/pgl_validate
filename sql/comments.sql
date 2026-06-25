@@ -2,7 +2,7 @@ COMMENT ON SCHEMA pgl_validate IS
     'Cross-node data validation objects for pglogical-first replication topologies.';
 
 COMMENT ON TABLE pgl_validate.peer IS
-    'Named connection targets and remote-query timeouts used by the coordinator when resolving peers.';
+    'Named connection targets, replication-set metadata, and remote-query timeouts used by the coordinator when resolving peers.';
 COMMENT ON TABLE pgl_validate.run IS
     'One validation run, including lifecycle state and summary counts.';
 COMMENT ON TABLE pgl_validate.run_participant IS
@@ -61,6 +61,8 @@ COMMENT ON VIEW pgl_validate.schema_issues IS
 
 COMMENT ON FUNCTION pgl_validate.column_encoding_mode(oid) IS
     'Select the coordinator-pushed row_digest encoding mode for a column type.';
+COMMENT ON FUNCTION pgl_validate.pglogical_table_contract(regclass, text[], name) IS
+    'Resolve pglogical action masks, effective column list, filter presence, sync state, and validated property for a relation.';
 COMMENT ON FUNCTION pgl_validate.plan_chunk_sql(regclass, text[], bytea, bytea, text[], text[]) IS
     'Generate planner-visible SQL for a table chunk checksum.';
 COMMENT ON FUNCTION pgl_validate.compare_table(regclass, text[], jsonb) IS

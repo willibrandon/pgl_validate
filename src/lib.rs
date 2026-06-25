@@ -716,6 +716,142 @@ mod tests {
         assert!(!has_row_filter);
         assert_eq!(att_count, 3);
     }
+
+    #[pg_test]
+    fn pglogical_contract_uses_effective_column_list_and_action_mask() {
+        let backend_pid = Spi::get_one::<i32>("SELECT pg_backend_pid()")
+            .unwrap()
+            .unwrap();
+        let table_name = identifier(&format!("pglogical_contract_cols_{backend_pid}"));
+        let repset_name = identifier(&format!("pgl_validate_contract_cols_{backend_pid}"));
+        let node_name = identifier(&format!("pgl_validate_contract_node_{backend_pid}"));
+
+        Spi::run(&format!(
+            "
+            CREATE EXTENSION pglogical;
+            SELECT pglogical.create_node({node}, 'dbname=' || current_database());
+            CREATE TABLE public.{table_name}(
+                id int PRIMARY KEY,
+                kept text,
+                ignored text
+            );
+            SELECT pglogical.create_replication_set({repset}, true, false, true, true);
+            SELECT pglogical.replication_set_add_table(
+                {repset},
+                'public.{table_name}'::regclass,
+                false,
+                ARRAY['id','kept']
+            );
+            ",
+            node = sql_literal(&node_name),
+            repset = sql_literal(&repset_name)
+        ))
+        .unwrap();
+
+        let contract_sql = format!(
+            "
+            SELECT array_to_string(att_list, ',') || ';' ||
+                   validated_property || ';' ||
+                   repl_update::text
+            FROM pgl_validate.pglogical_table_contract(
+                'public.{table_name}'::regclass,
+                ARRAY[{repset}]
+            )
+            ",
+            repset = sql_literal(&repset_name)
+        );
+        let contract = Spi::get_one::<String>(&contract_sql).unwrap().unwrap();
+
+        assert_eq!(contract, "id,kept;keys_only;false");
+    }
+
+    #[pg_test]
+    fn compare_table_uses_pglogical_column_projection() {
+        let backend_pid = Spi::get_one::<i32>("SELECT pg_backend_pid()")
+            .unwrap()
+            .unwrap();
+        let peer_db = identifier(&format!("pgl_validate_contract_peer_{backend_pid}"));
+        let table_name = identifier(&format!("pglogical_projection_target_{backend_pid}"));
+        let repset_name = identifier(&format!("pgl_validate_projection_{backend_pid}"));
+        let node_name = identifier(&format!("pgl_validate_projection_node_{backend_pid}"));
+        let local_dsn = local_dsn();
+        let remote_dsn = peer_dsn(&peer_db);
+
+        let _ = crate::transport::libpq::execute_command(
+            &local_dsn,
+            &format!("DROP DATABASE IF EXISTS {peer_db} WITH (FORCE)"),
+        );
+        crate::transport::libpq::execute_command(&local_dsn, &format!("CREATE DATABASE {peer_db}"))
+            .unwrap();
+        crate::transport::libpq::execute_command(
+            &remote_dsn,
+            &format!(
+                "CREATE EXTENSION pgl_validate;
+                 CREATE TABLE public.{table_name}(
+                     id int PRIMARY KEY,
+                     kept text,
+                     ignored text
+                 );
+                 INSERT INTO public.{table_name} VALUES (1, 'same', 'remote-only');"
+            ),
+        )
+        .unwrap();
+
+        Spi::run(&format!(
+            "
+            CREATE EXTENSION pglogical;
+            SELECT pglogical.create_node({node}, 'dbname=' || current_database());
+            CREATE TABLE public.{table_name}(
+                id int PRIMARY KEY,
+                kept text,
+                ignored text
+            );
+            INSERT INTO public.{table_name} VALUES (1, 'same', 'local-only');
+            SELECT pglogical.create_replication_set({repset}, true, true, true, true);
+            SELECT pglogical.replication_set_add_table(
+                {repset},
+                'public.{table_name}'::regclass,
+                false,
+                ARRAY['id','kept']
+            );
+            INSERT INTO pgl_validate.peer(name, dsn, replication_sets)
+            VALUES ('remote_projection', {remote_dsn}, ARRAY[{repset}]);
+            ",
+            node = sql_literal(&node_name),
+            repset = sql_literal(&repset_name),
+            remote_dsn = sql_literal(&remote_dsn)
+        ))
+        .unwrap();
+
+        let verdict_sql = format!(
+            "
+            SELECT (pgl_validate.compare_table(
+                'public.{table_name}'::regclass,
+                ARRAY['remote_projection'],
+                '{{\"repsets\":[{repset_json}]}}'::jsonb
+            )).verdict
+            ",
+            repset_json = sql_literal(&repset_name).replace('\'', "\"")
+        );
+        let verdict = Spi::get_one::<String>(&verdict_sql).unwrap().unwrap();
+        assert_eq!(verdict, "match");
+
+        let planned_cols_sql = format!(
+            "SELECT array_to_string(att_list, ',')
+             FROM pgl_validate.table_plan
+             WHERE table_name = {}
+             ORDER BY run_id DESC
+             LIMIT 1",
+            sql_literal(&table_name)
+        );
+        let planned_cols = Spi::get_one::<String>(&planned_cols_sql).unwrap().unwrap();
+        assert_eq!(planned_cols, "id,kept");
+
+        let _ = crate::transport::libpq::execute_command(
+            &local_dsn,
+            &format!("DROP DATABASE IF EXISTS {peer_db} WITH (FORCE)"),
+        );
+    }
 }
 
 #[cfg(test)]
