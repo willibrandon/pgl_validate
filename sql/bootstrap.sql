@@ -1,11 +1,17 @@
 CREATE SCHEMA IF NOT EXISTS pgl_validate;
 
 CREATE TABLE pgl_validate.peer (
-    name      text PRIMARY KEY,
-    dsn       text NOT NULL,
-    backend   text NOT NULL DEFAULT 'pglogical'
-              CHECK (backend IN ('pglogical','native','standby')),
-    added_at  timestamptz NOT NULL DEFAULT now()
+    name                    text PRIMARY KEY,
+    dsn                     text NOT NULL,
+    backend                 text NOT NULL DEFAULT 'pglogical'
+                            CHECK (backend IN ('pglogical','native','standby')),
+    connect_timeout_seconds int NOT NULL DEFAULT 10
+                            CHECK (connect_timeout_seconds > 0),
+    statement_timeout_ms    int NOT NULL DEFAULT 600000
+                            CHECK (statement_timeout_ms > 0),
+    lock_timeout_ms         int NOT NULL DEFAULT 30000
+                            CHECK (lock_timeout_ms > 0),
+    added_at                timestamptz NOT NULL DEFAULT now()
 );
 REVOKE ALL ON pgl_validate.peer FROM PUBLIC;
 
@@ -437,16 +443,19 @@ DECLARE
     rel_name text;
     cols text[];
     key_cols text[];
+    peer_names text[];
+    missing_peers text[];
+    peer_rec record;
+    remote_rec record;
     checksum_sql text;
     n_rows bigint;
     lthash bytea;
+    differ_count int := 0;
+    participant_count int := 1;
+    verdict text;
+    result_reason text;
     result_row pgl_validate.table_result;
 BEGIN
-    IF peers IS NOT NULL AND cardinality(peers) > 0 THEN
-        RAISE EXCEPTION 'remote peer transport is not available in this build slice'
-            USING ERRCODE = '0A000';
-    END IF;
-
     SELECT n.nspname, c.relname
     INTO schema_name, rel_name
     FROM pg_class c
@@ -471,6 +480,26 @@ BEGIN
     JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ord.attnum
     WHERE i.indrelid = table_name
       AND i.indisprimary;
+
+    IF peers IS NULL OR cardinality(peers) = 0 THEN
+        SELECT COALESCE(array_agg(p.name ORDER BY p.name), ARRAY[]::text[])
+        INTO peer_names
+        FROM pgl_validate.peer p;
+    ELSE
+        SELECT array_agg(DISTINCT requested.peer_name ORDER BY requested.peer_name)
+        INTO peer_names
+        FROM unnest(peers) AS requested(peer_name);
+
+        SELECT array_agg(requested.peer_name ORDER BY requested.peer_name)
+        INTO missing_peers
+        FROM unnest(peer_names) AS requested(peer_name)
+        LEFT JOIN pgl_validate.peer p ON p.name = requested.peer_name
+        WHERE p.name IS NULL;
+
+        IF missing_peers IS NOT NULL THEN
+            RAISE EXCEPTION 'unknown pgl_validate peer(s): %', array_to_string(missing_peers, ', ');
+        END IF;
+    END IF;
 
     INSERT INTO pgl_validate.run(status, options, tables_total)
     VALUES ('running', options, 1)
@@ -498,21 +527,74 @@ BEGIN
     )
     VALUES (v_run_id, schema_name, rel_name, 'local', n_rows, lthash, NULL);
 
+    FOR peer_rec IN
+        SELECT p.name, p.dsn, p.backend,
+               p.connect_timeout_seconds,
+               p.statement_timeout_ms,
+               p.lock_timeout_ms
+        FROM pgl_validate.peer p
+        WHERE p.name = ANY (peer_names)
+        ORDER BY p.name
+    LOOP
+        SELECT rc.pg_version, rc.n_rows, rc.lthash
+        INTO remote_rec
+        FROM pgl_validate.remote_checksum(
+            peer_rec.dsn,
+            checksum_sql,
+            peer_rec.connect_timeout_seconds,
+            peer_rec.statement_timeout_ms,
+            peer_rec.lock_timeout_ms
+        ) AS rc;
+
+        participant_count := participant_count + 1;
+
+        INSERT INTO pgl_validate.run_participant(
+            run_id, node, role, backend, pg_version, dsn_ref, status
+        )
+        VALUES (
+            v_run_id, peer_rec.name, 'participant', peer_rec.backend,
+            remote_rec.pg_version, peer_rec.name, 'done'
+        );
+
+        INSERT INTO pgl_validate.table_node_result(
+            run_id, schema_name, table_name, node, n_rows, lthash, set_hash
+        )
+        VALUES (
+            v_run_id, schema_name, rel_name, peer_rec.name,
+            remote_rec.n_rows, remote_rec.lthash, NULL
+        );
+
+        IF remote_rec.n_rows IS DISTINCT FROM n_rows
+           OR remote_rec.lthash IS DISTINCT FROM lthash THEN
+            differ_count := differ_count + 1;
+        END IF;
+    END LOOP;
+
+    IF differ_count = 0 THEN
+        verdict := 'match';
+        IF participant_count = 1 THEN
+            result_reason := 'single local participant; no peers registered or requested';
+        ELSE
+            result_reason := format('all %s participants have matching row count and LtHash', participant_count);
+        END IF;
+    ELSE
+        verdict := 'differ';
+        result_reason := format('%s of %s remote peer(s) differ from local', differ_count, participant_count - 1);
+    END IF;
+
     INSERT INTO pgl_validate.table_result(
         run_id, schema_name, table_name, verdict, reason, finished_at
     )
     VALUES (
-        v_run_id, schema_name, rel_name, 'match',
-        'single local participant; remote transport not yet involved',
-        now()
+        v_run_id, schema_name, rel_name, verdict, result_reason, now()
     )
     RETURNING * INTO result_row;
 
     UPDATE pgl_validate.run
     SET status = 'completed',
         finished_at = now(),
-        tables_matched = 1,
-        tables_differ = 0
+        tables_matched = CASE WHEN differ_count = 0 THEN 1 ELSE 0 END,
+        tables_differ = CASE WHEN differ_count = 0 THEN 0 ELSE 1 END
     WHERE pgl_validate.run.run_id = v_run_id;
 
     UPDATE pgl_validate.run_participant

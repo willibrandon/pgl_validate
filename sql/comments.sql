@@ -2,7 +2,7 @@ COMMENT ON SCHEMA pgl_validate IS
     'Cross-node data validation objects for pglogical-first replication topologies.';
 
 COMMENT ON TABLE pgl_validate.peer IS
-    'Named connection targets used by the coordinator when resolving peers.';
+    'Named connection targets and remote-query timeouts used by the coordinator when resolving peers.';
 COMMENT ON TABLE pgl_validate.run IS
     'One validation run, including lifecycle state and summary counts.';
 COMMENT ON TABLE pgl_validate.run_participant IS
@@ -82,6 +82,8 @@ COMMENT ON FUNCTION pgl_validate.last_commit_lsn() IS
     'Return the backend exact last commit end LSN for barrier fencing.';
 COMMENT ON FUNCTION pgl_validate.hash_digest_array(bytea[]) IS
     'Hash a caller-sorted array of row digests for cryptographic set confirmation.';
+COMMENT ON FUNCTION pgl_validate.remote_checksum(text, text, integer, integer, integer) IS
+    'Execute generated checksum SQL on a named peer DSN via libpq with bounded connect, statement, and lock timeouts.';
 COMMENT ON TYPE pgl_validate.lthash_state IS
     'Internal varlena state for the LtHash multiset accumulator.';
 COMMENT ON FUNCTION pgl_validate.lthash_state_in(cstring) IS

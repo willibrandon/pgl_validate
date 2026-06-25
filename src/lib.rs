@@ -7,6 +7,7 @@
 use pgrx::prelude::*;
 
 mod digest;
+mod transport;
 
 pgrx::pg_module_magic!(name, version);
 
@@ -54,6 +55,7 @@ fn last_commit_lsn() -> i64 {
 #[pg_schema]
 mod pgl_validate {
     use super::digest;
+    use super::transport;
     use pgrx::StringInfo;
     use pgrx::aggregate::*;
     use pgrx::prelude::*;
@@ -135,6 +137,34 @@ mod pgl_validate {
         state.to_core().to_bytes()
     }
 
+    /// Execute generated checksum SQL on a remote peer over libpq.
+    #[pg_extern(volatile, parallel_unsafe)]
+    fn remote_checksum(
+        dsn: &str,
+        checksum_sql: &str,
+        connect_timeout_seconds: default!(i32, 10),
+        statement_timeout_ms: default!(i32, 600000),
+        lock_timeout_ms: default!(i32, 30000),
+    ) -> TableIterator<
+        'static,
+        (
+            name!(pg_version, i32),
+            name!(n_rows, i64),
+            name!(lthash, Vec<u8>),
+        ),
+    > {
+        let checksum = transport::libpq::fetch_checksum(
+            dsn,
+            checksum_sql,
+            connect_timeout_seconds,
+            statement_timeout_ms,
+            lock_timeout_ms,
+        )
+        .unwrap_or_else(|err| pgrx::error!("{err}"));
+
+        TableIterator::once((checksum.pg_version, checksum.n_rows, checksum.lthash))
+    }
+
     #[pg_aggregate]
     impl Aggregate<lthash_state> for lthash_state {
         type State = PgVarlena<Self>;
@@ -184,6 +214,47 @@ mod pgl_validate {
 #[pg_schema]
 mod tests {
     use pgrx::prelude::*;
+
+    fn sql_literal(value: &str) -> String {
+        format!("'{}'", value.replace('\'', "''"))
+    }
+
+    fn identifier(value: &str) -> String {
+        assert!(
+            value.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'),
+            "test identifier contains unsafe characters: {value}"
+        );
+        value.to_string()
+    }
+
+    fn local_dsn() -> String {
+        let port = Spi::get_one::<i32>("SELECT inet_server_port()")
+            .unwrap()
+            .unwrap();
+        let dbname = Spi::get_one::<String>("SELECT current_database()::text")
+            .unwrap()
+            .unwrap();
+        let user = Spi::get_one::<String>("SELECT current_user::text")
+            .unwrap()
+            .unwrap();
+
+        format!(
+            "host=localhost port={port} dbname={dbname} user={user} connect_timeout=5 application_name=pgl_validate_test options='-c statement_timeout=10000 -c lock_timeout=10000'"
+        )
+    }
+
+    fn peer_dsn(dbname: &str) -> String {
+        let port = Spi::get_one::<i32>("SELECT inet_server_port()")
+            .unwrap()
+            .unwrap();
+        let user = Spi::get_one::<String>("SELECT current_user::text")
+            .unwrap()
+            .unwrap();
+
+        format!(
+            "host=localhost port={port} dbname={dbname} user={user} connect_timeout=5 application_name=pgl_validate_test options='-c statement_timeout=10000 -c lock_timeout=10000'"
+        )
+    }
 
     #[pg_test]
     fn hash_digest_array_is_order_sensitive_by_contract() {
@@ -338,6 +409,106 @@ mod tests {
         .unwrap()
         .unwrap();
         assert!(lthash_present);
+    }
+
+    #[pg_test]
+    fn remote_checksum_reads_over_libpq() {
+        let dsn = local_dsn();
+        let checksum_sql = "SELECT 7::bigint AS n_rows, decode('010203', 'hex') AS lthash";
+        let sql = format!(
+            "SELECT n_rows FROM pgl_validate.remote_checksum({}, {})",
+            sql_literal(&dsn),
+            sql_literal(checksum_sql)
+        );
+
+        let n_rows = Spi::get_one::<i64>(&sql).unwrap().unwrap();
+        assert_eq!(n_rows, 7);
+
+        let sql = format!(
+            "SELECT lthash FROM pgl_validate.remote_checksum({}, {})",
+            sql_literal(&dsn),
+            sql_literal(checksum_sql)
+        );
+        let lthash = Spi::get_one::<Vec<u8>>(&sql).unwrap().unwrap();
+        assert_eq!(lthash, vec![0x01, 0x02, 0x03]);
+    }
+
+    #[pg_test]
+    fn compare_table_uses_registered_remote_peer_match() {
+        let dsn = local_dsn();
+        Spi::run(&format!(
+            "INSERT INTO pgl_validate.peer(name, dsn) VALUES ('self_peer', {})",
+            sql_literal(&dsn)
+        ))
+        .unwrap();
+
+        let verdict = Spi::get_one::<String>(
+            "SELECT (pgl_validate.compare_table('pgl_validate.fence_barrier'::regclass)).verdict",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(verdict, "match");
+
+        let participants = Spi::get_one::<i64>(
+            "SELECT count(*) FROM pgl_validate.run_participant WHERE node IN ('local', 'self_peer')",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(participants, 2);
+    }
+
+    #[pg_test]
+    fn compare_table_reports_registered_remote_peer_difference() {
+        let backend_pid = Spi::get_one::<i32>("SELECT pg_backend_pid()")
+            .unwrap()
+            .unwrap();
+        let peer_db = identifier(&format!("pgl_validate_peer_{backend_pid}"));
+        let table_name = identifier(&format!("remote_compare_target_{backend_pid}"));
+        let local_dsn = local_dsn();
+        let remote_dsn = peer_dsn(&peer_db);
+
+        let _ = crate::transport::libpq::execute_command(
+            &local_dsn,
+            &format!("DROP DATABASE IF EXISTS {peer_db} WITH (FORCE)"),
+        );
+        crate::transport::libpq::execute_command(&local_dsn, &format!("CREATE DATABASE {peer_db}"))
+            .unwrap();
+        crate::transport::libpq::execute_command(
+            &remote_dsn,
+            &format!(
+                "CREATE EXTENSION pgl_validate;
+                 CREATE TABLE public.{table_name}(id int PRIMARY KEY, value text);
+                 INSERT INTO public.{table_name} VALUES (1, 'remote');"
+            ),
+        )
+        .unwrap();
+
+        Spi::run(&format!(
+            "CREATE TABLE public.{table_name}(id int PRIMARY KEY, value text);
+             INSERT INTO public.{table_name} VALUES (1, 'local');
+             INSERT INTO pgl_validate.peer(name, dsn) VALUES ('remote_diff', {});",
+            sql_literal(&remote_dsn)
+        ))
+        .unwrap();
+
+        let verdict_sql = format!(
+            "SELECT (pgl_validate.compare_table({}::regclass)).verdict",
+            sql_literal(&format!("public.{table_name}"))
+        );
+        let verdict = Spi::get_one::<String>(&verdict_sql).unwrap().unwrap();
+        assert_eq!(verdict, "differ");
+
+        let remote_rows = Spi::get_one::<i64>(
+            "SELECT n_rows FROM pgl_validate.table_node_result WHERE node = 'remote_diff'",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(remote_rows, 1);
+
+        let _ = crate::transport::libpq::execute_command(
+            &local_dsn,
+            &format!("DROP DATABASE IF EXISTS {peer_db} WITH (FORCE)"),
+        );
     }
 
     #[pg_test]
