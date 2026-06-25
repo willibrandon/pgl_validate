@@ -204,6 +204,112 @@ AS 'MODULE_PATHNAME', 'remote_inject_barrier_wrapper';
         ))
     }
 
+    /// Wait for a pglogical provider slot to confirm flushing a barrier LSN.
+    #[pg_extern(
+        volatile,
+        parallel_unsafe,
+        sql = r#"
+CREATE FUNCTION pgl_validate.remote_wait_slot_confirm_lsn(
+    dsn text,
+    slot_name name,
+    barrier_end_lsn pg_lsn,
+    connect_timeout_seconds integer DEFAULT 10,
+    statement_timeout_ms integer DEFAULT 600000,
+    lock_timeout_ms integer DEFAULT 30000
+)
+RETURNS pg_lsn
+LANGUAGE c
+STRICT
+VOLATILE
+PARALLEL UNSAFE
+AS 'MODULE_PATHNAME', 'remote_wait_slot_confirm_lsn_wrapper';
+"#
+    )]
+    fn remote_wait_slot_confirm_lsn(
+        dsn: &str,
+        slot_name: &str,
+        barrier_end_lsn: i64,
+        connect_timeout_seconds: default!(i32, 10),
+        statement_timeout_ms: default!(i32, 600000),
+        lock_timeout_ms: default!(i32, 30000),
+    ) -> i64 {
+        let barrier_end_lsn =
+            u64::try_from(barrier_end_lsn).unwrap_or_else(|_| pgrx::error!("pg_lsn is negative"));
+        let confirmation = transport::libpq::wait_slot_confirm_lsn(
+            dsn,
+            slot_name,
+            barrier_end_lsn,
+            connect_timeout_seconds,
+            statement_timeout_ms,
+            lock_timeout_ms,
+        )
+        .unwrap_or_else(|err| pgrx::error!("{err}"));
+
+        confirmation.confirmed_flush_lsn as i64
+    }
+
+    /// Observe target-side origin progress and token visibility for a barrier.
+    #[pg_extern(
+        volatile,
+        parallel_unsafe,
+        sql = r#"
+CREATE FUNCTION pgl_validate.remote_observe_barrier(
+    dsn text,
+    origin_name text,
+    token uuid,
+    barrier_end_lsn pg_lsn,
+    connect_timeout_seconds integer DEFAULT 10,
+    statement_timeout_ms integer DEFAULT 600000,
+    lock_timeout_ms integer DEFAULT 30000
+)
+RETURNS TABLE (
+    origin_progress_lsn pg_lsn,
+    token_visible boolean,
+    converged boolean
+)
+LANGUAGE c
+STRICT
+VOLATILE
+PARALLEL UNSAFE
+AS 'MODULE_PATHNAME', 'remote_observe_barrier_wrapper';
+"#
+    )]
+    fn remote_observe_barrier(
+        dsn: &str,
+        origin_name: &str,
+        token: pgrx::Uuid,
+        barrier_end_lsn: i64,
+        connect_timeout_seconds: default!(i32, 10),
+        statement_timeout_ms: default!(i32, 600000),
+        lock_timeout_ms: default!(i32, 30000),
+    ) -> TableIterator<
+        'static,
+        (
+            name!(origin_progress_lsn, i64),
+            name!(token_visible, bool),
+            name!(converged, bool),
+        ),
+    > {
+        let barrier_end_lsn =
+            u64::try_from(barrier_end_lsn).unwrap_or_else(|_| pgrx::error!("pg_lsn is negative"));
+        let observation = transport::libpq::observe_barrier(
+            dsn,
+            origin_name,
+            *token.as_bytes(),
+            barrier_end_lsn,
+            connect_timeout_seconds,
+            statement_timeout_ms,
+            lock_timeout_ms,
+        )
+        .unwrap_or_else(|err| pgrx::error!("{err}"));
+
+        TableIterator::once((
+            observation.origin_progress_lsn as i64,
+            observation.token_visible,
+            observation.converged,
+        ))
+    }
+
     #[pg_aggregate]
     impl Aggregate<lthash_state> for lthash_state {
         type State = PgVarlena<Self>;
@@ -566,6 +672,147 @@ mod tests {
         );
         let recorded = Spi::get_one::<bool>(&verify_sql).unwrap().unwrap();
         assert!(recorded);
+    }
+
+    #[pg_test]
+    fn remote_observe_barrier_reports_origin_progress_and_token_visibility() {
+        let dsn = local_dsn();
+        let backend_pid = Spi::get_one::<i32>("SELECT pg_backend_pid()")
+            .unwrap()
+            .unwrap();
+        let origin_name = identifier(&format!("pgl_validate_origin_{backend_pid}"));
+
+        let injected_sql = format!(
+            "
+            SELECT token::text || ';' || barrier_end_lsn::text
+            FROM pgl_validate.remote_inject_barrier({})
+            ",
+            sql_literal(&dsn)
+        );
+        let injected = Spi::get_one::<String>(&injected_sql).unwrap().unwrap();
+        let (token, barrier_end_lsn) = injected
+            .split_once(';')
+            .expect("barrier result should contain token and LSN");
+
+        crate::transport::libpq::execute_command(
+            &dsn,
+            &format!(
+                "DO $$ BEGIN PERFORM pg_replication_origin_create({}); END $$",
+                sql_literal(&origin_name)
+            ),
+        )
+        .unwrap();
+        crate::transport::libpq::execute_command(
+            &dsn,
+            &format!(
+                "DO $$ BEGIN PERFORM pg_replication_origin_advance({}, {}::pg_lsn); END $$",
+                sql_literal(&origin_name),
+                sql_literal(barrier_end_lsn)
+            ),
+        )
+        .unwrap();
+
+        let observe_sql = format!(
+            "
+            SELECT token_visible::text || ';' ||
+                   converged::text || ';' ||
+                   (origin_progress_lsn >= {}::pg_lsn)::text
+            FROM pgl_validate.remote_observe_barrier(
+                {},
+                {},
+                {}::uuid,
+                {}::pg_lsn
+            )
+            ",
+            sql_literal(barrier_end_lsn),
+            sql_literal(&dsn),
+            sql_literal(&origin_name),
+            sql_literal(token),
+            sql_literal(barrier_end_lsn)
+        );
+        let observed = Spi::get_one::<String>(&observe_sql).unwrap().unwrap();
+        assert_eq!(observed, "true;true;true");
+
+        let _ = crate::transport::libpq::execute_command(
+            &dsn,
+            &format!(
+                "DO $$ BEGIN PERFORM pg_replication_origin_drop({}); END $$",
+                sql_literal(&origin_name)
+            ),
+        );
+    }
+
+    #[pg_test]
+    fn record_fence_attempt_derives_converged_and_waiting_statuses() {
+        let converged = Spi::get_one::<bool>(
+            r#"
+            WITH run AS (
+                INSERT INTO pgl_validate.run(status)
+                VALUES ('fencing')
+                RETURNING run_id
+            ), edge AS (
+                INSERT INTO pgl_validate.run_edge(
+                    run_id, edge_id, provider_node, target_node, backend,
+                    subscription, slot_name, origin_name, repsets
+                )
+                SELECT run_id, 1, 'origin', 'target', 'pglogical',
+                       'sub', 'slot', 'origin_name', ARRAY['default']
+                FROM run
+                RETURNING run_id, edge_id
+            ), fence AS (
+                INSERT INTO pgl_validate.fence_epoch(run_id, epoch_seq)
+                SELECT run_id, 1 FROM run
+                RETURNING run_id, epoch_seq
+            ), fence_edge AS (
+                INSERT INTO pgl_validate.fence_edge(
+                    run_id, epoch_seq, edge_id, fence_kind, barrier_token, barrier_end_lsn
+                )
+                SELECT edge.run_id, 1, edge.edge_id, 'barrier',
+                       '66666666-6666-6666-6666-666666666666'::uuid,
+                       '0/20'::pg_lsn
+                FROM edge
+                RETURNING run_id, epoch_seq, edge_id
+            ), attempt AS (
+                SELECT pgl_validate.record_fence_attempt(
+                    run_id, epoch_seq, edge_id,
+                    '0/20'::pg_lsn,
+                    '0/20'::pg_lsn,
+                    true,
+                    '0/20'::pg_lsn
+                ) AS row
+                FROM fence_edge
+            )
+            SELECT ((row).status = 'converged' AND (row).converged_at IS NOT NULL)
+            FROM attempt
+            "#,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(converged);
+
+        let waiting = Spi::get_one::<bool>(
+            r#"
+            WITH latest AS (
+                SELECT run_id, epoch_seq, edge_id
+                FROM pgl_validate.fence_edge
+                WHERE barrier_token = '66666666-6666-6666-6666-666666666666'::uuid
+            ), attempt AS (
+                SELECT pgl_validate.record_fence_attempt(
+                    run_id, epoch_seq, edge_id,
+                    '0/20'::pg_lsn,
+                    '0/10'::pg_lsn,
+                    true,
+                    '0/20'::pg_lsn
+                ) AS row
+                FROM latest
+            )
+            SELECT ((row).status = 'waiting' AND (row).converged_at IS NULL)
+            FROM attempt
+            "#,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(waiting);
     }
 
     #[pg_test]

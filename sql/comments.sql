@@ -75,6 +75,8 @@ COMMENT ON FUNCTION pgl_validate.sequences(bigint) IS
     'Return persisted sequence results for a validation run.';
 COMMENT ON FUNCTION pgl_validate.record_barrier_fence(bigint, integer, integer, uuid, text, pg_lsn) IS
     'Persist an exact barrier token and end LSN for one run edge and epoch.';
+COMMENT ON FUNCTION pgl_validate.record_fence_attempt(bigint, integer, integer, pg_lsn, pg_lsn, boolean, pg_lsn, text) IS
+    'Persist a fence convergence observation with status derived from origin progress and token visibility.';
 COMMENT ON FUNCTION pgl_validate.protected_barrier_tokens() IS
     'Return barrier tokens referenced by unfinished validation runs.';
 COMMENT ON FUNCTION pgl_validate.cleanup_fence_barriers(interval, uuid[]) IS
@@ -90,6 +92,10 @@ COMMENT ON FUNCTION pgl_validate.remote_checksum(text, text, integer, integer, i
     'Execute generated checksum SQL on a named peer DSN via libpq with bounded connect, statement, and lock timeouts.';
 COMMENT ON FUNCTION pgl_validate.remote_inject_barrier(text, integer, integer, integer) IS
     'Insert a barrier token on a remote origin over libpq and return the exact barrier commit end LSN.';
+COMMENT ON FUNCTION pgl_validate.remote_wait_slot_confirm_lsn(text, name, pg_lsn, integer, integer, integer) IS
+    'Call pglogical.wait_slot_confirm_lsn on a provider and return the slot confirmed_flush_lsn.';
+COMMENT ON FUNCTION pgl_validate.remote_observe_barrier(text, text, uuid, pg_lsn, integer, integer, integer) IS
+    'Observe target-side replication origin progress, barrier-token visibility, and convergence.';
 COMMENT ON TYPE pgl_validate.lthash_state IS
     'Internal varlena state for the LtHash multiset accumulator.';
 COMMENT ON FUNCTION pgl_validate.lthash_state_in(cstring) IS

@@ -965,6 +965,69 @@ BEGIN
 END
 $$;
 
+CREATE FUNCTION pgl_validate.record_fence_attempt(
+    p_run_id bigint,
+    p_epoch_seq int,
+    p_edge_id int,
+    p_barrier_end_lsn pg_lsn,
+    p_origin_progress_lsn pg_lsn,
+    p_token_visible boolean,
+    p_confirmed_flush_lsn pg_lsn DEFAULT NULL,
+    p_status text DEFAULT NULL
+)
+RETURNS pgl_validate.fence_attempt
+LANGUAGE plpgsql
+VOLATILE
+AS $$
+DECLARE
+    derived_status text;
+    result_row pgl_validate.fence_attempt;
+BEGIN
+    IF p_barrier_end_lsn IS NULL THEN
+        RAISE EXCEPTION 'barrier_end_lsn is required';
+    END IF;
+    IF p_token_visible IS NULL THEN
+        RAISE EXCEPTION 'token_visible is required';
+    END IF;
+
+    derived_status := COALESCE(
+        p_status,
+        CASE
+            WHEN p_origin_progress_lsn IS NOT NULL
+             AND p_origin_progress_lsn >= p_barrier_end_lsn
+             AND p_token_visible
+            THEN 'converged'
+            ELSE 'waiting'
+        END
+    );
+
+    IF derived_status NOT IN ('waiting','converged','timeout','degraded') THEN
+        RAISE EXCEPTION 'invalid fence attempt status: %', derived_status;
+    END IF;
+
+    INSERT INTO pgl_validate.fence_attempt(
+        run_id, epoch_seq, edge_id, barrier_end_lsn, origin_progress_lsn,
+        token_visible, confirmed_flush_lsn, converged_at, status
+    )
+    VALUES (
+        p_run_id, p_epoch_seq, p_edge_id, p_barrier_end_lsn, p_origin_progress_lsn,
+        p_token_visible, p_confirmed_flush_lsn,
+        CASE WHEN derived_status = 'converged' THEN now() ELSE NULL END,
+        derived_status
+    )
+    ON CONFLICT (run_id, epoch_seq, edge_id) DO UPDATE
+    SET barrier_end_lsn = EXCLUDED.barrier_end_lsn,
+        origin_progress_lsn = EXCLUDED.origin_progress_lsn,
+        token_visible = EXCLUDED.token_visible,
+        confirmed_flush_lsn = EXCLUDED.confirmed_flush_lsn,
+        converged_at = EXCLUDED.converged_at,
+        status = EXCLUDED.status
+    RETURNING * INTO result_row;
+
+    RETURN result_row;
+END
+$$;
+
 CREATE FUNCTION pgl_validate.protected_barrier_tokens()
 RETURNS uuid[]
 LANGUAGE sql

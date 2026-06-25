@@ -51,6 +51,24 @@ pub(crate) struct BarrierInjection {
     pub(crate) barrier_end_lsn: u64,
 }
 
+/// Provider-side slot flush observation for a barrier.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) struct SlotConfirmation {
+    /// Slot `confirmed_flush_lsn` after `pglogical.wait_slot_confirm_lsn`.
+    pub(crate) confirmed_flush_lsn: u64,
+}
+
+/// Target-side apply observation for a barrier.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) struct BarrierObservation {
+    /// Edge-specific replication origin progress observed on the target.
+    pub(crate) origin_progress_lsn: u64,
+    /// Whether the barrier token is visible on the target.
+    pub(crate) token_visible: bool,
+    /// Whether origin progress and token visibility satisfy exact convergence.
+    pub(crate) converged: bool,
+}
+
 struct Connection {
     raw: *mut PGconn,
 }
@@ -229,6 +247,84 @@ pub(crate) fn inject_barrier(
     })
 }
 
+/// Wait for pglogical to confirm that a provider slot has flushed a barrier.
+pub(crate) fn wait_slot_confirm_lsn(
+    dsn: &str,
+    slot_name: &str,
+    barrier_end_lsn: u64,
+    connect_timeout_seconds: i32,
+    statement_timeout_ms: i32,
+    lock_timeout_ms: i32,
+) -> Result<SlotConfirmation, String> {
+    let conn = Connection::connect_with_timeout(dsn, connect_timeout_seconds)?;
+    conn.set_query_timeouts(statement_timeout_ms, lock_timeout_ms)?;
+
+    let slot = sql_literal(slot_name);
+    let barrier_lsn = format_lsn(barrier_end_lsn);
+    conn.exec(&format!(
+        "SELECT pglogical.wait_slot_confirm_lsn({slot}::name, '{}'::pg_lsn)",
+        barrier_lsn
+    ))?
+    .require_status(PGRES_TUPLES_OK)?;
+
+    let result = conn.exec(&format!(
+        "SELECT confirmed_flush_lsn::text \
+         FROM pg_replication_slots \
+         WHERE slot_name = {slot}"
+    ))?;
+    let confirmed_flush_lsn = parse_lsn(&result.single_value()?)?;
+
+    Ok(SlotConfirmation {
+        confirmed_flush_lsn,
+    })
+}
+
+/// Observe target-side origin progress and token visibility for a barrier.
+pub(crate) fn observe_barrier(
+    dsn: &str,
+    origin_name: &str,
+    token: [u8; 16],
+    barrier_end_lsn: u64,
+    connect_timeout_seconds: i32,
+    statement_timeout_ms: i32,
+    lock_timeout_ms: i32,
+) -> Result<BarrierObservation, String> {
+    let conn = Connection::connect_with_timeout(dsn, connect_timeout_seconds)?;
+    conn.set_query_timeouts(statement_timeout_ms, lock_timeout_ms)?;
+
+    let origin = sql_literal(origin_name);
+    let token = sql_literal(&uuid::Uuid::from_bytes(token).to_string());
+    let barrier_lsn = format_lsn(barrier_end_lsn);
+    let result = conn.exec(&format!(
+        "WITH observed AS ( \
+             SELECT pg_replication_origin_progress({origin}, true) AS origin_progress_lsn, \
+                    EXISTS ( \
+                        SELECT 1 \
+                        FROM pgl_validate.fence_barrier \
+                        WHERE token = {token}::uuid \
+                    ) AS token_visible \
+         ) \
+         SELECT origin_progress_lsn::text, \
+                token_visible::text, \
+                (origin_progress_lsn >= '{barrier_lsn}'::pg_lsn AND token_visible)::text \
+         FROM observed"
+    ))?;
+    result.require_status(PGRES_TUPLES_OK)?;
+    if result.ntuples() != 1 || result.nfields() != 3 {
+        return Err(format!(
+            "remote barrier observation returned {} row(s) and {} column(s), expected 1 row and 3 columns",
+            result.ntuples(),
+            result.nfields()
+        ));
+    }
+
+    Ok(BarrierObservation {
+        origin_progress_lsn: parse_lsn(&result.value(0, 0)?)?,
+        token_visible: parse_bool(&result.value(0, 1)?)?,
+        converged: parse_bool(&result.value(0, 2)?)?,
+    })
+}
+
 /// Run generated checksum SQL on a remote participant and return its digest.
 pub(crate) fn fetch_checksum(
     dsn: &str,
@@ -306,6 +402,10 @@ fn dsn_with_connect_timeout(dsn: &str, connect_timeout_seconds: i32) -> String {
     format!("{dsn} connect_timeout={connect_timeout_seconds}")
 }
 
+fn sql_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
 fn parse_hex(input: &str) -> Result<Vec<u8>, String> {
     let input = input.strip_prefix("\\x").unwrap_or(input);
     if input.len() % 2 != 0 {
@@ -337,9 +437,21 @@ fn parse_lsn(input: &str) -> Result<u64, String> {
     Ok((high << 32) | low)
 }
 
+fn format_lsn(lsn: u64) -> String {
+    format!("{:X}/{:08X}", lsn >> 32, lsn & u32::MAX as u64)
+}
+
+fn parse_bool(input: &str) -> Result<bool, String> {
+    match input {
+        "t" | "true" => Ok(true),
+        "f" | "false" => Ok(false),
+        _ => Err(format!("invalid boolean text: {input}")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{dsn_with_connect_timeout, parse_hex, parse_lsn};
+    use super::{dsn_with_connect_timeout, format_lsn, parse_bool, parse_hex, parse_lsn};
 
     #[test]
     fn parses_hex_with_or_without_bytea_prefix() {
@@ -383,5 +495,20 @@ mod tests {
         assert_eq!(parse_lsn("1/00000000").unwrap(), 0x1_0000_0000);
         assert!(parse_lsn("not-an-lsn").is_err());
         assert!(parse_lsn("100000000/0").is_err());
+    }
+
+    #[test]
+    fn formats_pg_lsn_text() {
+        assert_eq!(format_lsn(0x016b6c50), "0/016B6C50");
+        assert_eq!(format_lsn(0x1_0000_0000), "1/00000000");
+    }
+
+    #[test]
+    fn parses_postgres_boolean_text() {
+        assert!(parse_bool("t").unwrap());
+        assert!(parse_bool("true").unwrap());
+        assert!(!parse_bool("f").unwrap());
+        assert!(!parse_bool("false").unwrap());
+        assert!(parse_bool("yes").is_err());
     }
 }
