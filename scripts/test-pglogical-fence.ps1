@@ -150,7 +150,7 @@ function Stop-TestCluster {
     }
 
     $procs = Get-CimInstance Win32_Process | Where-Object {
-        ($_.Name -in @('postgres.exe', 'pg_ctl.exe', 'cmd.exe')) -and
+        ($_.Name -in @('postgres.exe', 'pg_ctl.exe', 'cmd.exe', 'psql.exe', 'initdb.exe')) -and
         ($null -ne $_.CommandLine) -and
         ($_.CommandLine -match 'target[/\\]pglogical-test-pgdata')
     }
@@ -205,7 +205,7 @@ while (Get-Process -Id `$parentPid -ErrorAction SilentlyContinue) {
     Start-Sleep -Seconds 2
 }
 `$procs = Get-CimInstance Win32_Process | Where-Object {
-    (`$_.Name -in @('postgres.exe', 'pg_ctl.exe', 'cmd.exe')) -and
+    (`$_.Name -in @('postgres.exe', 'pg_ctl.exe', 'cmd.exe', 'psql.exe', 'initdb.exe')) -and
     (`$null -ne `$_.CommandLine) -and
     (`$_.CommandLine -match 'target[/\\]pglogical-test-pgdata')
 }
@@ -517,7 +517,45 @@ SELECT EXISTS (
         throw 'compare_table did not record a converged fence'
     }
 
-    Write-Output "pglogical fence and compare_table tests passed on pg$PgMajor using slot $slotName"
+    Write-Step 'Creating subscriber-side drift and confirming key-level divergence'
+    Invoke-Sql -Database 'target' -Sql "UPDATE public.accounts SET value = 'target-drift' WHERE id = 1" | Out-Null
+    $driftVerdict = Invoke-Sql -Database 'provider' -Sql @"
+SELECT (pgl_validate.compare_table(
+    'public.accounts'::regclass,
+    ARRAY['target'],
+    jsonb_build_object(
+        'provider_dsn', $providerDsnSql,
+        'provider_node', 'provider',
+        'repsets', jsonb_build_array('default'),
+        'fence_timeout_ms', 30000,
+        'fence_poll_interval_ms', 100
+    )
+)).verdict
+"@
+    if ($driftVerdict -ne 'differ') {
+        throw "unexpected drift compare_table verdict: $driftVerdict"
+    }
+
+    $confirmedDrift = Invoke-Sql -Database 'provider' -Sql @"
+SELECT EXISTS (
+    SELECT 1
+    FROM pgl_validate.divergence d
+    JOIN pgl_validate.table_result tr USING (run_id, schema_name, table_name)
+    JOIN pgl_validate.divergence_recheck dr USING (run_id, schema_name, table_name, key_bytes, node)
+    WHERE d.schema_name = 'public'
+      AND d.table_name = 'accounts'
+      AND d.node = 'target'
+      AND d.classification = 'differs'
+      AND d.status = 'confirmed'
+      AND dr.outcome = 'still_differs'
+      AND tr.verdict = 'differ'
+)::text
+"@
+    if ($confirmedDrift -ne 'true') {
+        throw 'subscriber-side drift was not persisted as a confirmed divergence'
+    }
+
+    Write-Output "pglogical fence, compare_table, and divergence recheck tests passed on pg$PgMajor using slot $slotName"
 }
 catch {
     if (Test-Path -LiteralPath $log) {

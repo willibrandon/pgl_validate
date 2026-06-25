@@ -165,6 +165,37 @@ mod pgl_validate {
         TableIterator::once((checksum.pg_version, checksum.n_rows, checksum.lthash))
     }
 
+    /// Execute generated row-localization SQL on a remote peer over libpq.
+    #[pg_extern(volatile, parallel_unsafe)]
+    fn remote_localize_rows(
+        dsn: &str,
+        localization_sql: &str,
+        connect_timeout_seconds: default!(i32, 10),
+        statement_timeout_ms: default!(i32, 600000),
+        lock_timeout_ms: default!(i32, 30000),
+    ) -> TableIterator<
+        'static,
+        (
+            name!(key_text, String),
+            name!(key_bytes, Vec<u8>),
+            name!(row_digest, Vec<u8>),
+        ),
+    > {
+        let rows = transport::libpq::fetch_localized_rows(
+            dsn,
+            localization_sql,
+            connect_timeout_seconds,
+            statement_timeout_ms,
+            lock_timeout_ms,
+        )
+        .unwrap_or_else(|err| pgrx::error!("{err}"));
+
+        TableIterator::new(
+            rows.into_iter()
+                .map(|row| (row.key_text, row.key_bytes, row.row_digest)),
+        )
+    }
+
     /// Insert a barrier token on a remote origin and return its exact end LSN.
     #[pg_extern(
         volatile,
@@ -1007,6 +1038,15 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(remote_rows, 1);
+
+        let divergence = Spi::get_one::<String>(
+            "SELECT classification || ';' || status || ';' || node
+             FROM pgl_validate.divergence
+             WHERE node = 'remote_diff'",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(divergence, "differs;confirmed;remote_diff");
 
         let _ = crate::transport::libpq::execute_command(
             &local_dsn,

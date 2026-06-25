@@ -815,11 +815,110 @@ BEGIN
 END
 $$;
 
+-- Generate the planner-visible SQL used to enumerate keys and row digests for
+-- a localized divergent range. The current implementation emits the whole
+-- relation; range predicates will reuse this shape once Merkle bounds exist.
+CREATE FUNCTION pgl_validate.plan_localize_sql(
+    rel regclass,
+    key_cols text[],
+    cols text[]
+)
+RETURNS text
+LANGUAGE plpgsql
+STABLE
+AS $$
+DECLARE
+    rel_sql text;
+    selected_cols text[];
+    selected_key_cols text[];
+    enc_modes int[];
+    key_enc_modes int[];
+    digest_args text;
+    key_digest_args text;
+    key_text_args text;
+    order_args text;
+BEGIN
+    IF key_cols IS NULL OR cardinality(key_cols) = 0 THEN
+        RAISE EXCEPTION 'row-level localization requires a comparison key';
+    END IF;
+
+    SELECT format('%I.%I', n.nspname, c.relname)
+    INTO rel_sql
+    FROM pg_class c
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE c.oid = rel;
+
+    IF rel_sql IS NULL THEN
+        RAISE EXCEPTION 'relation % does not exist', rel;
+    END IF;
+
+    SELECT array_agg(a.attname ORDER BY a.attname)
+    INTO selected_cols
+    FROM unnest(cols) requested(col_name)
+    JOIN pg_attribute a
+      ON a.attrelid = rel
+     AND a.attname = requested.col_name
+     AND a.attnum > 0
+     AND NOT a.attisdropped;
+
+    IF selected_cols IS NULL OR cardinality(selected_cols) <> cardinality(cols) THEN
+        RAISE EXCEPTION 'one or more requested columns are not present on %', rel::text;
+    END IF;
+
+    SELECT array_agg(a.attname ORDER BY ord.ordinality)
+    INTO selected_key_cols
+    FROM unnest(key_cols) WITH ORDINALITY AS ord(col_name, ordinality)
+    JOIN pg_attribute a
+      ON a.attrelid = rel
+     AND a.attname = ord.col_name
+     AND a.attnum > 0
+     AND NOT a.attisdropped;
+
+    IF selected_key_cols IS NULL OR cardinality(selected_key_cols) <> cardinality(key_cols) THEN
+        RAISE EXCEPTION 'one or more key columns are not present on %', rel::text;
+    END IF;
+
+    SELECT
+        array_agg(pgl_validate.column_encoding_mode(a.atttypid) ORDER BY a.attname),
+        string_agg(format('t.%I', a.attname), ', ' ORDER BY a.attname)
+    INTO enc_modes, digest_args
+    FROM pg_attribute a
+    WHERE a.attrelid = rel
+      AND a.attname = ANY (selected_cols)
+      AND a.attnum > 0
+      AND NOT a.attisdropped;
+
+    SELECT
+        array_agg(pgl_validate.column_encoding_mode(a.atttypid) ORDER BY ord.ordinality),
+        string_agg(format('t.%I', a.attname), ', ' ORDER BY ord.ordinality),
+        string_agg(format('%L, t.%I', a.attname, a.attname), ', ' ORDER BY ord.ordinality),
+        string_agg(format('t.%I', a.attname), ', ' ORDER BY ord.ordinality)
+    INTO key_enc_modes, key_digest_args, key_text_args, order_args
+    FROM unnest(selected_key_cols) WITH ORDINALITY AS ord(col_name, ordinality)
+    JOIN pg_attribute a
+      ON a.attrelid = rel
+     AND a.attname = ord.col_name
+     AND a.attnum > 0
+     AND NOT a.attisdropped;
+
+    RETURN format(
+        'SELECT jsonb_build_object(%s)::text AS key_text, pgl_validate.row_digest(%L::int[], %s) AS key_bytes, pgl_validate.row_digest(%L::int[], %s) AS row_digest FROM %s t ORDER BY %s',
+        key_text_args,
+        key_enc_modes::text,
+        key_digest_args,
+        enc_modes::text,
+        digest_args,
+        rel_sql,
+        order_args
+    );
+END
+$$;
+
 -- First executable comparison path: compute and persist the local node's table
 -- checksum using the same generated SQL that the coordinator will send to
 -- remote peers. Multi-peer transport layers build on this catalog contract.
 CREATE FUNCTION pgl_validate.compare_table(
-    table_name regclass,
+    p_table_name regclass,
     peers text[] DEFAULT NULL,
     options jsonb DEFAULT '{}'
 )
@@ -829,8 +928,8 @@ VOLATILE
 AS $$
 DECLARE
     v_run_id bigint;
-    schema_name text;
-    rel_name text;
+    v_schema_name text;
+    v_rel_name text;
     cols text[];
     key_cols text[];
     contract_repsets text[];
@@ -861,28 +960,32 @@ DECLARE
     peer_rec record;
     remote_rec record;
     checksum_sql text;
+    localize_sql text;
     n_rows bigint;
     lthash bytea;
     differ_count int := 0;
+    confirmed_count int := 0;
+    advisory_count int := 0;
+    indeterminate_count int := 0;
     participant_count int := 1;
     verdict text;
     result_reason text;
     result_row pgl_validate.table_result;
 BEGIN
     SELECT n.nspname, c.relname
-    INTO schema_name, rel_name
+    INTO v_schema_name, v_rel_name
     FROM pg_class c
     JOIN pg_namespace n ON n.oid = c.relnamespace
-    WHERE c.oid = table_name;
+    WHERE c.oid = p_table_name;
 
-    IF schema_name IS NULL THEN
-        RAISE EXCEPTION 'relation % does not exist', table_name;
+    IF v_schema_name IS NULL THEN
+        RAISE EXCEPTION 'relation % does not exist', p_table_name;
     END IF;
 
     SELECT array_agg(a.attname ORDER BY a.attname)
     INTO cols
     FROM pg_attribute a
-    WHERE a.attrelid = table_name
+    WHERE a.attrelid = p_table_name
       AND a.attnum > 0
       AND NOT a.attisdropped;
 
@@ -891,7 +994,7 @@ BEGIN
     FROM pg_index i
     CROSS JOIN LATERAL unnest(i.indkey) WITH ORDINALITY AS ord(attnum, ordinality)
     JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ord.attnum
-    WHERE i.indrelid = table_name
+    WHERE i.indrelid = p_table_name
       AND i.indisprimary;
 
     requested_backend := COALESCE(NULLIF(options->>'backend', ''), 'pglogical');
@@ -947,7 +1050,7 @@ BEGIN
         SELECT EXISTS (
             SELECT 1
             FROM pglogical.replication_set_table rst
-            WHERE rst.set_reloid = table_name
+            WHERE rst.set_reloid = p_table_name
         )
         INTO table_in_pglogical;
     ELSIF options ? 'backend' AND requested_backend = 'pglogical' THEN
@@ -963,7 +1066,7 @@ BEGIN
         SELECT *
         INTO contract_rec
         FROM pgl_validate.pglogical_table_contract(
-            table_name,
+            p_table_name,
             contract_repsets,
             contract_subscription
         );
@@ -995,7 +1098,7 @@ BEGIN
         has_row_filter, sync_status, validated_property
     )
     VALUES (
-        v_run_id, schema_name, rel_name, key_cols, cols, plan_repsets,
+        v_run_id, v_schema_name, v_rel_name, key_cols, cols, plan_repsets,
         repl_insert, repl_update, repl_delete, repl_truncate,
         has_row_filter, sync_status, validated_property
     );
@@ -1015,7 +1118,7 @@ BEGIN
             run_id, schema_name, table_name, verdict, reason, finished_at
         )
         VALUES (
-            v_run_id, schema_name, rel_name, verdict, result_reason, now()
+            v_run_id, v_schema_name, v_rel_name, verdict, result_reason, now()
         )
         RETURNING * INTO result_row;
 
@@ -1138,13 +1241,13 @@ BEGIN
     SET status = 'running'
     WHERE pgl_validate.run.run_id = v_run_id;
 
-    checksum_sql := pgl_validate.plan_chunk_sql(table_name, key_cols, NULL, NULL, cols, NULL);
+    checksum_sql := pgl_validate.plan_chunk_sql(p_table_name, key_cols, NULL, NULL, cols, NULL);
     EXECUTE checksum_sql INTO n_rows, lthash;
 
     INSERT INTO pgl_validate.table_node_result(
         run_id, schema_name, table_name, node, n_rows, lthash, set_hash
     )
-    VALUES (v_run_id, schema_name, rel_name, 'local', n_rows, lthash, NULL);
+    VALUES (v_run_id, v_schema_name, v_rel_name, 'local', n_rows, lthash, NULL);
 
     FOR peer_rec IN
         SELECT p.name, p.dsn, p.backend,
@@ -1179,7 +1282,7 @@ BEGIN
             run_id, schema_name, table_name, node, n_rows, lthash, set_hash
         )
         VALUES (
-            v_run_id, schema_name, rel_name, peer_rec.name,
+            v_run_id, v_schema_name, v_rel_name, peer_rec.name,
             remote_rec.n_rows, remote_rec.lthash, NULL
         );
 
@@ -1188,6 +1291,282 @@ BEGIN
             differ_count := differ_count + 1;
         END IF;
     END LOOP;
+
+    IF differ_count > 0
+       AND key_cols IS NOT NULL
+       AND cardinality(key_cols) > 0 THEN
+        INSERT INTO pgl_validate.fence_epoch(run_id, epoch_seq)
+        VALUES (v_run_id, 1)
+        ON CONFLICT DO NOTHING;
+
+        localize_sql := pgl_validate.plan_localize_sql(p_table_name, key_cols, cols);
+
+        IF to_regclass('pg_temp.pgl_validate_localized_sample') IS NOT NULL THEN
+            DROP TABLE pg_temp.pgl_validate_localized_sample;
+        END IF;
+        CREATE TEMP TABLE pgl_validate_localized_sample (
+            sample     text NOT NULL,
+            node       text NOT NULL,
+            key_text   text NOT NULL,
+            key_bytes  bytea NOT NULL,
+            row_digest bytea NOT NULL
+        ) ON COMMIT DROP;
+
+        EXECUTE format(
+            'INSERT INTO pg_temp.pgl_validate_localized_sample(sample, node, key_text, key_bytes, row_digest)
+             SELECT %L, %L, q.key_text, q.key_bytes, q.row_digest FROM (%s) AS q',
+            'A',
+            'local',
+            localize_sql
+        );
+
+        FOR peer_rec IN
+            SELECT p.name, p.dsn, p.backend,
+                   p.connect_timeout_seconds,
+                   p.statement_timeout_ms,
+                   p.lock_timeout_ms
+            FROM pgl_validate.peer p
+            WHERE p.name = ANY (peer_names)
+            ORDER BY p.name
+        LOOP
+            INSERT INTO pg_temp.pgl_validate_localized_sample(
+                sample, node, key_text, key_bytes, row_digest
+            )
+            SELECT 'A', peer_rec.name, r.key_text, r.key_bytes, r.row_digest
+            FROM pgl_validate.remote_localize_rows(
+                peer_rec.dsn,
+                localize_sql,
+                peer_rec.connect_timeout_seconds,
+                peer_rec.statement_timeout_ms,
+                peer_rec.lock_timeout_ms
+            ) AS r;
+
+            INSERT INTO pgl_validate.divergence(
+                run_id, schema_name, table_name, key_text, key_bytes,
+                classification, node, status, detected_epoch, tuple
+            )
+            SELECT
+                v_run_id,
+                v_schema_name,
+                v_rel_name,
+                classified.key_text,
+                classified.key_bytes,
+                classified.classification,
+                peer_rec.name,
+                CASE
+                    WHEN classified.classification IN ('missing_on','extra_on')
+                     AND validated_property IN ('filtered_intersection','filtered_advisory')
+                    THEN 'advisory'
+                    WHEN classified.classification = 'extra_on'
+                     AND validated_property = 'superset'
+                    THEN 'advisory'
+                    ELSE 'candidate'
+                END,
+                1,
+                NULL
+            FROM (
+                SELECT
+                    COALESCE(l.key_text, r.key_text) AS key_text,
+                    COALESCE(l.key_bytes, r.key_bytes) AS key_bytes,
+                    CASE
+                        WHEN r.key_bytes IS NULL THEN 'missing_on'
+                        WHEN l.key_bytes IS NULL THEN 'extra_on'
+                        WHEN l.row_digest IS DISTINCT FROM r.row_digest
+                         AND validated_property <> 'keys_only'
+                        THEN 'differs'
+                        ELSE NULL
+                    END AS classification
+                FROM (
+                    SELECT key_text, key_bytes, row_digest
+                    FROM pg_temp.pgl_validate_localized_sample
+                    WHERE sample = 'A' AND node = 'local'
+                ) l
+                FULL OUTER JOIN (
+                    SELECT key_text, key_bytes, row_digest
+                    FROM pg_temp.pgl_validate_localized_sample
+                    WHERE sample = 'A' AND node = peer_rec.name
+                ) r USING (key_bytes)
+            ) classified
+            WHERE classified.classification IS NOT NULL
+            ON CONFLICT (run_id, schema_name, table_name, key_bytes, node) DO UPDATE
+            SET classification = EXCLUDED.classification,
+                status = EXCLUDED.status,
+                detected_epoch = EXCLUDED.detected_epoch,
+                detected_at = now();
+        END LOOP;
+
+        IF EXISTS (
+            SELECT 1
+            FROM pgl_validate.divergence d
+            JOIN pgl_validate.peer p ON p.name = d.node
+            WHERE d.run_id = v_run_id
+              AND d.schema_name = v_schema_name
+              AND d.table_name = v_rel_name
+              AND d.status = 'candidate'
+              AND p.backend = 'pglogical'
+        ) THEN
+            INSERT INTO pgl_validate.fence_epoch(run_id, epoch_seq)
+            VALUES (v_run_id, 2)
+            ON CONFLICT DO NOTHING;
+
+            UPDATE pgl_validate.run
+            SET status = 'rechecking'
+            WHERE pgl_validate.run.run_id = v_run_id;
+
+            FOR peer_rec IN
+                SELECT p.name, p.dsn, p.backend, p.subscription_name,
+                       p.connect_timeout_seconds,
+                       p.statement_timeout_ms,
+                       p.lock_timeout_ms,
+                       re.edge_id,
+                       re.slot_name,
+                       re.origin_name
+                FROM pgl_validate.peer p
+                JOIN pgl_validate.run_edge re
+                  ON re.run_id = v_run_id
+                 AND re.target_node = p.name
+                WHERE p.name = ANY (peer_names)
+                  AND p.backend = 'pglogical'
+                ORDER BY p.name
+            LOOP
+                SELECT *
+                INTO fence_rec
+                FROM pgl_validate.fence_pglogical_edge(
+                    v_run_id,
+                    2,
+                    peer_rec.edge_id,
+                    provider_node,
+                    peer_rec.name,
+                    provider_dsn,
+                    peer_rec.dsn,
+                    peer_rec.subscription_name::text,
+                    peer_rec.slot_name,
+                    peer_rec.origin_name,
+                    ARRAY['pgl_validate_barrier'],
+                    peer_rec.connect_timeout_seconds,
+                    peer_rec.statement_timeout_ms,
+                    peer_rec.lock_timeout_ms,
+                    fence_timeout_ms,
+                    fence_poll_interval_ms
+                );
+
+                IF fence_rec.status <> 'converged' THEN
+                    RAISE EXCEPTION
+                        'pglogical peer % failed to converge recheck fence: %',
+                        peer_rec.name,
+                        fence_rec.status
+                        USING ERRCODE = '57014';
+                END IF;
+            END LOOP;
+
+            EXECUTE format(
+                'INSERT INTO pg_temp.pgl_validate_localized_sample(sample, node, key_text, key_bytes, row_digest)
+                 SELECT %L, %L, q.key_text, q.key_bytes, q.row_digest FROM (%s) AS q',
+                'B',
+                'local',
+                localize_sql
+            );
+
+            FOR peer_rec IN
+                SELECT p.name, p.dsn, p.backend,
+                       p.connect_timeout_seconds,
+                       p.statement_timeout_ms,
+                       p.lock_timeout_ms
+                FROM pgl_validate.peer p
+                WHERE p.name = ANY (peer_names)
+                  AND p.backend = 'pglogical'
+                ORDER BY p.name
+            LOOP
+                INSERT INTO pg_temp.pgl_validate_localized_sample(
+                    sample, node, key_text, key_bytes, row_digest
+                )
+                SELECT 'B', peer_rec.name, r.key_text, r.key_bytes, r.row_digest
+                FROM pgl_validate.remote_localize_rows(
+                    peer_rec.dsn,
+                    localize_sql,
+                    peer_rec.connect_timeout_seconds,
+                    peer_rec.statement_timeout_ms,
+                    peer_rec.lock_timeout_ms
+                ) AS r;
+
+                INSERT INTO pgl_validate.divergence_recheck(
+                    run_id, schema_name, table_name, key_bytes, node, epoch_seq, outcome
+                )
+                SELECT
+                    d.run_id,
+                    d.schema_name,
+                    d.table_name,
+                    d.key_bytes,
+                    d.node,
+                    2,
+                    CASE
+                        WHEN (lb.key_bytes IS NOT NULL AND pb.key_bytes IS NOT NULL
+                              AND lb.row_digest IS NOT DISTINCT FROM pb.row_digest)
+                          OR (lb.key_bytes IS NULL AND pb.key_bytes IS NULL)
+                        THEN 'cleared'
+                        WHEN la.row_digest IS NOT DISTINCT FROM lb.row_digest
+                         AND pa.row_digest IS NOT DISTINCT FROM pb.row_digest
+                        THEN 'still_differs'
+                        ELSE 'still_hot'
+                    END
+                FROM pgl_validate.divergence d
+                LEFT JOIN pg_temp.pgl_validate_localized_sample la
+                  ON la.sample = 'A' AND la.node = 'local' AND la.key_bytes = d.key_bytes
+                LEFT JOIN pg_temp.pgl_validate_localized_sample pa
+                  ON pa.sample = 'A' AND pa.node = d.node AND pa.key_bytes = d.key_bytes
+                LEFT JOIN pg_temp.pgl_validate_localized_sample lb
+                  ON lb.sample = 'B' AND lb.node = 'local' AND lb.key_bytes = d.key_bytes
+                LEFT JOIN pg_temp.pgl_validate_localized_sample pb
+                  ON pb.sample = 'B' AND pb.node = d.node AND pb.key_bytes = d.key_bytes
+                WHERE d.run_id = v_run_id
+                  AND d.schema_name = v_schema_name
+                  AND d.table_name = v_rel_name
+                  AND d.node = peer_rec.name
+                  AND d.status = 'candidate'
+                ON CONFLICT (run_id, schema_name, table_name, key_bytes, node, epoch_seq)
+                DO UPDATE SET outcome = EXCLUDED.outcome, at = now();
+
+                UPDATE pgl_validate.divergence d
+                SET status = CASE r.outcome
+                    WHEN 'cleared' THEN 'cleared'
+                    WHEN 'still_differs' THEN 'confirmed'
+                    ELSE 'indeterminate'
+                END
+                FROM pgl_validate.divergence_recheck r
+                WHERE r.run_id = d.run_id
+                  AND r.schema_name = d.schema_name
+                  AND r.table_name = d.table_name
+                  AND r.key_bytes = d.key_bytes
+                  AND r.node = d.node
+                  AND r.epoch_seq = 2
+                  AND d.run_id = v_run_id
+                  AND d.schema_name = v_schema_name
+                  AND d.table_name = v_rel_name
+                  AND d.node = peer_rec.name
+                  AND d.status = 'candidate';
+            END LOOP;
+        END IF;
+
+        UPDATE pgl_validate.divergence d
+        SET status = 'confirmed'
+        FROM pgl_validate.peer p
+        WHERE p.name = d.node
+          AND p.backend <> 'pglogical'
+          AND d.run_id = v_run_id
+          AND d.schema_name = v_schema_name
+          AND d.table_name = v_rel_name
+          AND d.status = 'candidate';
+
+        SELECT
+            count(*) FILTER (WHERE status = 'confirmed'),
+            count(*) FILTER (WHERE status = 'advisory'),
+            count(*) FILTER (WHERE status = 'indeterminate')
+        INTO confirmed_count, advisory_count, indeterminate_count
+        FROM pgl_validate.divergence d
+        WHERE d.run_id = v_run_id
+          AND d.schema_name = v_schema_name
+          AND d.table_name = v_rel_name;
+    END IF;
 
     IF differ_count = 0 THEN
         verdict := 'match';
@@ -1203,16 +1582,44 @@ BEGIN
                 validated_property
             );
         END IF;
-    ELSE
+    ELSIF key_cols IS NULL OR cardinality(key_cols) = 0 THEN
         verdict := 'differ';
-        result_reason := format('%s of %s remote peer(s) differ from local', differ_count, participant_count - 1);
+        result_reason := format(
+            '%s of %s remote peer(s) differ from local; row-level localization unavailable without a key',
+            differ_count,
+            participant_count - 1
+        );
+    ELSIF confirmed_count > 0 THEN
+        verdict := 'differ';
+        result_reason := format(
+            '%s confirmed divergence(s), %s advisory difference(s), %s indeterminate key(s); validated_property=%s',
+            confirmed_count,
+            advisory_count,
+            indeterminate_count,
+            validated_property
+        );
+    ELSIF indeterminate_count > 0 THEN
+        verdict := 'indeterminate';
+        result_reason := format(
+            'checksum mismatch localized, but %s key(s) remained hot after recheck; %s advisory difference(s); validated_property=%s',
+            indeterminate_count,
+            advisory_count,
+            validated_property
+        );
+    ELSE
+        verdict := 'match';
+        result_reason := format(
+            'initial checksum mismatch produced no confirmed divergence after localization/recheck; advisory differences=%s; validated_property=%s',
+            advisory_count,
+            validated_property
+        );
     END IF;
 
     INSERT INTO pgl_validate.table_result(
         run_id, schema_name, table_name, verdict, reason, finished_at
     )
     VALUES (
-        v_run_id, schema_name, rel_name, verdict, result_reason, now()
+        v_run_id, v_schema_name, v_rel_name, verdict, result_reason, now()
     )
     RETURNING * INTO result_row;
 

@@ -69,6 +69,8 @@ COMMENT ON FUNCTION pgl_validate.fence_pglogical_edge(bigint, integer, integer, 
     'Inject and converge an exact pglogical barrier for one provider-to-target run edge.';
 COMMENT ON FUNCTION pgl_validate.plan_chunk_sql(regclass, text[], bytea, bytea, text[], text[]) IS
     'Generate planner-visible SQL for a table chunk checksum.';
+COMMENT ON FUNCTION pgl_validate.plan_localize_sql(regclass, text[], text[]) IS
+    'Generate planner-visible SQL for key and row-digest enumeration during divergence localization.';
 COMMENT ON FUNCTION pgl_validate.compare_table(regclass, text[], jsonb) IS
     'Run the current table comparison path and return the persisted table verdict.';
 COMMENT ON FUNCTION pgl_validate.run_status(bigint) IS
@@ -94,6 +96,8 @@ COMMENT ON FUNCTION pgl_validate.hash_digest_array(bytea[]) IS
     'Hash a caller-sorted array of row digests for cryptographic set confirmation.';
 COMMENT ON FUNCTION pgl_validate.remote_checksum(text, text, integer, integer, integer) IS
     'Execute generated checksum SQL on a named peer DSN via libpq with bounded connect, statement, and lock timeouts.';
+COMMENT ON FUNCTION pgl_validate.remote_localize_rows(text, text, integer, integer, integer) IS
+    'Execute generated row-localization SQL on a named peer DSN via libpq with bounded connect, statement, and lock timeouts.';
 COMMENT ON FUNCTION pgl_validate.remote_inject_barrier(text, integer, integer, integer) IS
     'Insert a barrier token on a remote origin over libpq and return the exact barrier commit end LSN.';
 COMMENT ON FUNCTION pgl_validate.remote_wait_slot_confirm_lsn(text, text, pg_lsn, integer, integer, integer) IS

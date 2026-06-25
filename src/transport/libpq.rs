@@ -42,6 +42,17 @@ pub(crate) struct RemoteChecksum {
     pub(crate) lthash: Vec<u8>,
 }
 
+/// Key and row digest fetched while localizing a divergent chunk.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) struct LocalizedRowDigest {
+    /// JSON text representation of the comparison key.
+    pub(crate) key_text: String,
+    /// Canonical digest bytes for the comparison key.
+    pub(crate) key_bytes: Vec<u8>,
+    /// Canonical row digest bytes for the replicated column set.
+    pub(crate) row_digest: Vec<u8>,
+}
+
 /// Barrier token and exact commit-end LSN injected on an origin node.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub(crate) struct BarrierInjection {
@@ -442,6 +453,44 @@ pub(crate) fn fetch_checksum(
         n_rows,
         lthash,
     })
+}
+
+/// Run generated localization SQL on a remote participant.
+pub(crate) fn fetch_localized_rows(
+    dsn: &str,
+    localization_sql: &str,
+    connect_timeout_seconds: i32,
+    statement_timeout_ms: i32,
+    lock_timeout_ms: i32,
+) -> Result<Vec<LocalizedRowDigest>, String> {
+    let conn = Connection::connect_with_timeout(dsn, connect_timeout_seconds)?;
+    conn.set_query_timeouts(statement_timeout_ms, lock_timeout_ms)?;
+    let wrapped_sql = format!(
+        "SELECT q.key_text, \
+                encode(q.key_bytes, 'hex'), \
+                encode(q.row_digest, 'hex') \
+         FROM ({localization_sql}) AS q"
+    );
+
+    let result = conn.exec(&wrapped_sql)?;
+    result.require_status(PGRES_TUPLES_OK)?;
+    if result.nfields() != 3 {
+        return Err(format!(
+            "remote localization returned {} column(s), expected 3",
+            result.nfields()
+        ));
+    }
+
+    let mut rows = Vec::with_capacity(result.ntuples() as usize);
+    for row in 0..result.ntuples() {
+        rows.push(LocalizedRowDigest {
+            key_text: result.value(row, 0)?,
+            key_bytes: parse_hex(&result.value(row, 1)?)?,
+            row_digest: parse_hex(&result.value(row, 2)?)?,
+        });
+    }
+
+    Ok(rows)
 }
 
 unsafe fn c_message(ptr: *const c_char) -> String {
