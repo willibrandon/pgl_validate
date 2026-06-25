@@ -1261,6 +1261,125 @@ mod tests {
     }
 
     #[pg_test]
+    fn apply_repair_orders_inserts_by_foreign_key() {
+        let backend_pid = Spi::get_one::<i32>("SELECT pg_backend_pid()")
+            .unwrap()
+            .unwrap();
+        let peer_db = identifier(&format!("pgl_validate_fk_peer_{backend_pid}"));
+        let parent_table = identifier(&format!("z_repair_parent_{backend_pid}"));
+        let child_table = identifier(&format!("a_repair_child_{backend_pid}"));
+        let local_dsn = local_dsn();
+        let remote_dsn = peer_dsn(&peer_db);
+
+        let _ = crate::transport::libpq::execute_command(
+            &local_dsn,
+            &format!("DROP DATABASE IF EXISTS {peer_db} WITH (FORCE)"),
+        );
+        crate::transport::libpq::execute_command(&local_dsn, &format!("CREATE DATABASE {peer_db}"))
+            .unwrap();
+        crate::transport::libpq::execute_command(
+            &remote_dsn,
+            &format!(
+                "CREATE EXTENSION pgl_validate;
+                 CREATE TABLE public.{parent_table}(id int PRIMARY KEY, value text);
+                 CREATE TABLE public.{child_table}(
+                     id int PRIMARY KEY,
+                     parent_id int NOT NULL REFERENCES public.{parent_table}(id),
+                     value text
+                 );"
+            ),
+        )
+        .unwrap();
+
+        Spi::run(&format!(
+            "
+            CREATE TABLE public.{parent_table}(id int PRIMARY KEY, value text);
+            CREATE TABLE public.{child_table}(
+                id int PRIMARY KEY,
+                parent_id int NOT NULL REFERENCES public.{parent_table}(id),
+                value text
+            );
+            INSERT INTO public.{parent_table} VALUES (1, 'parent');
+            INSERT INTO public.{child_table} VALUES (10, 1, 'child');
+            INSERT INTO pgl_validate.peer(name, dsn, backend)
+            VALUES ('remote_fk', {remote_dsn}, 'native');
+            ",
+            remote_dsn = sql_literal(&remote_dsn)
+        ))
+        .unwrap();
+
+        let run_id = Spi::get_one::<i64>(&format!(
+            "
+            SELECT pgl_validate.compare(
+                ARRAY[
+                    'public.{child_table}'::regclass,
+                    'public.{parent_table}'::regclass
+                ],
+                peers => ARRAY['remote_fk']
+            )
+            "
+        ))
+        .unwrap()
+        .unwrap();
+
+        let repair_status = Spi::get_one::<String>(&format!(
+            "
+            SELECT repair_id::text || ';' || status
+            FROM pgl_validate.apply_repair({run_id}, 'local', 'remote_fk', 'remote_fk')
+            "
+        ))
+        .unwrap()
+        .unwrap();
+        let (repair_id, repair_status) = repair_status
+            .split_once(';')
+            .expect("FK repair status should include id");
+        assert_eq!(repair_status, "applied");
+
+        let repair_audit = Spi::get_one::<String>(&format!(
+            "
+            SELECT string_agg(table_name || ':' || action || ':' || post_verdict, ',' ORDER BY table_name)
+            FROM pgl_validate.repair_result
+            WHERE repair_id = {repair_id}
+            "
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            repair_audit,
+            format!("{child_table}:insert:match,{parent_table}:insert:match")
+        );
+
+        let repaired_run_id = Spi::get_one::<i64>(&format!(
+            "
+            SELECT pgl_validate.compare(
+                ARRAY[
+                    'public.{child_table}'::regclass,
+                    'public.{parent_table}'::regclass
+                ],
+                peers => ARRAY['remote_fk']
+            )
+            "
+        ))
+        .unwrap()
+        .unwrap();
+        let repaired_verdicts = Spi::get_one::<String>(&format!(
+            "
+            SELECT string_agg(verdict, ',' ORDER BY table_name)
+            FROM pgl_validate.table_result
+            WHERE run_id = {repaired_run_id}
+            "
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(repaired_verdicts, "match,match");
+
+        let _ = crate::transport::libpq::execute_command(
+            &local_dsn,
+            &format!("DROP DATABASE IF EXISTS {peer_db} WITH (FORCE)"),
+        );
+    }
+
+    #[pg_test]
     fn fence_barrier_accepts_duplicate_tokens() {
         Spi::run(
             r#"

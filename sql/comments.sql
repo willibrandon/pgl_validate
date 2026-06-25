@@ -79,6 +79,8 @@ COMMENT ON FUNCTION pgl_validate.compare_table(regclass, text[], jsonb) IS
     'Run the current table comparison path and return the persisted table verdict.';
 COMMENT ON FUNCTION pgl_validate.compare_sequence(regclass, text[], jsonb) IS
     'Validate one sequence against peers using the pglogical sequence buffer-window contract.';
+COMMENT ON FUNCTION pgl_validate._repair_statements(bigint, text) IS
+    'Build structured repair statements with target, key, lock, verification, and relation metadata for generate_repair and apply_repair.';
 COMMENT ON FUNCTION pgl_validate.generate_repair(bigint, text) IS
     'Generate reviewable node-labeled DML and sequence setval statements for confirmed divergences using the selected authoritative node.';
 COMMENT ON FUNCTION pgl_validate.apply_repair(bigint, text, text, text, text, boolean) IS
