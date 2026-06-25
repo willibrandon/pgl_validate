@@ -1536,6 +1536,120 @@ mod tests {
     }
 
     #[pg_test]
+    fn run_control_transitions_only_active_runs() {
+        let running_run = Spi::get_one::<i64>(
+            "INSERT INTO pgl_validate.run(status) VALUES ('running') RETURNING run_id",
+        )
+        .unwrap()
+        .unwrap();
+        let completed_run = Spi::get_one::<i64>(
+            "INSERT INTO pgl_validate.run(status, finished_at)
+             VALUES ('completed', now() - interval '1 hour')
+             RETURNING run_id",
+        )
+        .unwrap()
+        .unwrap();
+
+        let paused = Spi::get_one::<bool>(&format!("SELECT pgl_validate.pause({running_run})"))
+            .unwrap()
+            .unwrap();
+        let resumed = Spi::get_one::<bool>(&format!("SELECT pgl_validate.resume({running_run})"))
+            .unwrap()
+            .unwrap();
+        let canceled = Spi::get_one::<bool>(&format!("SELECT pgl_validate.cancel({running_run})"))
+            .unwrap()
+            .unwrap();
+        let completed_pause =
+            Spi::get_one::<bool>(&format!("SELECT pgl_validate.pause({completed_run})"))
+                .unwrap()
+                .unwrap();
+        let final_state = Spi::get_one::<String>(&format!(
+            "
+            SELECT status || ';' || (finished_at IS NOT NULL)::text
+            FROM pgl_validate.run
+            WHERE run_id = {running_run}
+            "
+        ))
+        .unwrap()
+        .unwrap();
+
+        assert!(paused);
+        assert!(resumed);
+        assert!(canceled);
+        assert!(!completed_pause);
+        assert_eq!(final_state, "canceled;true");
+    }
+
+    #[pg_test]
+    fn purge_removes_terminal_runs_and_unprotected_barriers() {
+        let active_run = Spi::get_one::<i64>(
+            "INSERT INTO pgl_validate.run(status, started_at)
+             VALUES ('running', now() - interval '2 days')
+             RETURNING run_id",
+        )
+        .unwrap()
+        .unwrap();
+        let old_done = Spi::get_one::<i64>(
+            "INSERT INTO pgl_validate.run(status, started_at, finished_at)
+             VALUES ('completed', now() - interval '3 days', now() - interval '2 days')
+             RETURNING run_id",
+        )
+        .unwrap()
+        .unwrap();
+        let recent_done = Spi::get_one::<i64>(
+            "INSERT INTO pgl_validate.run(status, started_at, finished_at)
+             VALUES ('completed', now() - interval '10 minutes', now() - interval '5 minutes')
+             RETURNING run_id",
+        )
+        .unwrap()
+        .unwrap();
+
+        Spi::run(&format!(
+            "
+            INSERT INTO pgl_validate.fence_epoch(run_id, epoch_seq)
+            VALUES ({active_run}, 1);
+            INSERT INTO pgl_validate.run_edge(
+                run_id, edge_id, provider_node, target_node, backend,
+                subscription, slot_name, origin_name, repsets)
+            VALUES ({active_run}, 1, 'a', 'b', 'pglogical', 'sub', 'slot', 'origin', ARRAY['default']);
+            INSERT INTO pgl_validate.fence_barrier(token, injected_at)
+            VALUES
+                ('55555555-5555-5555-5555-555555555555', now() - interval '2 hours'),
+                ('66666666-6666-6666-6666-666666666666', now() - interval '2 hours');
+            INSERT INTO pgl_validate.fence_barrier_run(
+                token, run_id, epoch_seq, edge_id, origin_node, barrier_end_lsn)
+            VALUES ('55555555-5555-5555-5555-555555555555', {active_run}, 1, 1, 'a', '0/30');
+            "
+        ))
+        .unwrap();
+
+        let purged = Spi::get_one::<i64>("SELECT pgl_validate.purge(now() - interval '1 hour')")
+            .unwrap()
+            .unwrap();
+
+        let outcome = Spi::get_one::<String>(&format!(
+            "
+            SELECT EXISTS (SELECT 1 FROM pgl_validate.run WHERE run_id = {old_done})::text || ';' ||
+                   EXISTS (SELECT 1 FROM pgl_validate.run WHERE run_id = {recent_done})::text || ';' ||
+                   EXISTS (SELECT 1 FROM pgl_validate.run WHERE run_id = {active_run})::text || ';' ||
+                   EXISTS (
+                       SELECT 1 FROM pgl_validate.fence_barrier
+                       WHERE token = '55555555-5555-5555-5555-555555555555'
+                   )::text || ';' ||
+                   EXISTS (
+                       SELECT 1 FROM pgl_validate.fence_barrier
+                       WHERE token = '66666666-6666-6666-6666-666666666666'
+                   )::text
+            "
+        ))
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(purged, 1);
+        assert_eq!(outcome, "false;true;true;true;false");
+    }
+
+    #[pg_test]
     fn pglogical_accepts_insert_only_barrier_repset() {
         Spi::run(
             r#"

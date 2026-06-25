@@ -79,6 +79,14 @@ COMMENT ON FUNCTION pgl_validate.compare_table(regclass, text[], jsonb) IS
     'Run the current table comparison path and return the persisted table verdict.';
 COMMENT ON FUNCTION pgl_validate.compare_sequence(regclass, text[], jsonb) IS
     'Validate one sequence against peers using the pglogical sequence buffer-window contract.';
+COMMENT ON FUNCTION pgl_validate.cancel(bigint) IS
+    'Mark an active validation run canceled and finish it without deleting its audit rows.';
+COMMENT ON FUNCTION pgl_validate.pause(bigint) IS
+    'Move an active validation run into paused state for later resume.';
+COMMENT ON FUNCTION pgl_validate.resume(bigint) IS
+    'Move a paused validation run back into running state and clear transient completion/error fields.';
+COMMENT ON FUNCTION pgl_validate.purge(timestamptz) IS
+    'Delete terminal validation runs older than the cutoff and clean unprotected local barrier tokens.';
 COMMENT ON FUNCTION pgl_validate._repair_statements(bigint, text) IS
     'Build structured repair statements with target, key, lock, verification, and relation metadata for generate_repair and apply_repair.';
 COMMENT ON FUNCTION pgl_validate.generate_repair(bigint, text) IS

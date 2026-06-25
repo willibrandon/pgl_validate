@@ -2998,6 +2998,90 @@ BEGIN
 END
 $$;
 
+CREATE FUNCTION pgl_validate.cancel(run_id bigint)
+RETURNS boolean
+LANGUAGE plpgsql
+VOLATILE
+AS $$
+DECLARE
+    changed boolean;
+BEGIN
+    UPDATE pgl_validate.run r
+    SET status = 'canceled',
+        finished_at = COALESCE(r.finished_at, clock_timestamp())
+    WHERE r.run_id = cancel.run_id
+      AND r.status IN ('planning','fencing','running','paused','rechecking')
+    RETURNING true INTO changed;
+
+    RETURN COALESCE(changed, false);
+END
+$$;
+
+CREATE FUNCTION pgl_validate.pause(run_id bigint)
+RETURNS boolean
+LANGUAGE plpgsql
+VOLATILE
+AS $$
+DECLARE
+    changed boolean;
+BEGIN
+    UPDATE pgl_validate.run r
+    SET status = 'paused'
+    WHERE r.run_id = pause.run_id
+      AND r.status IN ('planning','fencing','running','rechecking')
+    RETURNING true INTO changed;
+
+    RETURN COALESCE(changed, false);
+END
+$$;
+
+CREATE FUNCTION pgl_validate.resume(run_id bigint)
+RETURNS boolean
+LANGUAGE plpgsql
+VOLATILE
+AS $$
+DECLARE
+    changed boolean;
+BEGIN
+    UPDATE pgl_validate.run r
+    SET status = 'running',
+        finished_at = NULL,
+        error = NULL
+    WHERE r.run_id = resume.run_id
+      AND r.status = 'paused'
+    RETURNING true INTO changed;
+
+    RETURN COALESCE(changed, false);
+END
+$$;
+
+CREATE FUNCTION pgl_validate.purge(before timestamptz)
+RETURNS bigint
+LANGUAGE plpgsql
+VOLATILE
+AS $$
+DECLARE
+    deleted_runs bigint;
+BEGIN
+    IF before IS NULL THEN
+        RAISE EXCEPTION 'purge cutoff timestamp is required'
+            USING ERRCODE = '22004';
+    END IF;
+
+    WITH deleted AS (
+        DELETE FROM pgl_validate.run r
+        WHERE r.status IN ('completed','failed','canceled')
+          AND COALESCE(r.finished_at, r.started_at) < purge.before
+        RETURNING 1
+    )
+    SELECT count(*) INTO deleted_runs FROM deleted;
+
+    PERFORM pgl_validate.cleanup_fence_barriers();
+
+    RETURN deleted_runs;
+END
+$$;
+
 CREATE FUNCTION pgl_validate.run_status(run_id bigint)
 RETURNS pgl_validate.run
 LANGUAGE sql
