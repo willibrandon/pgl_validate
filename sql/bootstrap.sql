@@ -987,6 +987,128 @@ BEGIN
 END
 $$;
 
+CREATE FUNCTION pgl_validate.compare(
+    tables regclass[] DEFAULT NULL,
+    repset text DEFAULT NULL,
+    peers text[] DEFAULT NULL,
+    reference text DEFAULT NULL,
+    options jsonb DEFAULT '{}'::jsonb
+)
+RETURNS bigint
+LANGUAGE plpgsql
+VOLATILE
+AS $$
+DECLARE
+    v_run_id bigint;
+    table_list regclass[];
+    table_oid regclass;
+    effective_options jsonb := COALESCE(options, '{}'::jsonb);
+    internal_options jsonb;
+    result_row pgl_validate.table_result;
+BEGIN
+    IF jsonb_typeof(effective_options) <> 'object' THEN
+        RAISE EXCEPTION 'options must be a JSON object'
+            USING ERRCODE = '22023';
+    END IF;
+
+    IF tables IS NOT NULL AND cardinality(tables) > 0 THEN
+        SELECT array_agg(dedup.table_oid ORDER BY dedup.first_ordinal)
+        INTO table_list
+        FROM (
+            SELECT input.table_oid, min(input.ordinality) AS first_ordinal
+            FROM unnest(tables) WITH ORDINALITY AS input(table_oid, ordinality)
+            GROUP BY input.table_oid
+        ) dedup;
+    ELSIF repset IS NOT NULL THEN
+        IF to_regclass('pglogical.replication_set_table') IS NULL
+           OR to_regclass('pglogical.replication_set') IS NULL THEN
+            RAISE EXCEPTION 'repset expansion requires pglogical to be installed in this database'
+                USING ERRCODE = '0A000';
+        END IF;
+
+        EXECUTE
+            'SELECT array_agg(rst.set_reloid ORDER BY rst.set_reloid::text)
+             FROM pglogical.replication_set rs
+             JOIN pglogical.replication_set_table rst ON rst.set_id = rs.set_id
+             WHERE rs.set_name = $1::name'
+        INTO table_list
+        USING repset;
+    ELSE
+        SELECT array_agg(c.oid::regclass ORDER BY n.nspname, c.relname)
+        INTO table_list
+        FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE c.relkind IN ('r','p')
+          AND n.nspname NOT LIKE 'pg\_%' ESCAPE '\'
+          AND n.nspname <> 'information_schema'
+          AND n.nspname <> 'pgl_validate';
+    END IF;
+
+    IF table_list IS NULL OR cardinality(table_list) = 0 THEN
+        RAISE EXCEPTION 'no tables resolved for validation run'
+            USING ERRCODE = '02000';
+    END IF;
+
+    IF repset IS NOT NULL THEN
+        effective_options := effective_options || jsonb_build_object('repsets', jsonb_build_array(repset));
+    END IF;
+    IF reference IS NOT NULL THEN
+        effective_options := effective_options || jsonb_build_object('provider_node', reference);
+    END IF;
+
+    INSERT INTO pgl_validate.run(status, options, reference_node, tables_total)
+    VALUES ('planning', effective_options, reference, cardinality(table_list))
+    RETURNING pgl_validate.run.run_id INTO v_run_id;
+
+    BEGIN
+        FOREACH table_oid IN ARRAY table_list LOOP
+            internal_options := effective_options || jsonb_build_object('_pgl_validate_parent_run_id', v_run_id);
+            SELECT *
+            INTO result_row
+            FROM pgl_validate.compare_table(table_oid, peers, internal_options);
+        END LOOP;
+
+        UPDATE pgl_validate.run
+        SET status = 'completed',
+            finished_at = now(),
+            tables_total = cardinality(table_list),
+            tables_matched = (
+                SELECT count(*)::int
+                FROM pgl_validate.table_result tr
+                WHERE tr.run_id = v_run_id
+                  AND tr.verdict = 'match'
+            ),
+            tables_differ = (
+                SELECT count(*)::int
+                FROM pgl_validate.table_result tr
+                WHERE tr.run_id = v_run_id
+                  AND tr.verdict = 'differ'
+            )
+        WHERE pgl_validate.run.run_id = v_run_id;
+
+        UPDATE pgl_validate.run_participant
+        SET status = 'done'
+        WHERE pgl_validate.run_participant.run_id = v_run_id
+          AND status NOT IN ('unreachable','error');
+    EXCEPTION WHEN others THEN
+        UPDATE pgl_validate.run
+        SET status = 'failed',
+            finished_at = now(),
+            error = SQLERRM
+        WHERE pgl_validate.run.run_id = v_run_id;
+
+        UPDATE pgl_validate.run_participant
+        SET status = 'error'
+        WHERE pgl_validate.run_participant.run_id = v_run_id
+          AND node = 'local';
+
+        RAISE;
+    END;
+
+    RETURN v_run_id;
+END
+$$;
+
 -- First executable comparison path: compute and persist the local node's table
 -- checksum using the same generated SQL that the coordinator will send to
 -- remote peers. Multi-peer transport layers build on this catalog contract.
@@ -1001,6 +1123,10 @@ VOLATILE
 AS $$
 DECLARE
     v_run_id bigint;
+    parent_run_id bigint := NULLIF(options->>'_pgl_validate_parent_run_id', '')::bigint;
+    append_to_parent boolean := false;
+    initial_epoch int := 1;
+    recheck_epoch int := 2;
     v_schema_name text;
     v_rel_name text;
     cols text[];
@@ -1028,6 +1154,7 @@ DECLARE
     fence_timeout_ms int;
     fence_poll_interval_ms int;
     edge_seq int := 0;
+    current_edge_ids int[] := ARRAY[]::int[];
     subscription_rec record;
     fence_rec pgl_validate.fence_attempt;
     peer_names text[];
@@ -1164,12 +1291,40 @@ BEGIN
         contract_reason := contract_rec.reason;
     END IF;
 
-    INSERT INTO pgl_validate.run(status, options, tables_total)
-    VALUES ('running', options, 1)
-    RETURNING pgl_validate.run.run_id INTO v_run_id;
+    IF parent_run_id IS NULL THEN
+        INSERT INTO pgl_validate.run(status, options, tables_total)
+        VALUES ('running', options, 1)
+        RETURNING pgl_validate.run.run_id INTO v_run_id;
+    ELSE
+        SELECT r.run_id
+        INTO v_run_id
+        FROM pgl_validate.run r
+        WHERE r.run_id = parent_run_id
+          AND r.status IN ('planning','fencing','running','rechecking','paused');
+
+        IF v_run_id IS NULL THEN
+            RAISE EXCEPTION 'parent validation run % does not exist or is not appendable', parent_run_id
+                USING ERRCODE = '55000';
+        END IF;
+
+        append_to_parent := true;
+        SELECT COALESCE(max(fe.epoch_seq), 0) + 1
+        INTO initial_epoch
+        FROM pgl_validate.fence_epoch fe
+        WHERE fe.run_id = v_run_id;
+        recheck_epoch := initial_epoch + 1;
+
+        SELECT COALESCE(max(re.edge_id), 0)
+        INTO edge_seq
+        FROM pgl_validate.run_edge re
+        WHERE re.run_id = v_run_id;
+    END IF;
 
     INSERT INTO pgl_validate.run_participant(run_id, node, role, backend, pg_version, status)
-    VALUES (v_run_id, 'local', 'coordinator', 'pglogical', current_setting('server_version_num')::int, 'connected');
+    VALUES (v_run_id, 'local', 'coordinator', 'pglogical', current_setting('server_version_num')::int, 'connected')
+    ON CONFLICT (run_id, node) DO UPDATE
+    SET status = 'connected',
+        pg_version = EXCLUDED.pg_version;
 
     INSERT INTO pgl_validate.table_plan(
         run_id, schema_name, table_name, key_cols, att_list, repsets,
@@ -1216,17 +1371,19 @@ BEGIN
         )
         RETURNING * INTO result_row;
 
-        UPDATE pgl_validate.run
-        SET status = 'completed',
-            finished_at = now(),
-            tables_matched = 0,
-            tables_differ = 0
-        WHERE pgl_validate.run.run_id = v_run_id;
+        IF NOT append_to_parent THEN
+            UPDATE pgl_validate.run
+            SET status = 'completed',
+                finished_at = now(),
+                tables_matched = 0,
+                tables_differ = 0
+            WHERE pgl_validate.run.run_id = v_run_id;
 
-        UPDATE pgl_validate.run_participant
-        SET status = 'done'
-        WHERE pgl_validate.run_participant.run_id = v_run_id
-          AND node = 'local';
+            UPDATE pgl_validate.run_participant
+            SET status = 'done'
+            WHERE pgl_validate.run_participant.run_id = v_run_id
+              AND node = 'local';
+        END IF;
 
         RETURN result_row;
     END IF;
@@ -1244,7 +1401,7 @@ BEGIN
         END IF;
 
         INSERT INTO pgl_validate.fence_epoch(run_id, epoch_seq)
-        VALUES (v_run_id, 1);
+        VALUES (v_run_id, initial_epoch);
 
         UPDATE pgl_validate.run
         SET status = 'fencing'
@@ -1295,11 +1452,12 @@ BEGIN
             END IF;
 
             edge_seq := edge_seq + 1;
+            current_edge_ids := current_edge_ids || edge_seq;
             SELECT *
             INTO fence_rec
             FROM pgl_validate.fence_pglogical_edge(
                 v_run_id,
-                1,
+                initial_epoch,
                 edge_seq,
                 provider_node,
                 peer_rec.name,
@@ -1387,7 +1545,12 @@ BEGIN
         VALUES (
             v_run_id, peer_rec.name, 'participant', peer_rec.backend,
             remote_rec.pg_version, peer_rec.name, 'done'
-        );
+        )
+        ON CONFLICT (run_id, node) DO UPDATE
+        SET backend = EXCLUDED.backend,
+            pg_version = EXCLUDED.pg_version,
+            dsn_ref = EXCLUDED.dsn_ref,
+            status = EXCLUDED.status;
 
         INSERT INTO pgl_validate.table_node_result(
             run_id, schema_name, table_name, node, n_rows, lthash, set_hash
@@ -1407,7 +1570,7 @@ BEGIN
        AND key_cols IS NOT NULL
        AND cardinality(key_cols) > 0 THEN
         INSERT INTO pgl_validate.fence_epoch(run_id, epoch_seq)
-        VALUES (v_run_id, 1)
+        VALUES (v_run_id, initial_epoch)
         ON CONFLICT DO NOTHING;
 
         localize_sql := pgl_validate.plan_localize_sql(
@@ -1484,7 +1647,7 @@ BEGIN
                     THEN 'advisory'
                     ELSE 'candidate'
                 END,
-                1,
+                initial_epoch,
                 NULL
             FROM (
                 SELECT
@@ -1528,7 +1691,7 @@ BEGIN
               AND p.backend = 'pglogical'
         ) THEN
             INSERT INTO pgl_validate.fence_epoch(run_id, epoch_seq)
-            VALUES (v_run_id, 2)
+            VALUES (v_run_id, recheck_epoch)
             ON CONFLICT DO NOTHING;
 
             UPDATE pgl_validate.run
@@ -1547,6 +1710,7 @@ BEGIN
                 JOIN pgl_validate.run_edge re
                   ON re.run_id = v_run_id
                  AND re.target_node = p.name
+                 AND re.edge_id = ANY (current_edge_ids)
                 WHERE p.name = ANY (peer_names)
                   AND p.backend = 'pglogical'
                 ORDER BY p.name
@@ -1555,7 +1719,7 @@ BEGIN
                 INTO fence_rec
                 FROM pgl_validate.fence_pglogical_edge(
                     v_run_id,
-                    2,
+                    recheck_epoch,
                     peer_rec.edge_id,
                     provider_node,
                     peer_rec.name,
@@ -1620,7 +1784,7 @@ BEGIN
                     d.table_name,
                     d.key_bytes,
                     d.node,
-                    2,
+                    recheck_epoch,
                     CASE
                         WHEN (lb.key_bytes IS NOT NULL AND pb.key_bytes IS NOT NULL
                               AND lb.row_digest IS NOT DISTINCT FROM pb.row_digest)
@@ -1660,7 +1824,7 @@ BEGIN
                   AND r.table_name = d.table_name
                   AND r.key_bytes = d.key_bytes
                   AND r.node = d.node
-                  AND r.epoch_seq = 2
+                  AND r.epoch_seq = recheck_epoch
                   AND d.run_id = v_run_id
                   AND d.schema_name = v_schema_name
                   AND d.table_name = v_rel_name
@@ -1745,17 +1909,19 @@ BEGIN
     )
     RETURNING * INTO result_row;
 
-    UPDATE pgl_validate.run
-    SET status = 'completed',
-        finished_at = now(),
-        tables_matched = CASE WHEN differ_count = 0 THEN 1 ELSE 0 END,
-        tables_differ = CASE WHEN differ_count = 0 THEN 0 ELSE 1 END
-    WHERE pgl_validate.run.run_id = v_run_id;
+    IF NOT append_to_parent THEN
+        UPDATE pgl_validate.run
+        SET status = 'completed',
+            finished_at = now(),
+            tables_matched = CASE WHEN differ_count = 0 THEN 1 ELSE 0 END,
+            tables_differ = CASE WHEN differ_count = 0 THEN 0 ELSE 1 END
+        WHERE pgl_validate.run.run_id = v_run_id;
 
-    UPDATE pgl_validate.run_participant
-    SET status = 'done'
-    WHERE pgl_validate.run_participant.run_id = v_run_id
-      AND node = 'local';
+        UPDATE pgl_validate.run_participant
+        SET status = 'done'
+        WHERE pgl_validate.run_participant.run_id = v_run_id
+          AND node = 'local';
+    END IF;
 
     RETURN result_row;
 END

@@ -687,6 +687,83 @@ mod tests {
     }
 
     #[pg_test]
+    fn compare_records_multiple_tables_under_one_parent_run() {
+        let backend_pid = Spi::get_one::<i32>("SELECT pg_backend_pid()")
+            .unwrap()
+            .unwrap();
+        let first_table = identifier(&format!("pgl_validate_compare_a_{backend_pid}"));
+        let second_table = identifier(&format!("pgl_validate_compare_b_{backend_pid}"));
+        let peer_name = format!("self_parent_{backend_pid}");
+        let dsn = local_dsn();
+
+        let _ = crate::transport::libpq::execute_command(
+            &dsn,
+            &format!("DROP TABLE IF EXISTS public.{first_table}, public.{second_table}"),
+        );
+        crate::transport::libpq::execute_command(
+            &dsn,
+            &format!(
+                "CREATE TABLE public.{first_table}(id int PRIMARY KEY, value text);
+                 CREATE TABLE public.{second_table}(id int PRIMARY KEY, value text);
+                 INSERT INTO public.{first_table} VALUES (1, 'same');
+                 INSERT INTO public.{second_table} VALUES (1, 'same');"
+            ),
+        )
+        .unwrap();
+
+        Spi::run(&format!(
+            "
+            DELETE FROM pgl_validate.peer;
+            INSERT INTO pgl_validate.peer(name, dsn, backend)
+            VALUES ({peer_name}, {dsn}, 'native');
+            ",
+            peer_name = sql_literal(&peer_name),
+            dsn = sql_literal(&dsn)
+        ))
+        .unwrap();
+
+        let run_id = Spi::get_one::<i64>(&format!(
+            "
+            SELECT pgl_validate.compare(
+                ARRAY[
+                    'public.{first_table}'::regclass,
+                    'public.{second_table}'::regclass
+                ],
+                peers => ARRAY[{peer_name}]
+            )
+            ",
+            peer_name = sql_literal(&peer_name)
+        ))
+        .unwrap()
+        .unwrap();
+
+        let run_shape = Spi::get_one::<String>(&format!(
+            "
+            SELECT r.status || ';' ||
+                   r.tables_total::text || ';' ||
+                   r.tables_matched::text || ';' ||
+                   count(tr.*)::text || ';' ||
+                   (SELECT count(*)::text
+                    FROM pgl_validate.run_participant rp
+                    WHERE rp.run_id = r.run_id) || ';' ||
+                   jsonb_array_length(pgl_validate.report(r.run_id)->'tables')::text
+            FROM pgl_validate.run r
+            JOIN pgl_validate.table_result tr ON tr.run_id = r.run_id
+            WHERE r.run_id = {run_id}
+            GROUP BY r.run_id, r.status, r.tables_total, r.tables_matched
+            "
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(run_shape, "completed;2;2;2;2;2");
+
+        let _ = crate::transport::libpq::execute_command(
+            &dsn,
+            &format!("DROP TABLE IF EXISTS public.{first_table}, public.{second_table}"),
+        );
+    }
+
+    #[pg_test]
     fn remote_checksum_reads_over_libpq() {
         let dsn = local_dsn();
         let checksum_sql = "SELECT 7::bigint AS n_rows, decode('010203', 'hex') AS lthash";
@@ -1385,6 +1462,74 @@ mod tests {
         let contract = Spi::get_one::<String>(&contract_sql).unwrap().unwrap();
 
         assert_eq!(contract, "id,kept;keys_only;false");
+    }
+
+    #[pg_test]
+    fn compare_expands_pglogical_repset_into_parent_run() {
+        let backend_pid = Spi::get_one::<i32>("SELECT pg_backend_pid()")
+            .unwrap()
+            .unwrap();
+        let first_table = identifier(&format!("pgl_validate_repset_a_{backend_pid}"));
+        let second_table = identifier(&format!("pgl_validate_repset_b_{backend_pid}"));
+        let repset_name = identifier(&format!("pgl_validate_compare_repset_{backend_pid}"));
+        let node_name = identifier(&format!("pgl_validate_compare_node_{backend_pid}"));
+
+        Spi::run(&format!(
+            "
+            DELETE FROM pgl_validate.peer;
+            CREATE EXTENSION pglogical;
+            SELECT pglogical.create_node({node}, 'dbname=' || current_database());
+            CREATE TABLE public.{first_table}(id int PRIMARY KEY, value text);
+            CREATE TABLE public.{second_table}(id int PRIMARY KEY, value text);
+            INSERT INTO public.{first_table} VALUES (1, 'same');
+            INSERT INTO public.{second_table} VALUES (1, 'same');
+            SELECT pglogical.create_replication_set({repset}, true, true, true, true);
+            SELECT pglogical.replication_set_add_table(
+                {repset},
+                'public.{first_table}'::regclass,
+                false
+            );
+            SELECT pglogical.replication_set_add_table(
+                {repset},
+                'public.{second_table}'::regclass,
+                false
+            );
+            ",
+            node = sql_literal(&node_name),
+            repset = sql_literal(&repset_name)
+        ))
+        .unwrap();
+
+        let run_id = Spi::get_one::<i64>(&format!(
+            "
+            SELECT pgl_validate.compare(
+                NULL::regclass[],
+                {repset},
+                NULL::text[],
+                NULL::text,
+                '{{}}'::jsonb
+            )
+            ",
+            repset = sql_literal(&repset_name)
+        ))
+        .unwrap()
+        .unwrap();
+
+        let planned = Spi::get_one::<String>(&format!(
+            "
+            SELECT r.status || ';' ||
+                   count(tp.*)::text || ';' ||
+                   bool_and(tp.repsets = ARRAY[{repset}]::text[])::text
+            FROM pgl_validate.run r
+            JOIN pgl_validate.table_plan tp ON tp.run_id = r.run_id
+            WHERE r.run_id = {run_id}
+            GROUP BY r.run_id, r.status
+            ",
+            repset = sql_literal(&repset_name)
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(planned, "completed;2;true");
     }
 
     #[pg_test]
