@@ -42,6 +42,15 @@ pub(crate) struct RemoteChecksum {
     pub(crate) lthash: Vec<u8>,
 }
 
+/// Barrier token and exact commit-end LSN injected on an origin node.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) struct BarrierInjection {
+    /// UUID bytes inserted into `pgl_validate.fence_barrier`.
+    pub(crate) token: [u8; 16],
+    /// Exact barrier commit end LSN from `pgl_validate.last_commit_lsn()`.
+    pub(crate) barrier_end_lsn: u64,
+}
+
 struct Connection {
     raw: *mut PGconn,
 }
@@ -77,6 +86,11 @@ impl Connection {
         }
 
         Ok(QueryResult { raw })
+    }
+
+    fn exec_command(&self, sql: &str) -> Result<(), String> {
+        let result = self.exec(sql)?;
+        result.require_status(PGRES_COMMAND_OK)
     }
 
     fn set_query_timeouts(
@@ -149,6 +163,19 @@ impl QueryResult {
             .map_err(|err| format!("remote result column {column} is not UTF-8: {err}"))
     }
 
+    fn single_value(&self) -> Result<String, String> {
+        self.require_status(PGRES_TUPLES_OK)?;
+        if self.ntuples() != 1 || self.nfields() != 1 {
+            return Err(format!(
+                "remote query returned {} row(s) and {} column(s), expected 1 row and 1 column",
+                self.ntuples(),
+                self.nfields()
+            ));
+        }
+
+        self.value(0, 0)
+    }
+
     fn error_message(&self) -> String {
         unsafe { c_message(PQresultErrorMessage(self.raw)) }
     }
@@ -165,8 +192,41 @@ impl Drop for QueryResult {
 pub(crate) fn execute_command(dsn: &str, sql: &str) -> Result<(), String> {
     let conn = Connection::connect_with_timeout(dsn, 10)?;
     conn.set_query_timeouts(10_000, 10_000)?;
-    let result = conn.exec(sql)?;
-    result.require_status(PGRES_COMMAND_OK)
+    conn.exec_command(sql)
+}
+
+/// Insert a barrier token on an origin and return the exact commit-end LSN.
+pub(crate) fn inject_barrier(
+    dsn: &str,
+    connect_timeout_seconds: i32,
+    statement_timeout_ms: i32,
+    lock_timeout_ms: i32,
+) -> Result<BarrierInjection, String> {
+    let conn = Connection::connect_with_timeout(dsn, connect_timeout_seconds)?;
+    conn.set_query_timeouts(statement_timeout_ms, lock_timeout_ms)?;
+
+    let token = uuid::Uuid::new_v4();
+    let token_sql = token.to_string();
+
+    conn.exec_command("BEGIN")?;
+    if let Err(err) = conn.exec_command(&format!(
+        "INSERT INTO pgl_validate.fence_barrier(token) VALUES ('{token_sql}'::uuid)"
+    )) {
+        let _ = conn.exec_command("ROLLBACK");
+        return Err(err);
+    }
+    if let Err(err) = conn.exec_command("COMMIT") {
+        let _ = conn.exec_command("ROLLBACK");
+        return Err(err);
+    }
+
+    let lsn_result = conn.exec("SELECT pgl_validate.last_commit_lsn()::text")?;
+    let barrier_end_lsn = parse_lsn(&lsn_result.single_value()?)?;
+
+    Ok(BarrierInjection {
+        token: *token.as_bytes(),
+        barrier_end_lsn,
+    })
 }
 
 /// Run generated checksum SQL on a remote participant and return its digest.
@@ -262,9 +322,24 @@ fn parse_hex(input: &str) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
+fn parse_lsn(input: &str) -> Result<u64, String> {
+    let Some((high, low)) = input.split_once('/') else {
+        return Err(format!("invalid pg_lsn without slash: {input}"));
+    };
+    let high = u64::from_str_radix(high, 16)
+        .map_err(|err| format!("invalid pg_lsn high word {high:?}: {err}"))?;
+    let low = u64::from_str_radix(low, 16)
+        .map_err(|err| format!("invalid pg_lsn low word {low:?}: {err}"))?;
+    if high > u32::MAX as u64 || low > u32::MAX as u64 {
+        return Err(format!("pg_lsn word out of range: {input}"));
+    }
+
+    Ok((high << 32) | low)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{dsn_with_connect_timeout, parse_hex};
+    use super::{dsn_with_connect_timeout, parse_hex, parse_lsn};
 
     #[test]
     fn parses_hex_with_or_without_bytea_prefix() {
@@ -300,5 +375,13 @@ mod tests {
             dsn_with_connect_timeout("postgresql://localhost/postgres?sslmode=disable", 7),
             "postgresql://localhost/postgres?sslmode=disable&connect_timeout=7"
         );
+    }
+
+    #[test]
+    fn parses_pg_lsn_text() {
+        assert_eq!(parse_lsn("0/16B6C50").unwrap(), 0x016b6c50);
+        assert_eq!(parse_lsn("1/00000000").unwrap(), 0x1_0000_0000);
+        assert!(parse_lsn("not-an-lsn").is_err());
+        assert!(parse_lsn("100000000/0").is_err());
     }
 }

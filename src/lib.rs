@@ -165,6 +165,45 @@ mod pgl_validate {
         TableIterator::once((checksum.pg_version, checksum.n_rows, checksum.lthash))
     }
 
+    /// Insert a barrier token on a remote origin and return its exact end LSN.
+    #[pg_extern(
+        volatile,
+        parallel_unsafe,
+        sql = r#"
+CREATE FUNCTION pgl_validate.remote_inject_barrier(
+    dsn text,
+    connect_timeout_seconds integer DEFAULT 10,
+    statement_timeout_ms integer DEFAULT 600000,
+    lock_timeout_ms integer DEFAULT 30000
+)
+RETURNS TABLE (token uuid, barrier_end_lsn pg_lsn)
+LANGUAGE c
+STRICT
+VOLATILE
+PARALLEL UNSAFE
+AS 'MODULE_PATHNAME', 'remote_inject_barrier_wrapper';
+"#
+    )]
+    fn remote_inject_barrier(
+        dsn: &str,
+        connect_timeout_seconds: default!(i32, 10),
+        statement_timeout_ms: default!(i32, 600000),
+        lock_timeout_ms: default!(i32, 30000),
+    ) -> TableIterator<'static, (name!(token, pgrx::Uuid), name!(barrier_end_lsn, i64))> {
+        let injection = transport::libpq::inject_barrier(
+            dsn,
+            connect_timeout_seconds,
+            statement_timeout_ms,
+            lock_timeout_ms,
+        )
+        .unwrap_or_else(|err| pgrx::error!("{err}"));
+
+        TableIterator::once((
+            pgrx::Uuid::from_bytes(injection.token),
+            injection.barrier_end_lsn as i64,
+        ))
+    }
+
     #[pg_aggregate]
     impl Aggregate<lthash_state> for lthash_state {
         type State = PgVarlena<Self>;
@@ -434,19 +473,133 @@ mod tests {
     }
 
     #[pg_test]
+    fn remote_inject_barrier_returns_visible_token_and_lsn() {
+        let dsn = local_dsn();
+        let sql = format!(
+            "
+            SELECT token::text || ';' || barrier_end_lsn::text
+            FROM pgl_validate.remote_inject_barrier({})
+            ",
+            sql_literal(&dsn)
+        );
+        let injected = Spi::get_one::<String>(&sql).unwrap().unwrap();
+        let (token, barrier_end_lsn) = injected
+            .split_once(';')
+            .expect("barrier result should contain token and LSN");
+
+        let visible_sql = format!(
+            "
+            SELECT EXISTS (
+                       SELECT 1
+                       FROM pgl_validate.fence_barrier
+                       WHERE token = {}::uuid
+                   )
+                   AND {}::pg_lsn <= pg_current_wal_lsn()
+            ",
+            sql_literal(token),
+            sql_literal(barrier_end_lsn)
+        );
+        let valid = Spi::get_one::<bool>(&visible_sql).unwrap().unwrap();
+        assert!(valid);
+    }
+
+    #[pg_test]
+    fn record_barrier_fence_persists_epoch_edge_and_protected_token() {
+        let dsn = local_dsn();
+        let sql = format!(
+            "
+            WITH run AS (
+                INSERT INTO pgl_validate.run(status)
+                VALUES ('fencing')
+                RETURNING run_id
+            ), edge AS (
+                INSERT INTO pgl_validate.run_edge(
+                    run_id, edge_id, provider_node, target_node, backend,
+                    subscription, slot_name, origin_name, repsets
+                )
+                SELECT run_id, 1, 'origin', 'target', 'pglogical',
+                       'sub', 'slot', 'origin_name', ARRAY['default']
+                FROM run
+                RETURNING run_id, edge_id
+            ), injected AS (
+                SELECT * FROM pgl_validate.remote_inject_barrier({})
+            ), recorded AS (
+                SELECT pgl_validate.record_barrier_fence(
+                    edge.run_id,
+                    1,
+                    edge.edge_id,
+                    injected.token,
+                    'origin',
+                    injected.barrier_end_lsn
+                )
+                FROM edge, injected
+            )
+            SELECT edge.run_id::text || ';' ||
+                   injected.token::text || ';' ||
+                   injected.barrier_end_lsn::text
+            FROM edge, injected, recorded
+            ",
+            sql_literal(&dsn)
+        );
+        let recorded_values = Spi::get_one::<String>(&sql).unwrap().unwrap();
+        let mut parts = recorded_values.split(';');
+        let run_id = parts.next().expect("run id should be present");
+        let token = parts.next().expect("token should be present");
+        let barrier_end_lsn = parts.next().expect("barrier LSN should be present");
+
+        let verify_sql = format!(
+            "
+            SELECT EXISTS (
+                       SELECT 1
+                       FROM pgl_validate.fence_edge
+                       WHERE run_id = {}
+                         AND fence_kind = 'barrier'
+                         AND barrier_token = {}::uuid
+                         AND barrier_end_lsn = {}::pg_lsn
+                   )
+                   AND {}::uuid = ANY (pgl_validate.protected_barrier_tokens())
+            ",
+            run_id,
+            sql_literal(token),
+            sql_literal(barrier_end_lsn),
+            sql_literal(token)
+        );
+        let recorded = Spi::get_one::<bool>(&verify_sql).unwrap().unwrap();
+        assert!(recorded);
+    }
+
+    #[pg_test]
     fn compare_table_uses_registered_remote_peer_match() {
         let dsn = local_dsn();
+        let backend_pid = Spi::get_one::<i32>("SELECT pg_backend_pid()")
+            .unwrap()
+            .unwrap();
+        let table_name = identifier(&format!("self_compare_target_{backend_pid}"));
+
+        let _ = crate::transport::libpq::execute_command(
+            &dsn,
+            &format!("DROP TABLE IF EXISTS public.{table_name}"),
+        );
+        crate::transport::libpq::execute_command(
+            &dsn,
+            &format!(
+                "CREATE TABLE public.{table_name}(id int PRIMARY KEY, value text);
+                 INSERT INTO public.{table_name} VALUES (1, 'same');"
+            ),
+        )
+        .unwrap();
+
         Spi::run(&format!(
             "INSERT INTO pgl_validate.peer(name, dsn) VALUES ('self_peer', {})",
             sql_literal(&dsn)
         ))
         .unwrap();
 
-        let verdict = Spi::get_one::<String>(
-            "SELECT (pgl_validate.compare_table('pgl_validate.fence_barrier'::regclass)).verdict",
-        )
-        .unwrap()
-        .unwrap();
+        let verdict_sql = format!(
+            "SELECT (pgl_validate.compare_table({}::regclass)).verdict",
+            sql_literal(&format!("public.{table_name}"))
+        );
+        let verdict = Spi::get_one::<String>(&verdict_sql).unwrap().unwrap();
         assert_eq!(verdict, "match");
 
         let participants = Spi::get_one::<i64>(

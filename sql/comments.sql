@@ -73,6 +73,8 @@ COMMENT ON FUNCTION pgl_validate.divergences(bigint) IS
     'Return persisted divergences for a validation run.';
 COMMENT ON FUNCTION pgl_validate.sequences(bigint) IS
     'Return persisted sequence results for a validation run.';
+COMMENT ON FUNCTION pgl_validate.record_barrier_fence(bigint, integer, integer, uuid, text, pg_lsn) IS
+    'Persist an exact barrier token and end LSN for one run edge and epoch.';
 COMMENT ON FUNCTION pgl_validate.protected_barrier_tokens() IS
     'Return barrier tokens referenced by unfinished validation runs.';
 COMMENT ON FUNCTION pgl_validate.cleanup_fence_barriers(interval, uuid[]) IS
@@ -86,6 +88,8 @@ COMMENT ON FUNCTION pgl_validate.hash_digest_array(bytea[]) IS
     'Hash a caller-sorted array of row digests for cryptographic set confirmation.';
 COMMENT ON FUNCTION pgl_validate.remote_checksum(text, text, integer, integer, integer) IS
     'Execute generated checksum SQL on a named peer DSN via libpq with bounded connect, statement, and lock timeouts.';
+COMMENT ON FUNCTION pgl_validate.remote_inject_barrier(text, integer, integer, integer) IS
+    'Insert a barrier token on a remote origin over libpq and return the exact barrier commit end LSN.';
 COMMENT ON TYPE pgl_validate.lthash_state IS
     'Internal varlena state for the LtHash multiset accumulator.';
 COMMENT ON FUNCTION pgl_validate.lthash_state_in(cstring) IS

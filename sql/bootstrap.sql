@@ -907,6 +907,64 @@ AS $$
     SELECT s.* FROM pgl_validate.sequence_result s WHERE s.run_id = sequences.run_id
 $$;
 
+CREATE FUNCTION pgl_validate.record_barrier_fence(
+    p_run_id bigint,
+    p_epoch_seq int,
+    p_edge_id int,
+    p_token uuid,
+    p_origin_node text,
+    p_barrier_end_lsn pg_lsn
+)
+RETURNS void
+LANGUAGE plpgsql
+VOLATILE
+AS $$
+BEGIN
+    IF p_token IS NULL THEN
+        RAISE EXCEPTION 'barrier token is required';
+    END IF;
+    IF p_barrier_end_lsn IS NULL THEN
+        RAISE EXCEPTION 'barrier_end_lsn is required';
+    END IF;
+
+    INSERT INTO pgl_validate.fence_epoch(run_id, epoch_seq)
+    VALUES (p_run_id, p_epoch_seq)
+    ON CONFLICT (run_id, epoch_seq) DO NOTHING;
+
+    INSERT INTO pgl_validate.fence_edge(
+        run_id, epoch_seq, edge_id, fence_kind, barrier_token, barrier_end_lsn
+    )
+    VALUES (
+        p_run_id,
+        p_epoch_seq,
+        p_edge_id,
+        'barrier',
+        p_token,
+        p_barrier_end_lsn
+    )
+    ON CONFLICT (run_id, epoch_seq, edge_id) DO UPDATE
+    SET fence_kind = 'barrier',
+        barrier_token = EXCLUDED.barrier_token,
+        barrier_end_lsn = EXCLUDED.barrier_end_lsn;
+
+    INSERT INTO pgl_validate.fence_barrier_run(
+        token, run_id, epoch_seq, edge_id, origin_node, barrier_end_lsn
+    )
+    VALUES (
+        p_token,
+        p_run_id,
+        p_epoch_seq,
+        p_edge_id,
+        p_origin_node,
+        p_barrier_end_lsn
+    )
+    ON CONFLICT (run_id, epoch_seq, edge_id) DO UPDATE
+    SET token = EXCLUDED.token,
+        origin_node = EXCLUDED.origin_node,
+        barrier_end_lsn = EXCLUDED.barrier_end_lsn;
+END
+$$;
+
 CREATE FUNCTION pgl_validate.protected_barrier_tokens()
 RETURNS uuid[]
 LANGUAGE sql
