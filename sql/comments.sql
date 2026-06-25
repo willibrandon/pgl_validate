@@ -74,7 +74,7 @@ COMMENT ON FUNCTION pgl_validate.plan_localize_sql(regclass, text[], text[], tex
 COMMENT ON FUNCTION pgl_validate.plan_sequence_sql(regclass) IS
     'Generate planner-visible SQL for reading a sequence last_value on a participant.';
 COMMENT ON FUNCTION pgl_validate.compare(regclass[], text, text[], text, jsonb) IS
-    'Run a validation over explicit tables, a pglogical replication set, or auto-discovered local tables and return the parent run id.';
+    'Run a validation over explicit tables, a pglogical replication set including its sequences, or auto-discovered local relations and return the parent run id.';
 COMMENT ON FUNCTION pgl_validate.compare_table(regclass, text[], jsonb) IS
     'Run the current table comparison path and return the persisted table verdict.';
 COMMENT ON FUNCTION pgl_validate.compare_sequence(regclass, text[], jsonb) IS

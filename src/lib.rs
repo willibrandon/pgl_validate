@@ -1469,10 +1469,38 @@ mod tests {
         let backend_pid = Spi::get_one::<i32>("SELECT pg_backend_pid()")
             .unwrap()
             .unwrap();
+        let peer_db = identifier(&format!("pgl_validate_repset_peer_{backend_pid}"));
         let first_table = identifier(&format!("pgl_validate_repset_a_{backend_pid}"));
         let second_table = identifier(&format!("pgl_validate_repset_b_{backend_pid}"));
+        let sequence_name = identifier(&format!("pgl_validate_repset_seq_{backend_pid}"));
         let repset_name = identifier(&format!("pgl_validate_compare_repset_{backend_pid}"));
         let node_name = identifier(&format!("pgl_validate_compare_node_{backend_pid}"));
+        let local_dsn = local_dsn();
+        let remote_dsn = peer_dsn(&peer_db);
+
+        let _ = crate::transport::libpq::execute_command(
+            &local_dsn,
+            &format!("DROP DATABASE IF EXISTS {peer_db} WITH (FORCE)"),
+        );
+        crate::transport::libpq::execute_command(&local_dsn, &format!("CREATE DATABASE {peer_db}"))
+            .unwrap();
+        crate::transport::libpq::execute_command(
+            &remote_dsn,
+            &format!(
+                "CREATE EXTENSION pgl_validate;
+                 CREATE TABLE public.{first_table}(id int PRIMARY KEY, value text);
+                 CREATE TABLE public.{second_table}(id int PRIMARY KEY, value text);
+                 CREATE SEQUENCE public.{sequence_name} CACHE 5;
+                 INSERT INTO public.{first_table} VALUES (1, 'same');
+                 INSERT INTO public.{second_table} VALUES (1, 'same');
+                 DO $$
+                 BEGIN
+                     PERFORM setval('public.{sequence_name}'::regclass, 12, true);
+                 END
+                 $$;"
+            ),
+        )
+        .unwrap();
 
         Spi::run(&format!(
             "
@@ -1481,8 +1509,10 @@ mod tests {
             SELECT pglogical.create_node({node}, 'dbname=' || current_database());
             CREATE TABLE public.{first_table}(id int PRIMARY KEY, value text);
             CREATE TABLE public.{second_table}(id int PRIMARY KEY, value text);
+            CREATE SEQUENCE public.{sequence_name} CACHE 5;
             INSERT INTO public.{first_table} VALUES (1, 'same');
             INSERT INTO public.{second_table} VALUES (1, 'same');
+            SELECT setval('public.{sequence_name}'::regclass, 10, true);
             SELECT pglogical.create_replication_set({repset}, true, true, true, true);
             SELECT pglogical.replication_set_add_table(
                 {repset},
@@ -1494,9 +1524,17 @@ mod tests {
                 'public.{second_table}'::regclass,
                 false
             );
+            SELECT pglogical.replication_set_add_sequence(
+                {repset},
+                'public.{sequence_name}'::regclass,
+                false
+            );
+            INSERT INTO pgl_validate.peer(name, dsn, backend)
+            VALUES ('repset_peer', {remote_dsn}, 'native');
             ",
             node = sql_literal(&node_name),
-            repset = sql_literal(&repset_name)
+            repset = sql_literal(&repset_name),
+            remote_dsn = sql_literal(&remote_dsn)
         ))
         .unwrap();
 
@@ -1505,9 +1543,9 @@ mod tests {
             SELECT pgl_validate.compare(
                 NULL::regclass[],
                 {repset},
-                NULL::text[],
+                ARRAY['repset_peer'],
                 NULL::text,
-                '{{}}'::jsonb
+                '{{\"sequence_buffer_multiplier\":2}}'::jsonb
             )
             ",
             repset = sql_literal(&repset_name)
@@ -1519,17 +1557,31 @@ mod tests {
             "
             SELECT r.status || ';' ||
                    count(tp.*)::text || ';' ||
-                   bool_and(tp.repsets = ARRAY[{repset}]::text[])::text
+                   bool_and(tp.repsets = ARRAY[{repset}]::text[])::text || ';' ||
+                   (SELECT count(*)::text
+                    FROM pgl_validate.sequence_result sr
+                    WHERE sr.run_id = r.run_id
+                      AND sr.seq_name = {sequence_name}) || ';' ||
+                   (SELECT bool_and(sr.verdict = 'match' AND sr.within_contract)::text
+                    FROM pgl_validate.sequence_result sr
+                    WHERE sr.run_id = r.run_id
+                      AND sr.seq_name = {sequence_name})
             FROM pgl_validate.run r
             JOIN pgl_validate.table_plan tp ON tp.run_id = r.run_id
             WHERE r.run_id = {run_id}
             GROUP BY r.run_id, r.status
             ",
-            repset = sql_literal(&repset_name)
+            repset = sql_literal(&repset_name),
+            sequence_name = sql_literal(&sequence_name)
         ))
         .unwrap()
         .unwrap();
-        assert_eq!(planned, "completed;2;true");
+        assert_eq!(planned, "completed;2;true;1;true");
+
+        let _ = crate::transport::libpq::execute_command(
+            &local_dsn,
+            &format!("DROP DATABASE IF EXISTS {peer_db} WITH (FORCE)"),
+        );
     }
 
     #[pg_test]

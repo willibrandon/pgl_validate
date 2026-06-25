@@ -1001,10 +1001,14 @@ AS $$
 DECLARE
     v_run_id bigint;
     table_list regclass[];
+    sequence_list regclass[];
     table_oid regclass;
+    sequence_oid regclass;
     effective_options jsonb := COALESCE(options, '{}'::jsonb);
     internal_options jsonb;
     result_row pgl_validate.table_result;
+    table_count int := 0;
+    sequence_count int := 0;
 BEGIN
     IF jsonb_typeof(effective_options) <> 'object' THEN
         RAISE EXCEPTION 'options must be a JSON object'
@@ -1033,6 +1037,14 @@ BEGIN
              WHERE rs.set_name = $1::name'
         INTO table_list
         USING repset;
+
+        EXECUTE
+            'SELECT array_agg(rss.set_seqoid ORDER BY rss.set_seqoid::text)
+             FROM pglogical.replication_set rs
+             JOIN pglogical.replication_set_seq rss ON rss.set_id = rs.set_id
+             WHERE rs.set_name = $1::name'
+        INTO sequence_list
+        USING repset;
     ELSE
         SELECT array_agg(c.oid::regclass ORDER BY n.nspname, c.relname)
         INTO table_list
@@ -1042,10 +1054,22 @@ BEGIN
           AND n.nspname NOT LIKE 'pg\_%' ESCAPE '\'
           AND n.nspname <> 'information_schema'
           AND n.nspname <> 'pgl_validate';
+
+        SELECT array_agg(c.oid::regclass ORDER BY n.nspname, c.relname)
+        INTO sequence_list
+        FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE c.relkind = 'S'
+          AND n.nspname NOT LIKE 'pg\_%' ESCAPE '\'
+          AND n.nspname <> 'information_schema'
+          AND n.nspname <> 'pgl_validate';
     END IF;
 
-    IF table_list IS NULL OR cardinality(table_list) = 0 THEN
-        RAISE EXCEPTION 'no tables resolved for validation run'
+    table_count := COALESCE(cardinality(table_list), 0);
+    sequence_count := COALESCE(cardinality(sequence_list), 0);
+
+    IF table_count = 0 AND sequence_count = 0 THEN
+        RAISE EXCEPTION 'no tables or sequences resolved for validation run'
             USING ERRCODE = '02000';
     END IF;
 
@@ -1057,21 +1081,30 @@ BEGIN
     END IF;
 
     INSERT INTO pgl_validate.run(status, options, reference_node, tables_total)
-    VALUES ('planning', effective_options, reference, cardinality(table_list))
+    VALUES ('planning', effective_options, reference, table_count)
     RETURNING pgl_validate.run.run_id INTO v_run_id;
 
     BEGIN
-        FOREACH table_oid IN ARRAY table_list LOOP
-            internal_options := effective_options || jsonb_build_object('_pgl_validate_parent_run_id', v_run_id);
-            SELECT *
-            INTO result_row
-            FROM pgl_validate.compare_table(table_oid, peers, internal_options);
-        END LOOP;
+        IF table_count > 0 THEN
+            FOREACH table_oid IN ARRAY table_list LOOP
+                internal_options := effective_options || jsonb_build_object('_pgl_validate_parent_run_id', v_run_id);
+                SELECT *
+                INTO result_row
+                FROM pgl_validate.compare_table(table_oid, peers, internal_options);
+            END LOOP;
+        END IF;
+
+        IF sequence_count > 0 THEN
+            FOREACH sequence_oid IN ARRAY sequence_list LOOP
+                internal_options := effective_options || jsonb_build_object('_pgl_validate_parent_run_id', v_run_id);
+                PERFORM pgl_validate.compare_sequence(sequence_oid, peers, internal_options);
+            END LOOP;
+        END IF;
 
         UPDATE pgl_validate.run
         SET status = 'completed',
             finished_at = now(),
-            tables_total = cardinality(table_list),
+            tables_total = table_count,
             tables_matched = (
                 SELECT count(*)::int
                 FROM pgl_validate.table_result tr
@@ -1938,6 +1971,9 @@ VOLATILE
 AS $$
 DECLARE
     v_run_id bigint;
+    parent_run_id bigint := NULLIF(options->>'_pgl_validate_parent_run_id', '')::bigint;
+    append_to_parent boolean := false;
+    initial_epoch int := 1;
     v_schema_name text;
     v_seq_name text;
     peer_names text[];
@@ -2000,12 +2036,39 @@ BEGIN
         END IF;
     END IF;
 
-    INSERT INTO pgl_validate.run(status, options, tables_total)
-    VALUES ('running', options, 0)
-    RETURNING pgl_validate.run.run_id INTO v_run_id;
+    IF parent_run_id IS NULL THEN
+        INSERT INTO pgl_validate.run(status, options, tables_total)
+        VALUES ('running', options, 0)
+        RETURNING pgl_validate.run.run_id INTO v_run_id;
+    ELSE
+        SELECT r.run_id
+        INTO v_run_id
+        FROM pgl_validate.run r
+        WHERE r.run_id = parent_run_id
+          AND r.status IN ('planning','fencing','running','rechecking','paused');
+
+        IF v_run_id IS NULL THEN
+            RAISE EXCEPTION 'parent validation run % does not exist or is not appendable', parent_run_id
+                USING ERRCODE = '55000';
+        END IF;
+
+        append_to_parent := true;
+        SELECT COALESCE(max(fe.epoch_seq), 0) + 1
+        INTO initial_epoch
+        FROM pgl_validate.fence_epoch fe
+        WHERE fe.run_id = v_run_id;
+
+        SELECT COALESCE(max(re.edge_id), 0)
+        INTO edge_seq
+        FROM pgl_validate.run_edge re
+        WHERE re.run_id = v_run_id;
+    END IF;
 
     INSERT INTO pgl_validate.run_participant(run_id, node, role, backend, pg_version, status)
-    VALUES (v_run_id, 'local', 'coordinator', 'pglogical', current_setting('server_version_num')::int, 'connected');
+    VALUES (v_run_id, 'local', 'coordinator', 'pglogical', current_setting('server_version_num')::int, 'connected')
+    ON CONFLICT (run_id, node) DO UPDATE
+    SET status = 'connected',
+        pg_version = EXCLUDED.pg_version;
 
     IF EXISTS (
         SELECT 1
@@ -2020,7 +2083,7 @@ BEGIN
         END IF;
 
         INSERT INTO pgl_validate.fence_epoch(run_id, epoch_seq)
-        VALUES (v_run_id, 1);
+        VALUES (v_run_id, initial_epoch);
 
         UPDATE pgl_validate.run
         SET status = 'fencing'
@@ -2075,7 +2138,7 @@ BEGIN
             INTO fence_rec
             FROM pgl_validate.fence_pglogical_edge(
                 v_run_id,
-                1,
+                initial_epoch,
                 edge_seq,
                 provider_node,
                 peer_rec.name,
@@ -2182,7 +2245,11 @@ BEGIN
             COALESCE(remote_seq_rec.pg_version, current_setting('server_version_num')::int),
             peer_rec.name, 'done'
         )
-        ON CONFLICT (run_id, node) DO NOTHING;
+        ON CONFLICT (run_id, node) DO UPDATE
+        SET backend = EXCLUDED.backend,
+            pg_version = EXCLUDED.pg_version,
+            dsn_ref = EXCLUDED.dsn_ref,
+            status = EXCLUDED.status;
 
         INSERT INTO pgl_validate.sequence_result(
             run_id, schema_name, seq_name, provider_node, provider_last_value,
@@ -2194,15 +2261,17 @@ BEGIN
         );
     END LOOP;
 
-    UPDATE pgl_validate.run
-    SET status = 'completed',
-        finished_at = now()
-    WHERE pgl_validate.run.run_id = v_run_id;
+    IF NOT append_to_parent THEN
+        UPDATE pgl_validate.run
+        SET status = 'completed',
+            finished_at = now()
+        WHERE pgl_validate.run.run_id = v_run_id;
 
-    UPDATE pgl_validate.run_participant
-    SET status = 'done'
-    WHERE pgl_validate.run_participant.run_id = v_run_id
-      AND node = 'local';
+        UPDATE pgl_validate.run_participant
+        SET status = 'done'
+        WHERE pgl_validate.run_participant.run_id = v_run_id
+          AND node = 'local';
+    END IF;
 
     RETURN QUERY
     SELECT sr.*
