@@ -53,12 +53,14 @@ function Write-LogTail {
     )
 
     if (-not (Test-Path -LiteralPath $Path)) {
-        Write-Output "--- log tail unavailable: $Path does not exist ---"
+        Write-Host "--- log tail unavailable: $Path does not exist ---"
         return
     }
 
-    Write-Output "--- log tail: $Path ---"
-    Get-Content -LiteralPath $Path -Tail $Lines
+    Write-Host "--- log tail: $Path ---"
+    Get-Content -LiteralPath $Path -Tail $Lines | ForEach-Object {
+        Write-Host $_
+    }
 }
 
 function Invoke-CheckedProcess {
