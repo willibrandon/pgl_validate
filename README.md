@@ -45,8 +45,9 @@ For extension validation, use pgrx:
 ```
 
 `scripts\test-pgrx.ps1` always stops repo-local pgrx test clusters in
-`target\test-pgdata`, `target\pglogical-test-pgdata`, and
-`target\native-test-pgdata`, and `target\diag-pgdata`, even when a pg_test
+`target\test-pgdata`, `target\pglogical-test-pgdata`,
+`target\native-test-pgdata`, `target\standby-primary-pgdata`,
+`target\standby-replica-pgdata`, and `target\diag-pgdata`, even when a pg_test
 fails.
 
 pglogical is a required part of the test environment. Install the packaged
@@ -62,6 +63,13 @@ subscription machinery:
 
 ```powershell
 .\scripts\test-native-logical-fence.ps1 -PgMajor 18
+```
+
+Physical standby coverage uses PostgreSQL streaming replication and validates
+the replay-LSN fence path against a real read-only standby:
+
+```powershell
+.\scripts\test-physical-standby-fence.ps1 -PgMajor 18
 ```
 
 If `cargo check` is launched by an editor, start that editor from a Visual
@@ -104,5 +112,5 @@ physical-standby replay fence plumbing, sequence-window validation, keyless
 whole-relation validation, multi-table and replication-set compare
 orchestration, structured JSON reports, reviewable repair generation, audited
 repair application, conflict-history evidence correlation, run-control and
-retention APIs, and fenced paths exercised against real pglogical and native
-logical subscriptions.
+retention APIs, and fenced paths exercised against real pglogical, native
+logical, and physical standby replication.

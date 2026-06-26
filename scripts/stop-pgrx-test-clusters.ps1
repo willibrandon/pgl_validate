@@ -10,6 +10,8 @@ $configuredTargets = @(
     'target\test-pgdata',
     'target\pglogical-test-pgdata',
     'target\native-test-pgdata',
+    'target\standby-primary-pgdata',
+    'target\standby-replica-pgdata',
     'target\diag-pgdata'
 ) | ForEach-Object { Join-Path $workspace $_ }
 
@@ -161,10 +163,12 @@ $patterns += @(
     'target[/\\]test-pgdata',
     'target[/\\]pglogical-test-pgdata',
     'target[/\\]native-test-pgdata',
+    'target[/\\]standby-primary-pgdata',
+    'target[/\\]standby-replica-pgdata',
     'target[/\\]diag-pgdata'
 )
 
-$processNames = @('postgres.exe', 'pg_ctl.exe', 'cmd.exe', 'psql.exe', 'initdb.exe')
+$processNames = @('postgres.exe', 'pg_ctl.exe', 'cmd.exe', 'psql.exe', 'initdb.exe', 'pg_basebackup.exe')
 $procs = Get-CimInstance Win32_Process | Where-Object {
     $commandLine = $_.CommandLine
     ($_.Name -in $processNames) -and
