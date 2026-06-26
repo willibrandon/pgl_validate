@@ -18,6 +18,7 @@ extension_sql_file!("../sql/comments.sql", name = "comments", finalize);
 static PARANOID_CONFIRM: GucSetting<bool> = GucSetting::<bool>::new(false);
 static CHUNK_TARGET_ROWS: GucSetting<i32> = GucSetting::<i32>::new(50000);
 static LOCALIZE_THRESHOLD: GucSetting<i32> = GucSetting::<i32>::new(1000);
+static RECHECK_PASSES: GucSetting<i32> = GucSetting::<i32>::new(3);
 static FENCE_TIMEOUT_MS: GucSetting<i32> = GucSetting::<i32>::new(300000);
 static FENCE_POLL_INTERVAL_MS: GucSetting<i32> = GucSetting::<i32>::new(100);
 static SEQUENCE_BUFFER_MULTIPLIER: GucSetting<i32> = GucSetting::<i32>::new(2);
@@ -52,6 +53,16 @@ pub extern "C-unwind" fn _PG_init() {
         c"Rows per range while localizing divergence.",
         c"Controls the smaller chunk size used after a table-level checksum mismatch.",
         &LOCALIZE_THRESHOLD,
+        1,
+        i32::MAX,
+        GucContext::Userset,
+        flags,
+    );
+    GucRegistry::define_int_guc(
+        c"pgl_validate.recheck_passes",
+        c"Digest-stability recheck pass limit.",
+        c"Maximum later barrier-converged epochs before a continuously hot key becomes indeterminate.",
+        &RECHECK_PASSES,
         1,
         i32::MAX,
         GucContext::Userset,
@@ -1275,6 +1286,7 @@ mod tests {
         Spi::run(&format!(
             "
             SET LOCAL pgl_validate.chunk_target_rows = 2;
+            SET LOCAL pgl_validate.recheck_passes = 2;
             SET LOCAL pgl_validate.sequence_buffer_multiplier = 1;
             DELETE FROM pgl_validate.peer;
             CREATE TABLE public.{table_name}(id int PRIMARY KEY, value text);
@@ -1333,6 +1345,40 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(override_chunks, 1);
+
+        let recheck_setting = Spi::get_one::<String>("SHOW pgl_validate.recheck_passes")
+            .unwrap()
+            .unwrap();
+        assert_eq!(recheck_setting, "2");
+
+        Spi::run(&format!(
+            r#"
+            DO $pgl_validate_recheck$
+            DECLARE
+                rejected boolean := false;
+            BEGIN
+                BEGIN
+                    PERFORM pgl_validate.compare_table(
+                        'public.{table_name}'::regclass,
+                        ARRAY['remote_guc'],
+                        '{{"recheck_passes":0}}'::jsonb
+                    );
+                EXCEPTION WHEN others THEN
+                    IF SQLERRM = 'recheck_passes must be greater than zero' THEN
+                        rejected := true;
+                    ELSE
+                        RAISE;
+                    END IF;
+                END;
+
+                IF NOT rejected THEN
+                    RAISE EXCEPTION 'expected compare_table to reject recheck_passes=0';
+                END IF;
+            END
+            $pgl_validate_recheck$;
+            "#
+        ))
+        .unwrap();
 
         let guc_sequence = Spi::get_one::<String>(&format!(
             "

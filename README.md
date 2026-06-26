@@ -69,6 +69,7 @@ Per-run `options` override PostgreSQL settings. Implemented settings are:
 ```sql
 SET pgl_validate.chunk_target_rows = 50000;
 SET pgl_validate.localize_threshold = 1000;
+SET pgl_validate.recheck_passes = 3;
 SET pgl_validate.fence_timeout_ms = 300000;
 SET pgl_validate.fence_poll_interval_ms = 100;
 SET pgl_validate.sequence_buffer_multiplier = 2;

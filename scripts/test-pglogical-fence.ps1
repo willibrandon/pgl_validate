@@ -827,6 +827,18 @@ SELECT EXISTS (
         throw 'subscriber-side drift was not persisted as a confirmed divergence'
     }
 
+    $driftRecheckShape = Invoke-Sql -Database 'provider' -Sql @"
+SELECT count(*)::text || ';' || min(epoch_seq)::text || ';' || max(epoch_seq)::text
+FROM pgl_validate.divergence_recheck
+WHERE run_id = $driftRunId
+  AND schema_name = 'public'
+  AND table_name = 'accounts'
+  AND node = 'target'
+"@
+    if ($driftRecheckShape -ne '1;2;2') {
+        throw "stable drift should confirm after one recheck epoch, saw: $driftRecheckShape"
+    }
+
     Write-Step 'Refusing local_only repair while a forward_origins={all} cascade subscription is enabled'
     $blockedRepairResult = Invoke-Sql -Database 'provider' -Sql @"
 SELECT repair_id::text || ';' || status

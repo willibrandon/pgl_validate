@@ -1890,6 +1890,9 @@ DECLARE
     append_to_parent boolean := false;
     initial_epoch int := 1;
     recheck_epoch int := 2;
+    recheck_pass int;
+    previous_sample text := 'A';
+    current_sample text;
     v_schema_name text;
     v_rel_name text;
     cols text[];
@@ -1967,6 +1970,11 @@ DECLARE
         NULLIF(current_setting('pgl_validate.localize_threshold', true), '')::int,
         1000
     );
+    recheck_passes int := COALESCE(
+        (NULLIF(options->>'recheck_passes', ''))::int,
+        NULLIF(current_setting('pgl_validate.recheck_passes', true), '')::int,
+        3
+    );
     correlate_conflict_history boolean := COALESCE(
         (NULLIF(options->>'correlate_conflict_history', ''))::boolean,
         NULLIF(current_setting('pgl_validate.correlate_conflict_history', true), '')::boolean,
@@ -2030,6 +2038,9 @@ BEGIN
     END IF;
     IF localize_threshold <= 0 THEN
         RAISE EXCEPTION 'localize_threshold must be greater than zero';
+    END IF;
+    IF recheck_passes <= 0 THEN
+        RAISE EXCEPTION 'recheck_passes must be greater than zero';
     END IF;
 
     IF peers IS NULL OR cardinality(peers) = 0 THEN
@@ -2846,16 +2857,21 @@ BEGIN
                 detected_at = now();
         END LOOP;
 
-        IF EXISTS (
-            SELECT 1
-            FROM pgl_validate.divergence d
-            JOIN pgl_validate.peer p ON p.name = d.node
-            WHERE d.run_id = v_run_id
-              AND d.schema_name = v_schema_name
-              AND d.table_name = v_rel_name
-              AND d.status = 'candidate'
-              AND p.backend IN ('pglogical','standby')
-        ) THEN
+        FOR recheck_pass IN 1..recheck_passes LOOP
+            EXIT WHEN NOT EXISTS (
+                SELECT 1
+                FROM pgl_validate.divergence d
+                JOIN pgl_validate.peer p ON p.name = d.node
+                WHERE d.run_id = v_run_id
+                  AND d.schema_name = v_schema_name
+                  AND d.table_name = v_rel_name
+                  AND d.status = 'candidate'
+                  AND p.backend IN ('pglogical','standby')
+            );
+
+            recheck_epoch := initial_epoch + recheck_pass;
+            current_sample := format('R%s', recheck_pass);
+
             INSERT INTO pgl_validate.fence_epoch(run_id, epoch_seq)
             VALUES (v_run_id, recheck_epoch)
             ON CONFLICT DO NOTHING;
@@ -2952,6 +2968,9 @@ BEGIN
                 END IF;
             END LOOP;
 
+            DELETE FROM pg_temp.pgl_validate_localized_sample
+            WHERE sample = current_sample;
+
             FOR range_rec IN
                 SELECT *
                 FROM (
@@ -2987,7 +3006,7 @@ BEGIN
                 EXECUTE format(
                     'INSERT INTO pg_temp.pgl_validate_localized_sample(sample, node, key_text, key_bytes, row_digest, row_json)
                      SELECT %L, %L, q.key_text, q.key_bytes, q.row_digest, q.row_json::jsonb FROM (%s) AS q',
-                    'B',
+                    current_sample,
                     'local',
                     localize_sql
                 );
@@ -3038,7 +3057,7 @@ BEGIN
                     INSERT INTO pg_temp.pgl_validate_localized_sample(
                         sample, node, key_text, key_bytes, row_digest, row_json
                     )
-                    SELECT 'B', peer_rec.name, r.key_text, r.key_bytes, r.row_digest, r.row_json::jsonb
+                    SELECT current_sample, peer_rec.name, r.key_text, r.key_bytes, r.row_digest, r.row_json::jsonb
                     FROM pgl_validate.remote_localize_rows(
                         peer_rec.dsn,
                         remote_localize_sql,
@@ -3070,13 +3089,13 @@ BEGIN
                     END
                 FROM pgl_validate.divergence d
                 LEFT JOIN pg_temp.pgl_validate_localized_sample la
-                  ON la.sample = 'A' AND la.node = 'local' AND la.key_bytes = d.key_bytes
+                  ON la.sample = previous_sample AND la.node = 'local' AND la.key_bytes = d.key_bytes
                 LEFT JOIN pg_temp.pgl_validate_localized_sample pa
-                  ON pa.sample = 'A' AND pa.node = d.node AND pa.key_bytes = d.key_bytes
+                  ON pa.sample = previous_sample AND pa.node = d.node AND pa.key_bytes = d.key_bytes
                 LEFT JOIN pg_temp.pgl_validate_localized_sample lb
-                  ON lb.sample = 'B' AND lb.node = 'local' AND lb.key_bytes = d.key_bytes
+                  ON lb.sample = current_sample AND lb.node = 'local' AND lb.key_bytes = d.key_bytes
                 LEFT JOIN pg_temp.pgl_validate_localized_sample pb
-                  ON pb.sample = 'B' AND pb.node = d.node AND pb.key_bytes = d.key_bytes
+                  ON pb.sample = current_sample AND pb.node = d.node AND pb.key_bytes = d.key_bytes
                 WHERE d.run_id = v_run_id
                   AND d.schema_name = v_schema_name
                   AND d.table_name = v_rel_name
@@ -3086,10 +3105,11 @@ BEGIN
                 DO UPDATE SET outcome = EXCLUDED.outcome, at = now();
 
                 UPDATE pgl_validate.divergence d
-                SET status = CASE r.outcome
-                    WHEN 'cleared' THEN 'cleared'
-                    WHEN 'still_differs' THEN 'confirmed'
-                    ELSE 'indeterminate'
+                SET status = CASE
+                    WHEN r.outcome = 'cleared' THEN 'cleared'
+                    WHEN r.outcome = 'still_differs' THEN 'confirmed'
+                    WHEN recheck_pass >= recheck_passes THEN 'indeterminate'
+                    ELSE 'candidate'
                 END
                 FROM pgl_validate.divergence_recheck r
                 WHERE r.run_id = d.run_id
@@ -3104,7 +3124,9 @@ BEGIN
                   AND d.node = peer_rec.name
                   AND d.status = 'candidate';
             END LOOP;
-        END IF;
+
+            previous_sample := current_sample;
+        END LOOP;
 
         UPDATE pgl_validate.divergence d
         SET status = 'confirmed'
