@@ -370,8 +370,12 @@ struct QueryResult {
 }
 
 impl QueryResult {
+    fn status(&self) -> c_int {
+        unsafe { PQresultStatus(self.raw) }
+    }
+
     fn require_status(&self, expected: c_int) -> Result<(), String> {
-        let status = unsafe { PQresultStatus(self.raw) };
+        let status = self.status();
         if status == expected {
             Ok(())
         } else {
@@ -1106,45 +1110,23 @@ pub(crate) fn fetch_checksum(
 ) -> Result<RemoteChecksum, String> {
     let conn = Connection::connect_with_timeout(dsn, connect_timeout_seconds)?;
     conn.set_query_timeouts(statement_timeout_ms, lock_timeout_ms)?;
-    let wrapped_sql = format!(
-        "SELECT current_setting('server_version_num')::int::text, \
-                q.n_rows::bigint::text, \
-                encode(q.lthash, 'hex'), \
-                encode(q.set_hash, 'hex') \
-         FROM ({checksum_sql}) AS q"
-    );
-
-    let result = conn.exec(&wrapped_sql)?;
-    result.require_status(PGRES_TUPLES_OK)?;
-
-    if result.ntuples() != 1 || result.nfields() != 4 {
-        return Err(format!(
-            "remote checksum returned {} row(s) and {} column(s), expected 1 row and 4 columns",
-            result.ntuples(),
-            result.nfields()
-        ));
+    conn.exec_command("BEGIN ISOLATION LEVEL REPEATABLE READ, READ ONLY")?;
+    let checksum = match conn
+        .exec(&checksum_wrapper_sql(checksum_sql))
+        .and_then(|result| parse_checksum_result(&result))
+    {
+        Ok(checksum) => checksum,
+        Err(err) => {
+            let _ = conn.exec_command("ROLLBACK");
+            return Err(err);
+        }
+    };
+    if let Err(err) = conn.exec_command("COMMIT") {
+        let _ = conn.exec_command("ROLLBACK");
+        return Err(err);
     }
 
-    let pg_version = result
-        .value(0, 0)?
-        .parse::<i32>()
-        .map_err(|err| format!("invalid remote server_version_num: {err}"))?;
-    let n_rows = result
-        .value(0, 1)?
-        .parse::<i64>()
-        .map_err(|err| format!("invalid remote row count: {err}"))?;
-    let lthash = parse_hex(&result.value(0, 2)?)?;
-    let set_hash = result
-        .value_opt(0, 3)?
-        .map(|value| parse_hex(&value))
-        .transpose()?;
-
-    Ok(RemoteChecksum {
-        pg_version,
-        n_rows,
-        lthash,
-        set_hash,
-    })
+    Ok(checksum)
 }
 
 /// Run generated checksum SQL requests concurrently over bounded libpq fan-out.
@@ -1200,7 +1182,7 @@ pub(crate) fn fetch_checksums_batch(
 struct ActiveChecksumTask {
     task: RemoteChecksumTask,
     conn: Connection,
-    saw_result: bool,
+    checksum: Option<RemoteChecksum>,
 }
 
 impl ActiveChecksumTask {
@@ -1212,49 +1194,65 @@ impl ActiveChecksumTask {
         let conn = Connection::connect_with_timeout(&task.dsn, task.connect_timeout_seconds)?;
         conn.set_query_timeouts(task.statement_timeout_ms, task.lock_timeout_ms)?;
         conn.set_nonblocking(true)?;
-        conn.send_query(&checksum_wrapper_sql(&task.checksum_sql))?;
+        conn.send_query(&checksum_transaction_sql(&task.checksum_sql))?;
 
         Ok(Self {
             task,
             conn,
-            saw_result: false,
+            checksum: None,
         })
     }
 
     fn try_finish(&mut self) -> Result<Option<RemoteChecksumBatchResult>, String> {
-        self.conn.consume_input()?;
-        if self.conn.is_busy() {
-            return Ok(None);
-        }
-
-        let mut checksum = None;
-        while let Some(result) = self.conn.next_result() {
-            if self.saw_result {
-                return Err(format!(
-                    "remote checksum batch task {} returned more than one result",
-                    self.task.task_id
-                ));
-            }
-
-            checksum = Some(parse_checksum_result(&result)?);
-            self.saw_result = true;
-        }
-
-        let Some(checksum) = checksum else {
-            if self.saw_result {
+        loop {
+            self.conn.consume_input()?;
+            if self.conn.is_busy() {
                 return Ok(None);
             }
-            return Err(format!(
-                "remote checksum batch task {} completed without a result",
-                self.task.task_id
-            ));
-        };
 
-        Ok(Some(RemoteChecksumBatchResult {
-            task_id: self.task.task_id,
-            checksum,
-        }))
+            let Some(result) = self.conn.next_result() else {
+                let Some(checksum) = self.checksum.take() else {
+                    return Err(format!(
+                        "remote checksum batch task {} completed without a result",
+                        self.task.task_id
+                    ));
+                };
+
+                return Ok(Some(RemoteChecksumBatchResult {
+                    task_id: self.task.task_id,
+                    checksum,
+                }));
+            };
+
+            match result.status() {
+                PGRES_COMMAND_OK => {}
+                PGRES_TUPLES_OK => {
+                    if self.checksum.is_some() {
+                        return Err(format!(
+                            "remote checksum batch task {} returned more than one tuple result",
+                            self.task.task_id
+                        ));
+                    }
+
+                    self.checksum = Some(parse_checksum_result(&result)?);
+                }
+                status => {
+                    return Err(format!(
+                        "remote checksum batch task {} returned libpq status {status}: {}",
+                        self.task.task_id,
+                        result.error_message()
+                    ));
+                }
+            }
+        }
     }
+}
+
+fn checksum_transaction_sql(checksum_sql: &str) -> String {
+    format!(
+        "BEGIN ISOLATION LEVEL REPEATABLE READ, READ ONLY; {}; COMMIT",
+        checksum_wrapper_sql(checksum_sql)
+    )
 }
 
 fn checksum_wrapper_sql(checksum_sql: &str) -> String {
