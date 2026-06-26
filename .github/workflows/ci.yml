@@ -16,6 +16,7 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  PGL_VALIDATE_PGLOGICAL_VERSION: "2.5.3"
   RUST_BACKTRACE: "1"
 
 jobs:
@@ -79,7 +80,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.pgrx/postgresql-*
-          key: postgres-source-pg${{ matrix.pg }}-${{ matrix.target.platform }}-v1
+          key: postgres-source-pg${{ matrix.pg }}-${{ matrix.target.platform }}-pglogical-${{ env.PGL_VALIDATE_PGLOGICAL_VERSION }}-v1
 
       - name: Set up PostgreSQL and pgrx
         env:
@@ -95,7 +96,7 @@ jobs:
       - name: Install pglogical release
         env:
           PGL_VALIDATE_MSVC_ARCH: ${{ matrix.target.msvc_arch }}
-        run: ./scripts/pgrx-vs.ps1 pwsh -NoProfile -ExecutionPolicy Bypass -File ./scripts/install-pglogical-release.ps1 -PgMajor ${{ matrix.pg }}
+        run: ./scripts/pgrx-vs.ps1 pwsh -NoProfile -ExecutionPolicy Bypass -File ./scripts/install-pglogical-release.ps1 -PgMajor ${{ matrix.pg }} -Version $env:PGL_VALIDATE_PGLOGICAL_VERSION
 
       - name: Run pgrx pg_test suite
         env:
@@ -171,7 +172,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.pgrx/postgresql-*
-          key: postgres-source-pg${{ matrix.pg }}-${{ matrix.target.platform }}-v1
+          key: postgres-source-pg${{ matrix.pg }}-${{ matrix.target.platform }}-pglogical-${{ env.PGL_VALIDATE_PGLOGICAL_VERSION }}-v1
 
       - name: Set up PostgreSQL and pgrx
         env:
@@ -187,7 +188,7 @@ jobs:
       - name: Install pglogical release
         env:
           PGL_VALIDATE_MSVC_ARCH: ${{ matrix.target.msvc_arch }}
-        run: ./scripts/pgrx-vs.ps1 pwsh -NoProfile -ExecutionPolicy Bypass -File ./scripts/install-pglogical-release.ps1 -PgMajor ${{ matrix.pg }}
+        run: ./scripts/pgrx-vs.ps1 pwsh -NoProfile -ExecutionPolicy Bypass -File ./scripts/install-pglogical-release.ps1 -PgMajor ${{ matrix.pg }} -Version $env:PGL_VALIDATE_PGLOGICAL_VERSION
 
       - name: Run pglogical fence harness
         env:
@@ -259,7 +260,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.pgrx/postgresql-*
-          key: postgres-source-pg${{ matrix.pg }}-${{ matrix.target.platform }}-v1
+          key: postgres-source-pg${{ matrix.pg }}-${{ matrix.target.platform }}-pglogical-${{ env.PGL_VALIDATE_PGLOGICAL_VERSION }}-v1
 
       - name: Set up PostgreSQL and pgrx
         env:

@@ -181,15 +181,27 @@ function Install-PglogicalSource {
         New-Item -ItemType Directory -Force -Path $buildRoot | Out-Null
         $buildDir = Join-Path $buildRoot "pglogical-cmake-$([guid]::NewGuid())"
         $ninja = Get-PglCommandSource -Name 'ninja'
-        $configureArgs = @(
+        $generatorArgs = @()
+        if ($ninja) {
+            $generatorArgs = @('-G', 'Ninja')
+        }
+        elseif ($env:PGL_VALIDATE_MSVC_ARCH) {
+            $cmakeArchitecture = switch ($env:PGL_VALIDATE_MSVC_ARCH.ToLowerInvariant()) {
+                'x64' { 'x64' }
+                'arm64' { 'ARM64' }
+                default { $null }
+            }
+            if ($cmakeArchitecture) {
+                $generatorArgs = @('-A', $cmakeArchitecture)
+            }
+        }
+
+        $configureArgs = $generatorArgs + @(
             '-S', $sourceRoot.FullName,
             '-B', $buildDir,
             "-DPG_CONFIG=$PgConfig",
             '-DCMAKE_BUILD_TYPE=Release'
         )
-        if ($ninja) {
-            $configureArgs = @('-G', 'Ninja') + $configureArgs
-        }
 
         try {
             $env:PG_CONFIG = $PgConfig
@@ -227,23 +239,66 @@ function Install-PglogicalSource {
     }
 }
 
-function Assert-PglogicalInstalled {
-    param([string] $PgConfig)
+function Test-PglogicalInstalled {
+    param(
+        [string] $PgConfig,
+        [string] $Version
+    )
 
     $pkglibDir = & $PgConfig --pkglibdir
     $sharedDir = & $PgConfig --sharedir
     $extensionDir = Join-Path $sharedDir 'extension'
 
     $controlPath = Join-Path $extensionDir 'pglogical.control'
+    $markerPath = Join-Path $extensionDir 'pglogical.pgl_validate.version'
     $library = Get-ChildItem -LiteralPath $pkglibDir -File -Filter 'pglogical*' -ErrorAction SilentlyContinue |
         Where-Object { $_.Extension -in @('.dll', '.so', '.dylib') } |
         Select-Object -First 1
-    if (-not (Test-Path $controlPath)) {
+
+    if (-not ((Test-Path -LiteralPath $controlPath) -and $library)) {
+        return $false
+    }
+    if (-not $Version) {
+        return $true
+    }
+    if (-not (Test-Path -LiteralPath $markerPath)) {
+        return $false
+    }
+
+    return ((Get-Content -LiteralPath $markerPath -Raw).Trim() -eq $Version)
+}
+
+function Assert-PglogicalInstalled {
+    param([string] $PgConfig)
+
+    $pkglibDir = & $PgConfig --pkglibdir
+    $sharedDir = & $PgConfig --sharedir
+    $extensionDir = Join-Path $sharedDir 'extension'
+    $controlPath = Join-Path $extensionDir 'pglogical.control'
+    $library = Get-ChildItem -LiteralPath $pkglibDir -File -Filter 'pglogical*' -ErrorAction SilentlyContinue |
+        Where-Object { $_.Extension -in @('.dll', '.so', '.dylib') } |
+        Select-Object -First 1
+
+    if (-not (Test-Path -LiteralPath $controlPath)) {
         throw "Install verification failed: $controlPath was not found."
     }
     if (-not $library) {
         throw "Install verification failed: no pglogical library was found in $pkglibDir."
     }
+
+    Write-Verbose "Verified pglogical artifacts in $pkglibDir."
+}
+
+function Set-PglogicalInstallMarker {
+    param(
+        [string] $PgConfig,
+        [string] $Version
+    )
+
+    $sharedDir = & $PgConfig --sharedir
+    $extensionDir = Join-Path $sharedDir 'extension'
+    $markerPath = Join-Path $extensionDir 'pglogical.pgl_validate.version'
+    $Version | Out-File -LiteralPath $markerPath -Encoding ascii -NoNewline
 }
 
 if (-not $PgConfig) {
@@ -254,6 +309,12 @@ $PgConfig = (Resolve-Path $PgConfig).Path
 $pgVersion = & $PgConfig --version
 if ($pgVersion -notmatch "PostgreSQL\s+$PgMajor\.") {
     throw "$PgConfig reports '$pgVersion', not PostgreSQL $PgMajor.x"
+}
+
+if (Test-PglogicalInstalled -PgConfig $PgConfig -Version $Version) {
+    Write-Host "pglogical $Version is already installed for $pgVersion"
+    Write-Host "pg_config: $PgConfig"
+    return
 }
 
 $baseUri = "https://github.com/willibrandon/pglogical/releases/download/v$Version"
@@ -294,6 +355,7 @@ try {
     }
 
     Assert-PglogicalInstalled -PgConfig $PgConfig
+    Set-PglogicalInstallMarker -PgConfig $PgConfig -Version $Version
     Write-Host "pg_config: $PgConfig"
 } finally {
     Remove-Item -LiteralPath $workDir -Recurse -Force -ErrorAction SilentlyContinue
