@@ -90,6 +90,7 @@ unsafe fn encode_text(type_oid: pg_sys::Oid, datum: pg_sys::Datum) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     #[test]
     fn frame_distinguishes_null_empty_and_bytes() {
@@ -111,5 +112,43 @@ mod tests {
         assert_eq!(EncodingMode::try_from(1).unwrap(), EncodingMode::Send);
         assert_eq!(EncodingMode::try_from(2).unwrap(), EncodingMode::Text);
         assert!(EncodingMode::try_from(0).is_err());
+    }
+
+    fn frame_reference(values: &[Option<Vec<u8>>]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for value in values {
+            match value {
+                None => out.push(0x00),
+                Some(bytes) => {
+                    out.push(0x01);
+                    out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+                    out.extend_from_slice(bytes);
+                }
+            }
+        }
+        out
+    }
+
+    fn framed_digest(values: &[Option<Vec<u8>>]) -> blake3::Hash {
+        let mut hasher = blake3::Hasher::new();
+        for value in values {
+            frame_value(&mut hasher, value.as_deref());
+        }
+        hasher.finalize()
+    }
+
+    proptest! {
+        #[test]
+        fn frame_value_matches_independent_reference(
+            values in prop::collection::vec(
+                prop::option::of(prop::collection::vec(any::<u8>(), 0..256)),
+                0..32
+            )
+        ) {
+            let actual = framed_digest(&values);
+            let expected = blake3::hash(&frame_reference(&values));
+
+            prop_assert_eq!(actual, expected);
+        }
     }
 }

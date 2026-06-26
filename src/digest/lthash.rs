@@ -121,6 +121,7 @@ impl LtHashCore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     #[test]
     fn lthash_is_order_independent() {
@@ -186,5 +187,90 @@ mod tests {
         let first = hash_digest_array(&[a.as_bytes(), b.as_bytes()], HashAlgorithm::Blake3_256);
         let second = hash_digest_array(&[b.as_bytes(), a.as_bytes()], HashAlgorithm::Blake3_256);
         assert_ne!(first, second);
+    }
+
+    fn digest_strategy() -> impl Strategy<Value = Vec<u8>> {
+        prop::collection::vec(any::<u8>(), 0..128)
+    }
+
+    fn digest_vec_strategy() -> impl Strategy<Value = Vec<Vec<u8>>> {
+        prop::collection::vec(digest_strategy(), 0..32)
+    }
+
+    fn lthash_reference(digests: &[Vec<u8>]) -> LtHashCore {
+        let mut state = LtHashCore::default();
+        for digest in digests {
+            add_row_digest(&mut state, digest);
+        }
+        state
+    }
+
+    fn sorted_digest_reference(digests: &[Vec<u8>], algorithm: HashAlgorithm) -> Vec<u8> {
+        let mut sorted = digests.to_vec();
+        sorted.sort();
+
+        let mut hasher = blake3::Hasher::new();
+        for digest in &sorted {
+            hasher.update(digest);
+        }
+        algorithm.finalize_blake3(hasher)
+    }
+
+    proptest! {
+        #[test]
+        fn lthash_is_commutative_for_any_generated_multiset(mut digests in digest_vec_strategy()) {
+            let forward = lthash_reference(&digests);
+            digests.reverse();
+            let reverse = lthash_reference(&digests);
+
+            prop_assert_eq!(forward, reverse);
+        }
+
+        #[test]
+        fn lthash_combine_matches_partitioned_reference(
+            left in digest_vec_strategy(),
+            right in digest_vec_strategy()
+        ) {
+            let mut all = left.clone();
+            all.extend(right.clone());
+
+            prop_assert_eq!(
+                combine(lthash_reference(&left), lthash_reference(&right)),
+                lthash_reference(&all)
+            );
+        }
+
+        #[test]
+        fn lthash_changes_for_single_added_non_empty_digest(
+            mut digests in digest_vec_strategy(),
+            extra in prop::collection::vec(any::<u8>(), 1..128)
+        ) {
+            let before = lthash_reference(&digests);
+            digests.push(extra);
+            let after = lthash_reference(&digests);
+
+            prop_assert_ne!(before, after);
+        }
+
+        #[test]
+        fn sorted_confirmation_matches_independent_sorted_reference(
+            digests in digest_vec_strategy(),
+            wide in any::<bool>()
+        ) {
+            let algorithm = if wide {
+                HashAlgorithm::Blake3_512
+            } else {
+                HashAlgorithm::Blake3_256
+            };
+
+            let mut sorted = digests.clone();
+            sorted.sort();
+            let refs = sorted.iter().map(Vec::as_slice).collect::<Vec<_>>();
+
+            prop_assert_eq!(
+                hash_digest_array(&refs, algorithm),
+                sorted_digest_reference(&digests, algorithm)
+            );
+        }
     }
 }
