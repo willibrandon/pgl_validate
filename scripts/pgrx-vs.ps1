@@ -23,16 +23,46 @@ if (-not (Test-Path $vswhere)) {
     throw "vswhere.exe was not found. Install Visual Studio with the C++ workload."
 }
 
-$installPath = & $vswhere -latest -products * `
-    -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
-    -property installationPath
-if (-not $installPath) {
-    throw "Visual Studio C++ tools were not found. Install the Desktop development with C++ workload."
+$requestedArch = $env:PGL_VALIDATE_MSVC_ARCH
+if (-not $requestedArch) {
+    $requestedArch = if ([Runtime.InteropServices.RuntimeInformation]::OSArchitecture -eq [Runtime.InteropServices.Architecture]::Arm64) {
+        'arm64'
+    }
+    else {
+        'x64'
+    }
+}
+$requestedArch = $requestedArch.ToLowerInvariant()
+
+$vcvarsName = switch ($requestedArch) {
+    'x64' {
+        'vcvars64.bat'
+        break
+    }
+    'arm64' {
+        'vcvarsarm64.bat'
+        break
+    }
+    default {
+        throw "Unsupported MSVC architecture '$requestedArch'. Use x64 or arm64."
+    }
 }
 
-$vcvars = Join-Path $installPath 'VC\Auxiliary\Build\vcvars64.bat'
+$requiredComponent = switch ($requestedArch) {
+    'x64' { 'Microsoft.VisualStudio.Component.VC.Tools.x86.x64' }
+    'arm64' { 'Microsoft.VisualStudio.Component.VC.Tools.ARM64' }
+}
+
+$installPath = & $vswhere -latest -products * `
+    -requires $requiredComponent `
+    -property installationPath
+if (-not $installPath) {
+    throw "Visual Studio C++ tools for $requestedArch were not found. Install the Desktop development with C++ workload for $requestedArch."
+}
+
+$vcvars = Join-Path $installPath "VC\Auxiliary\Build\$vcvarsName"
 if (-not (Test-Path $vcvars)) {
-    throw "vcvars64.bat was not found at $vcvars"
+    throw "$vcvarsName was not found at $vcvars"
 }
 
 $argLine = ($Command | ForEach-Object { '"' + ($_ -replace '"', '\"') + '"' }) -join ' '
