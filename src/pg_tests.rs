@@ -618,6 +618,85 @@ mod tests {
     }
 
     #[pg_test]
+    fn compare_table_splits_slow_chunks_until_single_row_ranges() {
+        Spi::run(
+            r#"
+            DELETE FROM pgl_validate.peer;
+            CREATE TEMP TABLE duration_split_target(
+                id int PRIMARY KEY,
+                value text
+            );
+            INSERT INTO duration_split_target
+            SELECT g, 'value-' || g::text
+            FROM generate_series(1, 6) AS g;
+            "#,
+        )
+        .unwrap();
+
+        let run_id = Spi::get_one::<i64>(
+            r#"
+            SELECT (pgl_validate.compare_table(
+                'duration_split_target'::regclass,
+                ARRAY[]::text[],
+                '{"chunk_target_rows":4,"chunk_max_duration":"1 microsecond"}'::jsonb
+            )).run_id
+            "#,
+        )
+        .unwrap()
+        .unwrap();
+
+        let split_count = Spi::get_one::<i64>(&format!(
+            "
+            SELECT count(*)
+            FROM pgl_validate.chunk_result
+            WHERE run_id = {run_id}
+              AND table_name = 'duration_split_target'
+              AND chunk_id <> 1
+              AND state = 'split'
+            "
+        ))
+        .unwrap()
+        .unwrap();
+        assert!(
+            split_count > 0,
+            "chunk_max_duration should force at least one non-root split"
+        );
+
+        let max_leaf_rows = Spi::get_one::<i64>(&format!(
+            "
+            SELECT max(cnr.n_rows)
+            FROM pgl_validate.chunk_result cr
+            JOIN pgl_validate.chunk_node_result cnr
+              USING (run_id, schema_name, table_name, chunk_id)
+            WHERE cr.run_id = {run_id}
+              AND cr.table_name = 'duration_split_target'
+              AND cr.chunk_id <> 1
+              AND cr.state <> 'split'
+              AND cnr.node = 'local'
+            "
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(max_leaf_rows, 1);
+
+        let split_parent_rows = Spi::get_one::<i64>(&format!(
+            "
+            SELECT count(*)
+            FROM pgl_validate.chunk_result cr
+            JOIN pgl_validate.chunk_node_result cnr
+              USING (run_id, schema_name, table_name, chunk_id)
+            WHERE cr.run_id = {run_id}
+              AND cr.table_name = 'duration_split_target'
+              AND cr.chunk_id <> 1
+              AND cr.state = 'split'
+            "
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(split_parent_rows, 0);
+    }
+
+    #[pg_test]
     fn compare_uses_guc_defaults_with_option_overrides() {
         let backend_pid = Spi::get_one::<i32>("SELECT pg_backend_pid()")
             .unwrap()

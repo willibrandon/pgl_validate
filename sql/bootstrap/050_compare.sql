@@ -379,12 +379,16 @@ DECLARE
     peer_rec record;
     remote_rec record;
     range_rec record;
+    split_rec record;
     child_chunk_id bigint;
+    next_chunk_id bigint := 1;
     planned_chunk_count int := 0;
     chunk_differ_count int := 0;
+    split_count int := 0;
     classified_divergence_count int := 0;
     reported_divergence_count int := 0;
     range_target_rows int;
+    split_target_rows int;
     checksum_sql text;
     remote_checksum_sql text;
     remote_set_hash_sql text;
@@ -399,8 +403,11 @@ DECLARE
     lthash bytea;
     set_hash bytea;
     chunk_n_rows bigint;
+    max_chunk_n_rows bigint;
     chunk_lthash bytea;
     chunk_set_hash bytea;
+    chunk_started_at timestamptz;
+    chunk_elapsed interval;
     differ_count int := 0;
     confirmed_count int := 0;
     advisory_count int := 0;
@@ -2212,6 +2219,38 @@ BEGIN
     IF key_cols IS NOT NULL
        AND cardinality(key_cols) > 0
        AND n_rows > range_target_rows THEN
+        IF to_regclass('pg_temp.pgl_validate_chunk_queue') IS NOT NULL THEN
+            DROP TABLE pg_temp.pgl_validate_chunk_queue;
+        END IF;
+        CREATE TEMP TABLE pgl_validate_chunk_queue (
+            chunk_id    bigint PRIMARY KEY,
+            parent_id   bigint NOT NULL,
+            lo          bytea,
+            hi          bytea,
+            target_rows int NOT NULL,
+            attempt     int NOT NULL
+        ) ON COMMIT DROP;
+
+        IF to_regclass('pg_temp.pgl_validate_chunk_split') IS NOT NULL THEN
+            DROP TABLE pg_temp.pgl_validate_chunk_split;
+        END IF;
+        CREATE TEMP TABLE pgl_validate_chunk_split (
+            planned_chunk_id bigint NOT NULL,
+            lo               bytea,
+            hi               bytea,
+            n_rows           bigint
+        ) ON COMMIT DROP;
+
+        IF to_regclass('pg_temp.pgl_validate_chunk_nodes') IS NOT NULL THEN
+            DROP TABLE pg_temp.pgl_validate_chunk_nodes;
+        END IF;
+        CREATE TEMP TABLE pgl_validate_chunk_nodes (
+            node     text PRIMARY KEY,
+            n_rows   bigint,
+            lthash   bytea,
+            set_hash bytea
+        ) ON COMMIT DROP;
+
         FOR range_rec IN
             SELECT *
             FROM pgl_validate.plan_key_ranges(
@@ -2224,9 +2263,36 @@ BEGIN
             )
             ORDER BY chunk_id
         LOOP
-            planned_chunk_count := planned_chunk_count + 1;
-            child_chunk_id := range_rec.chunk_id + 1;
+            next_chunk_id := next_chunk_id + 1;
+            INSERT INTO pg_temp.pgl_validate_chunk_queue(
+                chunk_id, parent_id, lo, hi, target_rows, attempt
+            )
+            VALUES (
+                next_chunk_id,
+                1,
+                range_rec.lo,
+                range_rec.hi,
+                range_target_rows,
+                1
+            );
+        END LOOP;
+
+        LOOP
+            SELECT q.chunk_id, q.parent_id, q.lo, q.hi, q.target_rows, q.attempt
+            INTO range_rec
+            FROM pg_temp.pgl_validate_chunk_queue q
+            ORDER BY q.chunk_id
+            LIMIT 1;
+
+            EXIT WHEN NOT FOUND;
+
+            DELETE FROM pg_temp.pgl_validate_chunk_queue q
+            WHERE q.chunk_id = range_rec.chunk_id;
+
+            child_chunk_id := range_rec.chunk_id;
             chunk_differ_count := 0;
+            split_count := 0;
+            chunk_started_at := clock_timestamp();
 
             IF COALESCE(cardinality(current_edge_ids), 0) > 0
                AND clock_timestamp() - last_re_fence_at >= max_snapshot_age THEN
@@ -2318,21 +2384,11 @@ BEGIN
             END;
             PERFORM set_config('statement_timeout', previous_statement_timeout, true);
 
-            INSERT INTO pgl_validate.chunk_node_result(
-                run_id, schema_name, table_name, chunk_id, node, n_rows, lthash
-            )
-            VALUES (
-                v_run_id,
-                v_schema_name,
-                v_rel_name,
-                child_chunk_id,
-                'local',
-                chunk_n_rows,
-                chunk_lthash
-            )
-            ON CONFLICT (run_id, schema_name, table_name, chunk_id, node) DO UPDATE
-            SET n_rows = EXCLUDED.n_rows,
-                lthash = EXCLUDED.lthash;
+            TRUNCATE pg_temp.pgl_validate_chunk_nodes;
+            max_chunk_n_rows := COALESCE(chunk_n_rows, 0);
+
+            INSERT INTO pg_temp.pgl_validate_chunk_nodes(node, n_rows, lthash, set_hash)
+            VALUES ('local', chunk_n_rows, chunk_lthash, chunk_set_hash);
 
             remote_checksum_sql := pgl_validate.plan_chunk_sql(
                 p_table_name,
@@ -2364,21 +2420,14 @@ BEGIN
                     peer_rec.lock_timeout_ms
                 ) AS rc;
 
-                INSERT INTO pgl_validate.chunk_node_result(
-                    run_id, schema_name, table_name, chunk_id, node, n_rows, lthash
-                )
-                VALUES (
-                    v_run_id,
-                    v_schema_name,
-                    v_rel_name,
-                    child_chunk_id,
-                    peer_rec.name,
-                    remote_rec.n_rows,
-                    remote_rec.lthash
-                )
-                ON CONFLICT (run_id, schema_name, table_name, chunk_id, node) DO UPDATE
+                max_chunk_n_rows := GREATEST(max_chunk_n_rows, COALESCE(remote_rec.n_rows, 0));
+
+                INSERT INTO pg_temp.pgl_validate_chunk_nodes(node, n_rows, lthash, set_hash)
+                VALUES (peer_rec.name, remote_rec.n_rows, remote_rec.lthash, remote_rec.set_hash)
+                ON CONFLICT (node) DO UPDATE
                 SET n_rows = EXCLUDED.n_rows,
-                    lthash = EXCLUDED.lthash;
+                    lthash = EXCLUDED.lthash,
+                    set_hash = EXCLUDED.set_hash;
 
                 IF remote_rec.n_rows IS DISTINCT FROM chunk_n_rows
                    OR remote_rec.lthash IS DISTINCT FROM chunk_lthash
@@ -2386,6 +2435,87 @@ BEGIN
                     chunk_differ_count := chunk_differ_count + 1;
                 END IF;
             END LOOP;
+
+            chunk_elapsed := clock_timestamp() - chunk_started_at;
+
+            IF chunk_elapsed >= chunk_max_duration
+               AND max_chunk_n_rows > 1
+               AND range_rec.target_rows > 1 THEN
+                split_target_rows := GREATEST(
+                    1,
+                    LEAST(
+                        range_rec.target_rows - 1,
+                        ceil(max_chunk_n_rows::numeric / 2.0)::int
+                    )
+                );
+
+                TRUNCATE pg_temp.pgl_validate_chunk_split;
+                INSERT INTO pg_temp.pgl_validate_chunk_split(
+                    planned_chunk_id, lo, hi, n_rows
+                )
+                SELECT sub.chunk_id, sub.lo, sub.hi, sub.n_rows
+                FROM pgl_validate.plan_key_ranges(
+                    p_table_name,
+                    key_cols,
+                    range_rec.lo,
+                    range_rec.hi,
+                    split_target_rows,
+                    row_filter_sql
+                ) AS sub;
+
+                SELECT count(*)::int
+                INTO split_count
+                FROM pg_temp.pgl_validate_chunk_split;
+
+                IF split_count > 1 THEN
+                    FOR split_rec IN
+                        SELECT *
+                        FROM pg_temp.pgl_validate_chunk_split s
+                        ORDER BY s.planned_chunk_id
+                    LOOP
+                        next_chunk_id := next_chunk_id + 1;
+                        INSERT INTO pg_temp.pgl_validate_chunk_queue(
+                            chunk_id, parent_id, lo, hi, target_rows, attempt
+                        )
+                        VALUES (
+                            next_chunk_id,
+                            child_chunk_id,
+                            split_rec.lo,
+                            split_rec.hi,
+                            split_target_rows,
+                            range_rec.attempt + 1
+                        );
+                    END LOOP;
+
+                    UPDATE pgl_validate.chunk_result cr
+                    SET state = 'split',
+                        updated_at = now()
+                    WHERE cr.run_id = v_run_id
+                      AND cr.schema_name = v_schema_name
+                      AND cr.table_name = v_rel_name
+                      AND cr.chunk_id = child_chunk_id;
+
+                    CONTINUE;
+                END IF;
+            END IF;
+
+            planned_chunk_count := planned_chunk_count + 1;
+
+            INSERT INTO pgl_validate.chunk_node_result(
+                run_id, schema_name, table_name, chunk_id, node, n_rows, lthash
+            )
+            SELECT
+                v_run_id,
+                v_schema_name,
+                v_rel_name,
+                child_chunk_id,
+                r.node,
+                r.n_rows,
+                r.lthash
+            FROM pg_temp.pgl_validate_chunk_nodes r
+            ON CONFLICT (run_id, schema_name, table_name, chunk_id, node) DO UPDATE
+            SET n_rows = EXCLUDED.n_rows,
+                lthash = EXCLUDED.lthash;
 
             UPDATE pgl_validate.chunk_result cr
             SET state = CASE WHEN chunk_differ_count = 0 THEN 'clean' ELSE 'divergent' END,

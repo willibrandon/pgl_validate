@@ -190,7 +190,7 @@ pub extern "C-unwind" fn _PG_init() {
     GucRegistry::define_string_guc(
         c"pgl_validate.chunk_max_duration",
         c"Maximum planned chunk duration.",
-        c"Design knob for adaptive split-and-retry chunk sizing. The current SQL engine validates the setting and records it in run options.",
+        c"Split and retry key-range chunks that exceed this elapsed-time threshold, down to single-row ranges.",
         &CHUNK_MAX_DURATION,
         GucContext::Userset,
         flags,
