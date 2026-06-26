@@ -10,6 +10,9 @@
 *.exp
 *.lib
 *.dll
+*.so
+*.dylib
+*.a
 *.exe
 *.obj
 *.iobj
@@ -18,6 +21,7 @@
 *.rmeta
 *.profraw
 *.profdata
+*.dSYM/
 .vs/
 *.user
 *.suo

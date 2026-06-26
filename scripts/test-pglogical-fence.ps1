@@ -10,9 +10,13 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+$common = Join-Path $PSScriptRoot 'pgrx-common.ps1'
+. $common
+
 $root = Split-Path -Parent $PSScriptRoot
-$data = Join-Path $root 'target\pglogical-test-pgdata'
-$log = Join-Path $root 'target\pglogical-test.log'
+$target = Join-Path $root 'target'
+$data = Join-Path $target 'pglogical-test-pgdata'
+$log = Join-Path $target 'pglogical-test.log'
 $runner = Join-Path $PSScriptRoot 'pgrx-vs.ps1'
 
 function Write-Step {
@@ -37,12 +41,7 @@ function Assert-UnderRoot {
 function Stop-ProcessTree {
     param([int] $ProcessId)
 
-    $children = Get-CimInstance Win32_Process | Where-Object { $_.ParentProcessId -eq $ProcessId }
-    foreach ($child in $children) {
-        Stop-ProcessTree -ProcessId $child.ProcessId
-    }
-
-    Stop-Process -Id $ProcessId -Force -ErrorAction SilentlyContinue
+    Stop-PglProcessTree -ProcessId $ProcessId
 }
 
 function Invoke-CheckedProcess {
@@ -85,49 +84,13 @@ function ConvertTo-EncodedCommand {
 function Get-PgrxPgConfig {
     param([int] $PgMajor)
 
-    $configPath = Join-Path $env:USERPROFILE '.pgrx\config.toml'
-    if (-not (Test-Path -LiteralPath $configPath)) {
-        throw "pgrx config was not found at $configPath. Run cargo pgrx init for pg$PgMajor."
-    }
-
-    $configText = Get-Content -LiteralPath $configPath -Raw
-    $label = "pg$PgMajor"
-    $pattern = "(?m)^\s*$label\s*=\s*['""]([^'""]+)['""]\s*$"
-    $match = [regex]::Match($configText, $pattern)
-    if (-not $match.Success) {
-        throw "pgrx config does not define $label in $configPath."
-    }
-
-    $pgConfig = $match.Groups[1].Value
-    if (-not (Test-Path -LiteralPath $pgConfig)) {
-        throw "Configured pg_config for $label does not exist: $pgConfig"
-    }
-
-    return $pgConfig
+    return Get-PglPgrxPgConfig -PgMajor $PgMajor
 }
 
 function Get-ExtensionSqlPath {
     param([string] $PgConfig)
 
-    $control = Get-ChildItem -LiteralPath $root -Filter '*.control' | Select-Object -First 1
-    if (-not $control) {
-        throw "No extension control file was found under $root."
-    }
-
-    $controlText = Get-Content -LiteralPath $control.FullName -Raw
-    $versionMatch = [regex]::Match($controlText, "(?m)^\s*default_version\s*=\s*'([^']+)'\s*$")
-    if (-not $versionMatch.Success) {
-        throw "Could not read default_version from $($control.FullName)."
-    }
-
-    $shareDir = & $PgConfig --sharedir
-    if ($LASTEXITCODE -ne 0 -or -not $shareDir) {
-        throw "pg_config failed to report --sharedir for $PgConfig."
-    }
-
-    $extensionDir = Join-Path $shareDir 'extension'
-    New-Item -ItemType Directory -Force -Path $extensionDir | Out-Null
-    return Join-Path $extensionDir "$($control.BaseName)--$($versionMatch.Groups[1].Value).sql"
+    return Get-PglExtensionSqlPath -Root $root -PgConfig $PgConfig
 }
 
 function Stop-TestCluster {
@@ -183,10 +146,7 @@ function Start-CleanupWatchdog {
         [switch] $RemoveData
     )
 
-    $powershell = (Get-Command pwsh.exe -ErrorAction SilentlyContinue).Source
-    if (-not $powershell) {
-        $powershell = (Get-Command powershell.exe -ErrorAction Stop).Source
-    }
+    $powershell = Get-PglPowerShellExecutable
 
     $cleanupScript = Join-Path $PSScriptRoot 'stop-pgrx-test-clusters.ps1'
     $removeFlag = if ($RemoveData) { '$true' } else { '$false' }
@@ -208,10 +168,9 @@ else {
 "@
 
     $encoded = ConvertTo-EncodedCommand -Script $watchdogScript
-    return Start-Process -FilePath $powershell `
-        -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', $encoded) `
-        -WindowStyle Hidden `
-        -PassThru
+    return Start-PglHiddenProcess `
+        -FilePath $powershell `
+        -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', $encoded)
 }
 
 function New-FreePort {
@@ -329,10 +288,9 @@ function Wait-SqlEquals {
 }
 
 $pgConfig = Get-PgrxPgConfig -PgMajor $PgMajor
-$pgBin = Split-Path -Parent $pgConfig
-$script:InitDb = Join-Path $pgBin 'initdb.exe'
-$script:PgCtl = Join-Path $pgBin 'pg_ctl.exe'
-$script:Psql = Join-Path $pgBin 'psql.exe'
+$script:InitDb = Get-PglToolPath -PgConfig $pgConfig -Name 'initdb'
+$script:PgCtl = Get-PglToolPath -PgConfig $pgConfig -Name 'pg_ctl'
+$script:Psql = Get-PglToolPath -PgConfig $pgConfig -Name 'psql'
 $script:Port = New-FreePort
 $extensionSql = Get-ExtensionSqlPath -PgConfig $pgConfig
 $watchdog = Start-CleanupWatchdog -ParentPid $PID -Data $data -PgCtl $script:PgCtl -RemoveData:(-not $KeepData)

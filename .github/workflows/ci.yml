@@ -1,0 +1,176 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+jobs:
+  pgrx-tests:
+    name: pgrx pg${{ matrix.pg }} / ${{ matrix.target.platform }}
+    runs-on: ${{ matrix.target.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: [15, 16, 17, 18]
+        target:
+          - os: ubuntu-24.04
+            platform: linux-x64
+          - os: ubuntu-24.04-arm
+            platform: linux-arm64
+          - os: windows-2025
+            platform: windows-x64
+            msvc_arch: x64
+          - os: windows-11-arm
+            platform: windows-arm64
+            msvc_arch: arm64
+          - os: macos-15
+            platform: macos-arm64
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: pgrx-pg${{ matrix.pg }}-${{ matrix.target.platform }}
+
+      - name: Enter MSVC developer environment
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: ${{ matrix.target.msvc_arch }}
+
+      - name: Set up PostgreSQL and pgrx
+        run: ./scripts/ci-setup.ps1 -PgMajor ${{ matrix.pg }}
+
+      - name: Run pgrx pg_test suite
+        run: ./scripts/test-pgrx.ps1 -PgMajor ${{ matrix.pg }} -TimeoutSeconds 1800
+
+      - name: Clean test clusters
+        if: always()
+        run: ./scripts/stop-pgrx-test-clusters.ps1 -RemoveData
+
+  pglogical:
+    name: pglogical pg${{ matrix.pg }} / ${{ matrix.target.platform }}
+    runs-on: ${{ matrix.target.os }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: [15, 16, 17, 18]
+        target:
+          - os: ubuntu-24.04
+            platform: linux-x64
+          - os: ubuntu-24.04-arm
+            platform: linux-arm64
+          - os: windows-2025
+            platform: windows-x64
+            msvc_arch: x64
+          - os: windows-11-arm
+            platform: windows-arm64
+            msvc_arch: arm64
+          - os: macos-15
+            platform: macos-arm64
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: pglogical-pg${{ matrix.pg }}-${{ matrix.target.platform }}
+
+      - name: Enter MSVC developer environment
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: ${{ matrix.target.msvc_arch }}
+
+      - name: Set up PostgreSQL and pgrx
+        run: ./scripts/ci-setup.ps1 -PgMajor ${{ matrix.pg }}
+
+      - name: Install pglogical release
+        run: ./scripts/install-pglogical-release.ps1 -PgMajor ${{ matrix.pg }}
+
+      - name: Run pglogical fence harness
+        run: ./scripts/test-pglogical-fence.ps1 -PgMajor ${{ matrix.pg }} -TimeoutSeconds 900
+
+      - name: Clean test clusters
+        if: always()
+        run: ./scripts/stop-pgrx-test-clusters.ps1 -RemoveData
+
+  replication-harnesses:
+    name: ${{ matrix.backend }} pg${{ matrix.pg }} / ${{ matrix.target.platform }}
+    runs-on: ${{ matrix.target.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: [15, 16, 17, 18]
+        backend: [native-logical, physical-standby]
+        target:
+          - os: ubuntu-24.04
+            platform: linux-x64
+          - os: ubuntu-24.04-arm
+            platform: linux-arm64
+          - os: windows-2025
+            platform: windows-x64
+            msvc_arch: x64
+          - os: windows-11-arm
+            platform: windows-arm64
+            msvc_arch: arm64
+          - os: macos-15
+            platform: macos-arm64
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.backend }}-pg${{ matrix.pg }}-${{ matrix.target.platform }}
+
+      - name: Enter MSVC developer environment
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: ${{ matrix.target.msvc_arch }}
+
+      - name: Set up PostgreSQL and pgrx
+        run: ./scripts/ci-setup.ps1 -PgMajor ${{ matrix.pg }}
+
+      - name: Run native logical harness
+        if: matrix.backend == 'native-logical'
+        run: ./scripts/test-native-logical-fence.ps1 -PgMajor ${{ matrix.pg }} -TimeoutSeconds 900
+
+      - name: Run physical standby harness
+        if: matrix.backend == 'physical-standby'
+        run: ./scripts/test-physical-standby-fence.ps1 -PgMajor ${{ matrix.pg }} -TimeoutSeconds 900
+
+      - name: Clean test clusters
+        if: always()
+        run: ./scripts/stop-pgrx-test-clusters.ps1 -RemoveData

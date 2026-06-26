@@ -13,21 +13,26 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+$common = Join-Path $PSScriptRoot 'pgrx-common.ps1'
+. $common
+
 $root = Split-Path -Parent $PSScriptRoot
 $stopArgs = @{ Root = $root }
 if (-not $KeepData) {
     $stopArgs.RemoveData = $true
 }
+if (-not $CargoPgrxArgs -or $CargoPgrxArgs.Count -eq 0) {
+    $CargoPgrxArgs = @('--no-default-features', '--features', "pg$PgMajor")
+}
+
+# pg_tests share one PostgreSQL cluster and several extension catalog tables.
+# Running them in parallel makes catalog-visible repair and peer state flaky.
+$env:RUST_TEST_THREADS = '1'
 
 function Stop-ProcessTree {
     param([int] $ProcessId)
 
-    $children = Get-CimInstance Win32_Process | Where-Object { $_.ParentProcessId -eq $ProcessId }
-    foreach ($child in $children) {
-        Stop-ProcessTree -ProcessId $child.ProcessId
-    }
-
-    Stop-Process -Id $ProcessId -Force -ErrorAction SilentlyContinue
+    Stop-PglProcessTree -ProcessId $ProcessId
 }
 
 function ConvertTo-CommandLineArgument {
@@ -46,25 +51,7 @@ function Get-PgrxPgConfig {
         [int] $PgMajor
     )
 
-    $configPath = Join-Path $env:USERPROFILE '.pgrx\config.toml'
-    if (-not (Test-Path -LiteralPath $configPath)) {
-        throw "pgrx config was not found at $configPath. Run cargo pgrx init for pg$PgMajor."
-    }
-
-    $configText = Get-Content -LiteralPath $configPath -Raw
-    $label = "pg$PgMajor"
-    $pattern = "(?m)^\s*$label\s*=\s*['""]([^'""]+)['""]\s*$"
-    $match = [regex]::Match($configText, $pattern)
-    if (-not $match.Success) {
-        throw "pgrx config does not define $label in $configPath."
-    }
-
-    $pgConfig = $match.Groups[1].Value
-    if (-not (Test-Path -LiteralPath $pgConfig)) {
-        throw "Configured pg_config for $label does not exist: $pgConfig"
-    }
-
-    return $pgConfig
+    return Get-PglPgrxPgConfig -PgMajor $PgMajor
 }
 
 function Get-ExtensionSqlPath {
@@ -73,25 +60,7 @@ function Get-ExtensionSqlPath {
         [string] $PgConfig
     )
 
-    $control = Get-ChildItem -LiteralPath $Root -Filter '*.control' | Select-Object -First 1
-    if (-not $control) {
-        throw "No extension control file was found under $Root."
-    }
-
-    $controlText = Get-Content -LiteralPath $control.FullName -Raw
-    $versionMatch = [regex]::Match($controlText, "(?m)^\s*default_version\s*=\s*'([^']+)'\s*$")
-    if (-not $versionMatch.Success) {
-        throw "Could not read default_version from $($control.FullName)."
-    }
-
-    $shareDir = & $PgConfig --sharedir
-    if ($LASTEXITCODE -ne 0 -or -not $shareDir) {
-        throw "pg_config failed to report --sharedir for $PgConfig."
-    }
-
-    $extensionDir = Join-Path $shareDir 'extension'
-    New-Item -ItemType Directory -Force -Path $extensionDir | Out-Null
-    return Join-Path $extensionDir "$($control.BaseName)--$($versionMatch.Groups[1].Value).sql"
+    return Get-PglExtensionSqlPath -Root $Root -PgConfig $PgConfig
 }
 
 $exitCode = 0
@@ -108,14 +77,19 @@ try {
     }
 
     $command = @('cargo', 'pgrx', 'test', "pg$PgMajor") + $CargoPgrxArgs
-    $powershell = (Get-Command pwsh.exe -ErrorAction SilentlyContinue).Source
-    if (-not $powershell) {
-        $powershell = (Get-Command powershell.exe -ErrorAction Stop).Source
-    }
+    $powershell = Get-PglPowerShellExecutable
 
     $arguments = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $runner) + $command
     $argumentLine = ($arguments | ForEach-Object { ConvertTo-CommandLineArgument $_ }) -join ' '
-    $process = Start-Process -FilePath $powershell -ArgumentList $argumentLine -NoNewWindow -PassThru
+    $startArgs = @{
+        FilePath = $powershell
+        ArgumentList = $argumentLine
+        PassThru = $true
+    }
+    if (Test-PglWindows) {
+        $startArgs.NoNewWindow = $true
+    }
+    $process = Start-Process @startArgs
 
     if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
         Write-Warning "cargo pgrx test pg$PgMajor exceeded ${TimeoutSeconds}s; terminating the process tree and cleaning pgrx test clusters."

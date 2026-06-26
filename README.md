@@ -44,11 +44,16 @@ For extension validation, use pgrx:
 .\scripts\test-pgrx.ps1
 ```
 
+The scripts are PowerShell, but they are intended to run on Windows, Linux, and
+macOS. On Windows, `scripts\pgrx-vs.ps1` loads the Visual Studio C++
+environment; on other platforms it runs the command directly.
+
 `scripts\test-pgrx.ps1` always stops repo-local pgrx test clusters in
 `target\test-pgdata`, `target\pglogical-test-pgdata`,
 `target\native-test-pgdata`, `target\standby-primary-pgdata`,
 `target\standby-replica-pgdata`, and `target\diag-pgdata`, even when a pg_test
-fails.
+fails. It also runs pg_tests serially because they share one PostgreSQL cluster
+and extension catalog state.
 
 pglogical is a required part of the test environment. Install the packaged
 release into the target pgrx PostgreSQL; do not build from a local pglogical
@@ -57,6 +62,10 @@ checkout:
 ```powershell
 .\scripts\install-pglogical-release.ps1 -PgMajor 18
 ```
+
+The installer verifies the release checksum and installs a packaged artifact
+when one exists. If a package is not published for the host architecture, it
+builds the source release against the selected `pg_config`.
 
 Native logical replication coverage uses PostgreSQL's built-in publication and
 subscription machinery:

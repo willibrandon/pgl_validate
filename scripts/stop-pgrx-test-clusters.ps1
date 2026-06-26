@@ -5,15 +5,19 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+$common = Join-Path $PSScriptRoot 'pgrx-common.ps1'
+. $common
+
 $workspace = (Resolve-Path -LiteralPath $Root).Path
+$targetRoot = Join-Path $workspace 'target'
 $configuredTargets = @(
-    'target\test-pgdata',
-    'target\pglogical-test-pgdata',
-    'target\native-test-pgdata',
-    'target\standby-primary-pgdata',
-    'target\standby-replica-pgdata',
-    'target\diag-pgdata'
-) | ForEach-Object { Join-Path $workspace $_ }
+    'test-pgdata',
+    'pglogical-test-pgdata',
+    'native-test-pgdata',
+    'standby-primary-pgdata',
+    'standby-replica-pgdata',
+    'diag-pgdata'
+) | ForEach-Object { Join-Path $targetRoot $_ }
 
 function Assert-WorkspaceTargetPath {
     param([string] $Path)
@@ -35,12 +39,7 @@ function Assert-WorkspaceTargetPath {
 function Stop-ProcessTree {
     param([int] $ProcessId)
 
-    $children = Get-CimInstance Win32_Process | Where-Object { $_.ParentProcessId -eq $ProcessId }
-    foreach ($child in $children) {
-        Stop-ProcessTree -ProcessId $child.ProcessId
-    }
-
-    Stop-Process -Id $ProcessId -Force -ErrorAction SilentlyContinue
+    Stop-PglProcessTree -ProcessId $ProcessId
 }
 
 function Get-DataDirectoryPid {
@@ -81,25 +80,17 @@ function Get-PgCtl {
 
     $major = Get-DataDirectoryMajor -DataDirectory $DataDirectory
     if ($major) {
-        $configPath = Join-Path $env:USERPROFILE '.pgrx\config.toml'
-        if (Test-Path -LiteralPath $configPath) {
-            $configText = Get-Content -LiteralPath $configPath -Raw
-            $label = "pg$major"
-            $pattern = "(?m)^\s*$label\s*=\s*['""]([^'""]+)['""]\s*$"
-            $match = [regex]::Match($configText, $pattern)
-            if ($match.Success) {
-                $pgConfig = $match.Groups[1].Value
-                $pgCtl = Join-Path (Split-Path -Parent $pgConfig) 'pg_ctl.exe'
-                if (Test-Path -LiteralPath $pgCtl) {
-                    return $pgCtl
-                }
-            }
+        try {
+            $pgConfig = Get-PglPgrxPgConfig -PgMajor ([int] $major)
+            return Get-PglToolPath -PgConfig $pgConfig -Name 'pg_ctl'
+        }
+        catch {
         }
     }
 
-    $fromPath = Get-Command pg_ctl.exe -ErrorAction SilentlyContinue
+    $fromPath = Get-PglCommandSource -Name 'pg_ctl'
     if ($fromPath) {
-        return $fromPath.Source
+        return $fromPath
     }
 
     return $null
@@ -127,8 +118,7 @@ function Stop-DataDirectoryCluster {
 function Get-RepoClusterDataDirectories {
     $known = @($configuredTargets | Where-Object { Test-Path -LiteralPath $_ })
 
-    $targetRoot = Join-Path $workspace 'target'
-    $discovered = @()
+$discovered = @()
     if (Test-Path -LiteralPath $targetRoot) {
         $discovered = Get-ChildItem -LiteralPath $targetRoot -Recurse -Force -File -Filter 'postmaster.pid' -ErrorAction SilentlyContinue |
             ForEach-Object {
@@ -168,8 +158,13 @@ $patterns += @(
     'target[/\\]diag-pgdata'
 )
 
-$processNames = @('postgres.exe', 'pg_ctl.exe', 'cmd.exe', 'psql.exe', 'initdb.exe', 'pg_basebackup.exe')
-$procs = Get-CimInstance Win32_Process | Where-Object {
+$processNames = if (Test-PglWindows) {
+    @('postgres.exe', 'pg_ctl.exe', 'cmd.exe', 'psql.exe', 'initdb.exe', 'pg_basebackup.exe')
+}
+else {
+    @('postgres', 'pg_ctl', 'psql', 'initdb', 'pg_basebackup')
+}
+$procs = Get-PglProcessInfo | Where-Object {
     $commandLine = $_.CommandLine
     ($_.Name -in $processNames) -and
     ($null -ne $commandLine) -and
