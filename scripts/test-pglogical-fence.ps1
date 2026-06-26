@@ -376,14 +376,17 @@ try {
     Write-Step 'Creating coordinator/provider/target databases and extensions'
     Invoke-Sql -Database 'postgres' -Sql 'CREATE DATABASE provider' | Out-Null
     Invoke-Sql -Database 'postgres' -Sql 'CREATE DATABASE target' | Out-Null
+    Invoke-Sql -Database 'postgres' -Sql 'CREATE DATABASE degraded' | Out-Null
     Invoke-Sql -Database 'postgres' -Sql 'CREATE DATABASE cascade' | Out-Null
     Invoke-Sql -Database 'postgres' -Sql 'CREATE EXTENSION pgl_validate' | Out-Null
 
     $providerDsn = "host=localhost port=$script:Port dbname=provider user=postgres connect_timeout=5 application_name=pgl_validate_pglogical"
     $targetDsn = "host=localhost port=$script:Port dbname=target user=postgres connect_timeout=5 application_name=pgl_validate_pglogical"
+    $degradedDsn = "host=localhost port=$script:Port dbname=degraded user=postgres connect_timeout=5 application_name=pgl_validate_pglogical"
     $cascadeDsn = "host=localhost port=$script:Port dbname=cascade user=postgres connect_timeout=5 application_name=pgl_validate_pglogical"
     $providerDsnSql = Sql-Literal $providerDsn
     $targetDsnSql = Sql-Literal $targetDsn
+    $degradedDsnSql = Sql-Literal $degradedDsn
     $cascadeDsnSql = Sql-Literal $cascadeDsn
 
     Write-Step 'Creating pglogical provider node and barrier replication set'
@@ -416,10 +419,36 @@ SELECT pglogical.create_subscription(
     $slotName = Wait-SubscriptionReady -TimeoutSeconds $TimeoutSeconds
     $slotNameSql = Sql-Literal $slotName
 
+    Write-Step 'Creating degraded pglogical target without the barrier repset'
+    Invoke-Sql -Database 'degraded' -Sql 'CREATE EXTENSION pgl_validate' | Out-Null
+    Invoke-Sql -Database 'degraded' -Sql 'CREATE EXTENSION pglogical' | Out-Null
+    Invoke-Sql -Database 'degraded' -Sql 'CREATE TABLE public.accounts(id int PRIMARY KEY, value text)' | Out-Null
+    Invoke-Sql -Database 'degraded' -Sql "SELECT pglogical.create_node('degraded', $degradedDsnSql)" | Out-Null
+    Invoke-Sql -Database 'degraded' -Sql @"
+SELECT pglogical.create_subscription(
+    'sub_degraded',
+    $providerDsnSql,
+    ARRAY['default'],
+    false,
+    false,
+    ARRAY['all']
+)
+"@ | Out-Null
+    $degradedSlotName = Wait-SubscriptionReady `
+        -SubscriberDatabase 'degraded' `
+        -SubscriptionName 'sub_degraded' `
+        -ProviderDatabase 'provider' `
+        -TimeoutSeconds $TimeoutSeconds
+
     Write-Step 'Replicating user table row for compare_table validation'
     Invoke-Sql -Database 'provider' -Sql "INSERT INTO public.accounts VALUES (1, 'same')" | Out-Null
     Wait-SqlEquals `
         -Database 'target' `
+        -Sql 'SELECT count(*)::text FROM public.accounts WHERE id = 1 AND value = ''same''' `
+        -Expected '1' `
+        -TimeoutSeconds $TimeoutSeconds
+    Wait-SqlEquals `
+        -Database 'degraded' `
         -Sql 'SELECT count(*)::text FROM public.accounts WHERE id = 1 AND value = ''same''' `
         -Expected '1' `
         -TimeoutSeconds $TimeoutSeconds
@@ -510,6 +539,51 @@ SELECT EXISTS (
 "@
     if ($compareFenceRecorded -ne 'true') {
         throw 'compare_table did not record a converged fence'
+    }
+
+    Write-Step 'Validating explicit degraded pglogical fence path'
+    Invoke-Sql -Database 'provider' -Sql @"
+INSERT INTO pgl_validate.peer(name, dsn, backend, subscription_name, replication_sets)
+VALUES ('degraded', $degradedDsnSql, 'pglogical', 'sub_degraded', ARRAY['default'])
+"@ | Out-Null
+    $degradedResult = Invoke-Sql -Database 'provider' -Sql @"
+SELECT run_id::text || ';' || verdict
+FROM pgl_validate.compare_table(
+    'public.accounts'::regclass,
+    ARRAY['degraded'],
+    jsonb_build_object(
+        'provider_dsn', $providerDsnSql,
+        'provider_node', 'provider',
+        'repsets', jsonb_build_array('default'),
+        'allow_degraded_fence', true,
+        'fence_timeout_ms', 30000,
+        'fence_poll_interval_ms', 100
+    )
+)
+"@
+    $degradedParts = $degradedResult.Split(';', 2)
+    if ($degradedParts.Count -ne 2) {
+        throw "unexpected degraded compare_table result: $degradedResult"
+    }
+    $degradedRunId = $degradedParts[0]
+    $degradedVerdict = $degradedParts[1]
+    if ($degradedVerdict -ne 'degraded') {
+        throw "unexpected degraded compare_table verdict: $degradedVerdict"
+    }
+
+    $degradedFenceRecorded = Invoke-Sql -Database 'provider' -Sql @"
+SELECT EXISTS (
+    SELECT 1
+    FROM pgl_validate.fence_edge fe
+    JOIN pgl_validate.fence_attempt fa USING (run_id, epoch_seq, edge_id)
+    WHERE fe.run_id = $degradedRunId
+      AND fe.fence_kind = 'degraded'
+      AND fa.status = 'degraded'
+      AND fa.confirmed_flush_lsn >= fa.barrier_end_lsn
+)::text
+"@
+    if ($degradedFenceRecorded -ne 'true') {
+        throw 'degraded fence catalog rows were not recorded'
     }
 
     Write-Step 'Validating pglogical row-filter intersection semantics'

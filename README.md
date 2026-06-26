@@ -77,6 +77,7 @@ SET pgl_validate.sequence_buffer_multiplier = 2;
 SET pgl_validate.paranoid_confirm = off;
 SET pgl_validate.paranoid_confirm_max_rows = 1000;
 SET pgl_validate.allow_approximate_filters = off;
+SET pgl_validate.allow_degraded_fence = off;
 SET pgl_validate.correlate_conflict_history = on;
 SET pgl_validate.conflict_history_max_rows = 1000;
 ```

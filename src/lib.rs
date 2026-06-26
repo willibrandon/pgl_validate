@@ -18,6 +18,7 @@ extension_sql_file!("../sql/comments.sql", name = "comments", finalize);
 static PARANOID_CONFIRM: GucSetting<bool> = GucSetting::<bool>::new(false);
 static PARANOID_CONFIRM_MAX_ROWS: GucSetting<i32> = GucSetting::<i32>::new(1000);
 static ALLOW_APPROXIMATE_FILTERS: GucSetting<bool> = GucSetting::<bool>::new(false);
+static ALLOW_DEGRADED_FENCE: GucSetting<bool> = GucSetting::<bool>::new(false);
 static CHUNK_TARGET_ROWS: GucSetting<i32> = GucSetting::<i32>::new(50000);
 static LOCALIZE_THRESHOLD: GucSetting<i32> = GucSetting::<i32>::new(1000);
 static RECHECK_PASSES: GucSetting<i32> = GucSetting::<i32>::new(3);
@@ -55,6 +56,14 @@ pub extern "C-unwind" fn _PG_init() {
         c"Allow approximate row-filter diagnostics.",
         c"Permit explicit approximate validation of session-sensitive row filters; results are never exact.",
         &ALLOW_APPROXIMATE_FILTERS,
+        GucContext::Userset,
+        flags,
+    );
+    GucRegistry::define_bool_guc(
+        c"pgl_validate.allow_degraded_fence",
+        c"Allow degraded pglogical fences.",
+        c"Permit explicit best-effort fencing when a pglogical edge cannot carry barrier tokens; results are never exact.",
+        &ALLOW_DEGRADED_FENCE,
         GucContext::Userset,
         flags,
     );
@@ -463,6 +472,42 @@ AS 'MODULE_PATHNAME', 'remote_wait_slot_confirm_lsn_wrapper';
         .unwrap_or_else(|err| pgrx::error!("{err}"));
 
         confirmation.confirmed_flush_lsn as i64
+    }
+
+    /// Fetch a provider's current WAL LSN for an explicitly degraded fence.
+    #[pg_extern(
+        volatile,
+        parallel_unsafe,
+        sql = r#"
+CREATE FUNCTION pgl_validate.remote_current_wal_lsn(
+    dsn text,
+    connect_timeout_seconds integer DEFAULT 10,
+    statement_timeout_ms integer DEFAULT 600000,
+    lock_timeout_ms integer DEFAULT 30000
+)
+RETURNS pg_lsn
+LANGUAGE c
+STRICT
+VOLATILE
+PARALLEL UNSAFE
+AS 'MODULE_PATHNAME', 'remote_current_wal_lsn_wrapper';
+"#
+    )]
+    fn remote_current_wal_lsn(
+        dsn: &str,
+        connect_timeout_seconds: default!(i32, 10),
+        statement_timeout_ms: default!(i32, 600000),
+        lock_timeout_ms: default!(i32, 30000),
+    ) -> i64 {
+        let lsn = transport::libpq::fetch_current_wal_lsn(
+            dsn,
+            connect_timeout_seconds,
+            statement_timeout_ms,
+            lock_timeout_ms,
+        )
+        .unwrap_or_else(|err| pgrx::error!("{err}"));
+
+        lsn as i64
     }
 
     /// Observe target-side origin progress and token visibility for a barrier.

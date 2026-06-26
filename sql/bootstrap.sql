@@ -1063,6 +1063,135 @@ BEGIN
 END
 $$;
 
+-- Record an explicit degraded pglogical fence for an edge that cannot carry the
+-- barrier table. This is never exact: it waits only for provider-side slot
+-- flush through a captured WAL LSN and persists status=degraded.
+CREATE FUNCTION pgl_validate.fence_pglogical_degraded_edge(
+    p_run_id bigint,
+    p_epoch_seq int,
+    p_edge_id int,
+    p_provider_node text,
+    p_target_node text,
+    p_provider_dsn text,
+    p_subscription_name text,
+    p_slot_name text,
+    p_origin_name text,
+    p_repsets text[] DEFAULT NULL,
+    p_connect_timeout_seconds int DEFAULT 10,
+    p_statement_timeout_ms int DEFAULT 600000,
+    p_lock_timeout_ms int DEFAULT 30000
+)
+RETURNS pgl_validate.fence_attempt
+LANGUAGE plpgsql
+VOLATILE
+AS $$
+DECLARE
+    target_lsn pg_lsn;
+    confirmed_flush_lsn pg_lsn;
+    result_row pgl_validate.fence_attempt;
+BEGIN
+    IF p_run_id IS NULL THEN
+        RAISE EXCEPTION 'run_id is required';
+    END IF;
+    IF p_epoch_seq IS NULL THEN
+        RAISE EXCEPTION 'epoch_seq is required';
+    END IF;
+    IF p_edge_id IS NULL THEN
+        RAISE EXCEPTION 'edge_id is required';
+    END IF;
+    IF p_provider_node IS NULL OR p_target_node IS NULL THEN
+        RAISE EXCEPTION 'provider_node and target_node are required';
+    END IF;
+    IF p_provider_dsn IS NULL THEN
+        RAISE EXCEPTION 'provider_dsn is required';
+    END IF;
+    IF p_slot_name IS NULL THEN
+        RAISE EXCEPTION 'slot_name is required';
+    END IF;
+    IF p_origin_name IS NULL THEN
+        RAISE EXCEPTION 'origin_name is required';
+    END IF;
+
+    INSERT INTO pgl_validate.run_edge(
+        run_id, edge_id, provider_node, target_node, backend,
+        subscription, slot_name, origin_name, repsets
+    )
+    VALUES (
+        p_run_id, p_edge_id, p_provider_node, p_target_node, 'pglogical',
+        p_subscription_name, p_slot_name, p_origin_name, p_repsets
+    )
+    ON CONFLICT (run_id, edge_id) DO UPDATE
+    SET provider_node = EXCLUDED.provider_node,
+        target_node = EXCLUDED.target_node,
+        backend = 'pglogical',
+        subscription = EXCLUDED.subscription,
+        slot_name = EXCLUDED.slot_name,
+        origin_name = EXCLUDED.origin_name,
+        repsets = EXCLUDED.repsets;
+
+    SELECT pgl_validate.remote_current_wal_lsn(
+        p_provider_dsn,
+        p_connect_timeout_seconds,
+        p_statement_timeout_ms,
+        p_lock_timeout_ms
+    )
+    INTO target_lsn;
+
+    SELECT pgl_validate.remote_wait_slot_confirm_lsn(
+        p_provider_dsn,
+        p_slot_name,
+        target_lsn,
+        p_connect_timeout_seconds,
+        p_statement_timeout_ms,
+        p_lock_timeout_ms
+    )
+    INTO confirmed_flush_lsn;
+
+    IF confirmed_flush_lsn < target_lsn THEN
+        RAISE EXCEPTION
+            'slot % confirmed_flush_lsn % is behind degraded target_lsn %',
+            p_slot_name,
+            confirmed_flush_lsn,
+            target_lsn;
+    END IF;
+
+    INSERT INTO pgl_validate.fence_epoch(run_id, epoch_seq)
+    VALUES (p_run_id, p_epoch_seq)
+    ON CONFLICT DO NOTHING;
+
+    INSERT INTO pgl_validate.fence_edge(
+        run_id, epoch_seq, edge_id, fence_kind, barrier_token, barrier_end_lsn
+    )
+    VALUES (
+        p_run_id,
+        p_epoch_seq,
+        p_edge_id,
+        'degraded',
+        NULL,
+        target_lsn
+    )
+    ON CONFLICT (run_id, epoch_seq, edge_id) DO UPDATE
+    SET fence_kind = 'degraded',
+        barrier_token = NULL,
+        barrier_end_lsn = EXCLUDED.barrier_end_lsn;
+
+    SELECT *
+    INTO result_row
+    FROM pgl_validate.record_fence_attempt(
+        p_run_id,
+        p_epoch_seq,
+        p_edge_id,
+        target_lsn,
+        NULL,
+        false,
+        confirmed_flush_lsn,
+        'degraded'
+    );
+
+    RETURN result_row;
+END
+$$;
+
 -- Fence one primary->physical-standby edge by capturing a primary WAL LSN and
 -- polling the target until physical replay has reached that cut.
 CREATE FUNCTION pgl_validate.fence_standby_edge(
@@ -2018,6 +2147,11 @@ DECLARE
         NULLIF(current_setting('pgl_validate.allow_approximate_filters', true), '')::boolean,
         false
     );
+    allow_degraded_fence boolean := COALESCE(
+        (NULLIF(options->>'allow_degraded_fence', ''))::boolean,
+        NULLIF(current_setting('pgl_validate.allow_degraded_fence', true), '')::boolean,
+        false
+    );
     approximate_filter_mode boolean := false;
     sync_status "char" := 'r';
     validated_property text := 'full';
@@ -2034,6 +2168,7 @@ DECLARE
     fence_poll_interval_ms int;
     on_fence_timeout text;
     partial_mode boolean := false;
+    degraded_mode boolean := false;
     skipped_peers text[] := ARRAY[]::text[];
     edge_seq int := 0;
     current_edge_ids int[] := ARRAY[]::int[];
@@ -2638,7 +2773,7 @@ BEGIN
         WHERE pgl_validate.run.run_id = v_run_id;
 
         FOR peer_rec IN
-            SELECT p.name, p.dsn, p.backend, p.subscription_name,
+            SELECT p.name, p.dsn, p.backend, p.subscription_name, p.replication_sets,
                    p.connect_timeout_seconds,
                    p.statement_timeout_ms,
                    p.lock_timeout_ms
@@ -2675,11 +2810,45 @@ BEGIN
                 END IF;
 
                 IF NOT (subscription_rec.replication_sets_json::jsonb ? 'pgl_validate_barrier') THEN
-                    RAISE EXCEPTION
-                        'pglogical peer % subscription % does not include pgl_validate_barrier',
+                    IF NOT allow_degraded_fence THEN
+                        RAISE EXCEPTION
+                            'pglogical peer % subscription % does not include pgl_validate_barrier',
+                            peer_rec.name,
+                            peer_rec.subscription_name
+                            USING ERRCODE = '0A000';
+                    END IF;
+
+                    edge_seq := edge_seq + 1;
+                    current_edge_ids := current_edge_ids || edge_seq;
+                    degraded_mode := true;
+
+                    SELECT *
+                    INTO fence_rec
+                    FROM pgl_validate.fence_pglogical_degraded_edge(
+                        v_run_id,
+                        initial_epoch,
+                        edge_seq,
+                        provider_node,
                         peer_rec.name,
-                        peer_rec.subscription_name
-                        USING ERRCODE = '0A000';
+                        provider_dsn,
+                        peer_rec.subscription_name::text,
+                        subscription_rec.slot_name,
+                        subscription_rec.slot_name,
+                        peer_rec.replication_sets,
+                        peer_rec.connect_timeout_seconds,
+                        peer_rec.statement_timeout_ms,
+                        peer_rec.lock_timeout_ms
+                    );
+
+                    IF fence_rec.status <> 'degraded' THEN
+                        RAISE EXCEPTION
+                            'pglogical peer % failed to record degraded fence: %',
+                            peer_rec.name,
+                            fence_rec.status
+                            USING ERRCODE = '57014';
+                    END IF;
+
+                    CONTINUE;
                 END IF;
 
                 edge_seq := edge_seq + 1;
@@ -3134,6 +3303,7 @@ BEGIN
     END IF;
 
     IF differ_count > 0
+       AND NOT degraded_mode
        AND key_cols IS NOT NULL
        AND cardinality(key_cols) > 0 THEN
         INSERT INTO pgl_validate.fence_epoch(run_id, epoch_seq)
@@ -3676,6 +3846,14 @@ BEGIN
             advisory_count,
             validated_property
         );
+    END IF;
+
+    IF degraded_mode THEN
+        result_reason := format(
+            '%s; one or more pglogical edges used allow_degraded_fence and are not exact',
+            result_reason
+        );
+        verdict := 'degraded';
     END IF;
 
     IF partial_mode THEN

@@ -362,6 +362,20 @@ pub(crate) fn inject_barrier(
     })
 }
 
+/// Fetch the provider's current WAL insert LSN for degraded fencing.
+pub(crate) fn fetch_current_wal_lsn(
+    dsn: &str,
+    connect_timeout_seconds: i32,
+    statement_timeout_ms: i32,
+    lock_timeout_ms: i32,
+) -> Result<u64, String> {
+    let conn = Connection::connect_with_timeout(dsn, connect_timeout_seconds)?;
+    conn.set_query_timeouts(statement_timeout_ms, lock_timeout_ms)?;
+
+    let result = conn.exec("SELECT pg_current_wal_lsn()::text")?;
+    parse_lsn(&result.single_value()?)
+}
+
 /// Wait for pglogical to confirm that a provider slot has flushed a barrier.
 pub(crate) fn wait_slot_confirm_lsn(
     dsn: &str,
