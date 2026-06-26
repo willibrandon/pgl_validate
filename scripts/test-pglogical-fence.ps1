@@ -640,6 +640,30 @@ FROM pgl_validate.compare_sequence(
 
     Write-Step 'Creating subscriber-side drift and applying audited pglogical repair'
     Invoke-Sql -Database 'target' -Sql "UPDATE public.accounts SET value = 'target-drift' WHERE id = 1" | Out-Null
+    Invoke-Sql -Database 'target' -Sql @"
+SELECT pglogical.conflict_history_ensure_partition(CURRENT_DATE);
+INSERT INTO pglogical.conflict_history(
+    sub_id, sub_name, conflict_type, resolution,
+    schema_name, table_name, index_name,
+    local_tuple, remote_tuple,
+    remote_origin, remote_commit_ts, remote_commit_lsn
+)
+SELECT
+    s.sub_id,
+    s.sub_name,
+    'update_update',
+    'keep_local',
+    'public',
+    'accounts',
+    'accounts_pkey',
+    '{"id": 1, "value": "target-drift"}'::jsonb,
+    '{"id": 1, "value": "same"}'::jsonb,
+    1,
+    now(),
+    pg_current_wal_lsn()
+FROM pglogical.subscription AS s
+WHERE s.sub_name = 'sub';
+"@ | Out-Null
     $repairableDriftResult = Invoke-Sql -Database 'provider' -Sql @"
 SELECT run_id::text || ';' || verdict
 FROM pgl_validate.compare_table(
@@ -662,6 +686,31 @@ FROM pgl_validate.compare_table(
     $repairableDriftVerdict = $repairableDriftParts[1]
     if ($repairableDriftVerdict -ne 'differ') {
         throw "unexpected repairable drift compare_table verdict: $repairableDriftVerdict"
+    }
+
+    $conflictEvidence = Invoke-Sql -Database 'provider' -Sql @"
+SELECT count(*)::text || ';' ||
+       COALESCE(min(conflict_type), '<none>') || ';' ||
+       COALESCE(min(resolution), '<none>') || ';' ||
+       COALESCE(bool_or('local_tuple_key' = ANY(matched_on))::text, 'false') || ';' ||
+       COALESCE(bool_or('remote_tuple_key' = ANY(matched_on))::text, 'false')
+FROM pgl_validate.conflict_evidence($repairableDriftRunId)
+WHERE node = 'target'
+"@
+    if ($conflictEvidence -ne '1;update_update;keep_local;true;true') {
+        throw "unexpected pglogical conflict-history evidence: $conflictEvidence"
+    }
+
+    $reportConflictEvidence = Invoke-Sql -Database 'provider' -Sql @"
+SELECT (jsonb_array_length(
+    pgl_validate.report($repairableDriftRunId)
+        -> 'tables' -> 0
+        -> 'divergences' -> 0
+        -> 'conflict_evidence'
+) = 1)::text
+"@
+    if ($reportConflictEvidence -ne 'true') {
+        throw "pglogical conflict-history evidence was not included in report()"
     }
 
     $repairResult = Invoke-Sql -Database 'provider' -Sql @"

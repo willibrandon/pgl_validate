@@ -236,6 +236,40 @@ CREATE TABLE pgl_validate.divergence_recheck (
         ON DELETE CASCADE
 );
 
+CREATE TABLE pgl_validate.conflict_evidence (
+    run_id               bigint NOT NULL,
+    schema_name          text NOT NULL,
+    table_name           text NOT NULL,
+    key_bytes            bytea NOT NULL,
+    node                 text NOT NULL,
+    source               text NOT NULL DEFAULT 'pglogical_conflict_history'
+                         CHECK (source IN ('pglogical_conflict_history')),
+    conflict_id          bigint NOT NULL,
+    recorded_at          timestamptz NOT NULL,
+    subscription_name    text,
+    conflict_type        text NOT NULL,
+    resolution           text NOT NULL,
+    index_name           text,
+    local_tuple          jsonb,
+    local_xid            text,
+    local_origin         integer,
+    local_commit_ts      timestamptz,
+    remote_tuple         jsonb,
+    remote_origin        integer NOT NULL,
+    remote_commit_ts     timestamptz NOT NULL,
+    remote_commit_lsn    pg_lsn NOT NULL,
+    has_before_triggers  boolean NOT NULL,
+    matched_on           text[] NOT NULL DEFAULT ARRAY[]::text[],
+    observed_at          timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (
+        run_id, schema_name, table_name, key_bytes, node,
+        source, recorded_at, conflict_id
+    ),
+    FOREIGN KEY (run_id, schema_name, table_name, key_bytes, node)
+        REFERENCES pgl_validate.divergence(run_id, schema_name, table_name, key_bytes, node)
+        ON DELETE CASCADE
+);
+
 CREATE TABLE pgl_validate.sequence_result (
     run_id                bigint NOT NULL REFERENCES pgl_validate.run(run_id) ON DELETE CASCADE,
     schema_name           text NOT NULL,
@@ -1208,6 +1242,9 @@ DECLARE
     verdict text;
     result_reason text;
     result_row pgl_validate.table_result;
+    correlate_conflict_history boolean := COALESCE((options->>'correlate_conflict_history')::boolean, true);
+    conflict_history_lookback interval := COALESCE((NULLIF(options->>'conflict_history_lookback', ''))::interval, interval '24 hours');
+    conflict_history_max_rows int := COALESCE((NULLIF(options->>'conflict_history_max_rows', ''))::int, 1000);
 BEGIN
     SELECT n.nspname, c.relname
     INTO v_schema_name, v_rel_name
@@ -1892,6 +1929,29 @@ BEGIN
         WHERE d.run_id = v_run_id
           AND d.schema_name = v_schema_name
           AND d.table_name = v_rel_name;
+
+        IF correlate_conflict_history AND confirmed_count > 0 THEN
+            BEGIN
+                PERFORM pgl_validate.correlate_conflict_history(
+                    v_run_id,
+                    conflict_history_lookback,
+                    conflict_history_max_rows
+                );
+            EXCEPTION WHEN others THEN
+                INSERT INTO pgl_validate.schema_issue(
+                    run_id, node, schema_name, table_name, issue_code, detail
+                )
+                VALUES (
+                    v_run_id,
+                    provider_node,
+                    v_schema_name,
+                    v_rel_name,
+                    'CONFLICT_HISTORY_UNAVAILABLE',
+                    SQLERRM
+                )
+                ON CONFLICT DO NOTHING;
+            END;
+        END IF;
     END IF;
 
     IF differ_count = 0 THEN
@@ -2285,6 +2345,155 @@ BEGIN
     FROM pgl_validate.sequence_result sr
     WHERE sr.run_id = v_run_id
     ORDER BY sr.schema_name, sr.seq_name, sr.subscriber_node;
+END
+$$;
+
+CREATE FUNCTION pgl_validate.correlate_conflict_history(
+    p_run_id bigint,
+    lookback interval DEFAULT interval '24 hours',
+    max_rows_per_peer int DEFAULT 1000
+)
+RETURNS integer
+LANGUAGE plpgsql
+VOLATILE
+AS $$
+DECLARE
+    run_rec pgl_validate.run%ROWTYPE;
+    peer_rec record;
+    table_rec record;
+    since_text text;
+    affected int;
+    total_affected int := 0;
+BEGIN
+    IF lookback IS NULL OR lookback < interval '0 seconds' THEN
+        RAISE EXCEPTION 'lookback must be a non-negative interval'
+            USING ERRCODE = '22023';
+    END IF;
+
+    IF max_rows_per_peer IS NULL OR max_rows_per_peer <= 0 THEN
+        RAISE EXCEPTION 'max_rows_per_peer must be greater than zero'
+            USING ERRCODE = '22023';
+    END IF;
+
+    SELECT *
+    INTO run_rec
+    FROM pgl_validate.run r
+    WHERE r.run_id = p_run_id;
+
+    IF run_rec.run_id IS NULL THEN
+        RAISE EXCEPTION 'validation run % does not exist', p_run_id
+            USING ERRCODE = '22023';
+    END IF;
+
+    since_text := (run_rec.started_at - lookback)::text;
+
+    FOR table_rec IN
+        SELECT DISTINCT d.schema_name, d.table_name
+        FROM pgl_validate.divergence d
+        WHERE d.run_id = p_run_id
+          AND d.status = 'confirmed'
+        ORDER BY d.schema_name, d.table_name
+    LOOP
+        FOR peer_rec IN
+            SELECT DISTINCT p.name, p.dsn, p.subscription_name,
+                   p.connect_timeout_seconds,
+                   p.statement_timeout_ms,
+                   p.lock_timeout_ms
+            FROM pgl_validate.divergence d
+            JOIN pgl_validate.peer p ON p.name = d.node
+            WHERE d.run_id = p_run_id
+              AND d.schema_name = table_rec.schema_name
+              AND d.table_name = table_rec.table_name
+              AND d.status = 'confirmed'
+              AND p.backend = 'pglogical'
+              AND p.subscription_name IS NOT NULL
+            ORDER BY p.name
+        LOOP
+            INSERT INTO pgl_validate.conflict_evidence(
+                run_id, schema_name, table_name, key_bytes, node,
+                conflict_id, recorded_at, subscription_name, conflict_type,
+                resolution, index_name, local_tuple, local_xid, local_origin,
+                local_commit_ts, remote_tuple, remote_origin, remote_commit_ts,
+                remote_commit_lsn, has_before_triggers, matched_on
+            )
+            SELECT
+                d.run_id,
+                d.schema_name,
+                d.table_name,
+                d.key_bytes,
+                d.node,
+                c.conflict_id,
+                c.recorded_at_text::timestamptz,
+                c.subscription_name,
+                c.conflict_type,
+                c.resolution,
+                c.index_name,
+                c.local_tuple_json::jsonb,
+                c.local_xid,
+                c.local_origin,
+                c.local_commit_ts_text::timestamptz,
+                c.remote_tuple_json::jsonb,
+                c.remote_origin,
+                c.remote_commit_ts_text::timestamptz,
+                c.remote_commit_lsn_text::pg_lsn,
+                c.has_before_triggers,
+                array_remove(ARRAY[
+                    CASE
+                        WHEN c.local_tuple_json IS NOT NULL
+                         AND c.local_tuple_json::jsonb @> d.key_text::jsonb
+                        THEN 'local_tuple_key'
+                    END,
+                    CASE
+                        WHEN c.remote_tuple_json IS NOT NULL
+                         AND c.remote_tuple_json::jsonb @> d.key_text::jsonb
+                        THEN 'remote_tuple_key'
+                    END
+                ]::text[], NULL)
+            FROM pgl_validate.divergence d
+            JOIN pgl_validate.remote_pglogical_conflict_history(
+                peer_rec.dsn,
+                peer_rec.subscription_name::text,
+                table_rec.schema_name,
+                table_rec.table_name,
+                since_text,
+                max_rows_per_peer,
+                peer_rec.connect_timeout_seconds,
+                peer_rec.statement_timeout_ms,
+                peer_rec.lock_timeout_ms
+            ) AS c
+              ON (c.local_tuple_json IS NOT NULL AND c.local_tuple_json::jsonb @> d.key_text::jsonb)
+              OR (c.remote_tuple_json IS NOT NULL AND c.remote_tuple_json::jsonb @> d.key_text::jsonb)
+            WHERE d.run_id = p_run_id
+              AND d.schema_name = table_rec.schema_name
+              AND d.table_name = table_rec.table_name
+              AND d.node = peer_rec.name
+              AND d.status = 'confirmed'
+            ON CONFLICT (
+                run_id, schema_name, table_name, key_bytes, node,
+                source, recorded_at, conflict_id
+            ) DO UPDATE
+            SET subscription_name = EXCLUDED.subscription_name,
+                conflict_type = EXCLUDED.conflict_type,
+                resolution = EXCLUDED.resolution,
+                index_name = EXCLUDED.index_name,
+                local_tuple = EXCLUDED.local_tuple,
+                local_xid = EXCLUDED.local_xid,
+                local_origin = EXCLUDED.local_origin,
+                local_commit_ts = EXCLUDED.local_commit_ts,
+                remote_tuple = EXCLUDED.remote_tuple,
+                remote_origin = EXCLUDED.remote_origin,
+                remote_commit_ts = EXCLUDED.remote_commit_ts,
+                remote_commit_lsn = EXCLUDED.remote_commit_lsn,
+                has_before_triggers = EXCLUDED.has_before_triggers,
+                matched_on = EXCLUDED.matched_on,
+                observed_at = now();
+
+            GET DIAGNOSTICS affected = ROW_COUNT;
+            total_affected := total_affected + affected;
+        END LOOP;
+    END LOOP;
+
+    RETURN total_affected;
 END
 $$;
 
@@ -3338,6 +3547,17 @@ AS $$
     SELECT d.* FROM pgl_validate.divergence d WHERE d.run_id = divergences.run_id
 $$;
 
+CREATE FUNCTION pgl_validate.conflict_evidence(run_id bigint)
+RETURNS SETOF pgl_validate.conflict_evidence
+LANGUAGE sql
+STABLE
+AS $$
+    SELECT ce.*
+    FROM pgl_validate.conflict_evidence ce
+    WHERE ce.run_id = conflict_evidence.run_id
+    ORDER BY ce.recorded_at DESC, ce.conflict_id DESC
+$$;
+
 CREATE FUNCTION pgl_validate.sequences(run_id bigint)
 RETURNS SETOF pgl_validate.sequence_result
 LANGUAGE sql
@@ -3418,6 +3638,19 @@ SELECT CASE
                                                       AND dr.table_name = d.table_name
                                                       AND dr.key_bytes = d.key_bytes
                                                       AND dr.node = d.node
+                                                ), '[]'::jsonb),
+                                            'conflict_evidence',
+                                                COALESCE((
+                                                    SELECT jsonb_agg(
+                                                        to_jsonb(ce)
+                                                        ORDER BY ce.recorded_at DESC, ce.conflict_id DESC
+                                                    )
+                                                    FROM pgl_validate.conflict_evidence ce
+                                                    WHERE ce.run_id = d.run_id
+                                                      AND ce.schema_name = d.schema_name
+                                                      AND ce.table_name = d.table_name
+                                                      AND ce.key_bytes = d.key_bytes
+                                                      AND ce.node = d.node
                                                 ), '[]'::jsonb)
                                         )
                                         ORDER BY d.detected_at, d.node, d.key_text

@@ -115,6 +115,41 @@ pub(crate) struct ForwardingSubscription {
     pub(crate) subscription_name: String,
 }
 
+/// pglogical conflict-history row fetched from a subscriber.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) struct ConflictHistoryRow {
+    /// Conflict row identifier within the subscriber partition.
+    pub(crate) conflict_id: i64,
+    /// Subscriber-side conflict recording timestamp as PostgreSQL text.
+    pub(crate) recorded_at: String,
+    /// Subscription name that observed the conflict.
+    pub(crate) subscription_name: Option<String>,
+    /// pglogical conflict type, such as `update_update`.
+    pub(crate) conflict_type: String,
+    /// pglogical conflict resolution, such as `keep_local`.
+    pub(crate) resolution: String,
+    /// Index name used for conflict detection.
+    pub(crate) index_name: Option<String>,
+    /// Local tuple JSON text, when pglogical captured it.
+    pub(crate) local_tuple_json: Option<String>,
+    /// Local transaction id text, when available.
+    pub(crate) local_xid: Option<String>,
+    /// Local tuple replication origin, when available.
+    pub(crate) local_origin: Option<i32>,
+    /// Local tuple commit timestamp text, when available.
+    pub(crate) local_commit_ts: Option<String>,
+    /// Remote tuple JSON text, when pglogical captured it.
+    pub(crate) remote_tuple_json: Option<String>,
+    /// Remote tuple replication origin.
+    pub(crate) remote_origin: i32,
+    /// Remote commit timestamp text.
+    pub(crate) remote_commit_ts: String,
+    /// Remote commit LSN.
+    pub(crate) remote_commit_lsn: u64,
+    /// Whether subscriber BEFORE triggers participated in the conflict.
+    pub(crate) has_before_triggers: bool,
+}
+
 struct Connection {
     raw: *mut PGconn,
 }
@@ -225,6 +260,14 @@ impl QueryResult {
         std::str::from_utf8(bytes)
             .map(str::to_owned)
             .map_err(|err| format!("remote result column {column} is not UTF-8: {err}"))
+    }
+
+    fn value_opt(&self, row: c_int, column: c_int) -> Result<Option<String>, String> {
+        if unsafe { PQgetisnull(self.raw, row, column) } != 0 {
+            return Ok(None);
+        }
+
+        self.value(row, column).map(Some)
     }
 
     fn single_value(&self) -> Result<String, String> {
@@ -466,6 +509,107 @@ pub(crate) fn fetch_forwarding_subscriptions(
     Ok(subscriptions)
 }
 
+/// Fetch pglogical conflict-history rows for one subscription and relation.
+pub(crate) fn fetch_conflict_history(
+    dsn: &str,
+    subscription_name: &str,
+    schema_name: &str,
+    table_name: &str,
+    since: &str,
+    max_rows: i32,
+    connect_timeout_seconds: i32,
+    statement_timeout_ms: i32,
+    lock_timeout_ms: i32,
+) -> Result<Vec<ConflictHistoryRow>, String> {
+    if max_rows <= 0 {
+        return Err("max_rows must be greater than zero".to_string());
+    }
+
+    let conn = Connection::connect_with_timeout(dsn, connect_timeout_seconds)?;
+    conn.set_query_timeouts(statement_timeout_ms, lock_timeout_ms)?;
+
+    let available = conn.exec("SELECT to_regclass('pglogical.conflict_history') IS NOT NULL")?;
+    if !parse_bool(&available.single_value()?)? {
+        return Ok(Vec::new());
+    }
+
+    let subscription_name = sql_literal(subscription_name);
+    let schema_name = sql_literal(schema_name);
+    let table_name = sql_literal(table_name);
+    let since = sql_literal(since);
+    let result = conn.exec(&format!(
+        "SELECT id::bigint::text, \
+                recorded_at::text, \
+                sub_name::text, \
+                conflict_type::text, \
+                resolution::text, \
+                index_name::text, \
+                local_tuple::text, \
+                local_xid::text, \
+                local_origin::int::text, \
+                local_commit_ts::text, \
+                remote_tuple::text, \
+                remote_origin::int::text, \
+                remote_commit_ts::text, \
+                remote_commit_lsn::text, \
+                has_before_triggers::text \
+         FROM pglogical.conflict_history \
+         WHERE sub_name = {subscription_name}::name \
+           AND schema_name = {schema_name}::name \
+           AND table_name = {table_name}::name \
+           AND recorded_at >= {since}::timestamptz \
+         ORDER BY recorded_at DESC, id DESC \
+         LIMIT {max_rows}"
+    ))?;
+    result.require_status(PGRES_TUPLES_OK)?;
+    if result.nfields() != 15 {
+        return Err(format!(
+            "expected 15 pglogical conflict-history columns, got {}",
+            result.nfields()
+        ));
+    }
+
+    let mut rows = Vec::with_capacity(result.ntuples() as usize);
+    for row in 0..result.ntuples() {
+        let conflict_id = result
+            .value(row, 0)?
+            .parse::<i64>()
+            .map_err(|err| format!("invalid pglogical conflict id: {err}"))?;
+        let local_origin = result
+            .value_opt(row, 8)?
+            .map(|value| {
+                value
+                    .parse::<i32>()
+                    .map_err(|err| format!("invalid pglogical local_origin: {err}"))
+            })
+            .transpose()?;
+        let remote_origin = result
+            .value(row, 11)?
+            .parse::<i32>()
+            .map_err(|err| format!("invalid pglogical remote_origin: {err}"))?;
+
+        rows.push(ConflictHistoryRow {
+            conflict_id,
+            recorded_at: result.value(row, 1)?,
+            subscription_name: result.value_opt(row, 2)?,
+            conflict_type: result.value(row, 3)?,
+            resolution: result.value(row, 4)?,
+            index_name: result.value_opt(row, 5)?,
+            local_tuple_json: result.value_opt(row, 6)?,
+            local_xid: result.value_opt(row, 7)?,
+            local_origin,
+            local_commit_ts: result.value_opt(row, 9)?,
+            remote_tuple_json: result.value_opt(row, 10)?,
+            remote_origin,
+            remote_commit_ts: result.value(row, 12)?,
+            remote_commit_lsn: parse_lsn(&result.value(row, 13)?)?,
+            has_before_triggers: parse_bool(&result.value(row, 14)?)?,
+        });
+    }
+
+    Ok(rows)
+}
+
 /// Run generated checksum SQL on a remote participant and return its digest.
 pub(crate) fn fetch_checksum(
     dsn: &str,
@@ -659,7 +803,8 @@ fn parse_lsn(input: &str) -> Result<u64, String> {
     Ok((high << 32) | low)
 }
 
-fn format_lsn(lsn: u64) -> String {
+/// Format a PostgreSQL LSN value using canonical hexadecimal text.
+pub(crate) fn format_lsn(lsn: u64) -> String {
     format!("{:X}/{:08X}", lsn >> 32, lsn & u32::MAX as u64)
 }
 

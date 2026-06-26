@@ -485,6 +485,110 @@ AS 'MODULE_PATHNAME', 'remote_pglogical_subscription_status_wrapper';
         )
     }
 
+    /// Fetch pglogical conflict-history rows from a remote subscriber.
+    #[pg_extern(
+        volatile,
+        parallel_unsafe,
+        sql = r#"
+CREATE FUNCTION pgl_validate.remote_pglogical_conflict_history(
+    dsn text,
+    subscription_name text,
+    schema_name text,
+    table_name text,
+    since_text text,
+    max_rows integer DEFAULT 1000,
+    connect_timeout_seconds integer DEFAULT 10,
+    statement_timeout_ms integer DEFAULT 600000,
+    lock_timeout_ms integer DEFAULT 30000
+)
+RETURNS TABLE (
+    conflict_id bigint,
+    recorded_at_text text,
+    subscription_name text,
+    conflict_type text,
+    resolution text,
+    index_name text,
+    local_tuple_json text,
+    local_xid text,
+    local_origin integer,
+    local_commit_ts_text text,
+    remote_tuple_json text,
+    remote_origin integer,
+    remote_commit_ts_text text,
+    remote_commit_lsn_text text,
+    has_before_triggers boolean
+)
+LANGUAGE c
+STRICT
+VOLATILE
+PARALLEL UNSAFE
+AS 'MODULE_PATHNAME', 'remote_pglogical_conflict_history_wrapper';
+"#
+    )]
+    fn remote_pglogical_conflict_history(
+        dsn: &str,
+        subscription_name: &str,
+        schema_name: &str,
+        table_name: &str,
+        since_text: &str,
+        max_rows: default!(i32, 1000),
+        connect_timeout_seconds: default!(i32, 10),
+        statement_timeout_ms: default!(i32, 600000),
+        lock_timeout_ms: default!(i32, 30000),
+    ) -> TableIterator<
+        'static,
+        (
+            name!(conflict_id, i64),
+            name!(recorded_at_text, String),
+            name!(subscription_name, Option<String>),
+            name!(conflict_type, String),
+            name!(resolution, String),
+            name!(index_name, Option<String>),
+            name!(local_tuple_json, Option<String>),
+            name!(local_xid, Option<String>),
+            name!(local_origin, Option<i32>),
+            name!(local_commit_ts_text, Option<String>),
+            name!(remote_tuple_json, Option<String>),
+            name!(remote_origin, i32),
+            name!(remote_commit_ts_text, String),
+            name!(remote_commit_lsn_text, String),
+            name!(has_before_triggers, bool),
+        ),
+    > {
+        let rows = transport::libpq::fetch_conflict_history(
+            dsn,
+            subscription_name,
+            schema_name,
+            table_name,
+            since_text,
+            max_rows,
+            connect_timeout_seconds,
+            statement_timeout_ms,
+            lock_timeout_ms,
+        )
+        .unwrap_or_else(|err| pgrx::error!("{err}"));
+
+        TableIterator::new(rows.into_iter().map(|row| {
+            (
+                row.conflict_id,
+                row.recorded_at,
+                row.subscription_name,
+                row.conflict_type,
+                row.resolution,
+                row.index_name,
+                row.local_tuple_json,
+                row.local_xid,
+                row.local_origin,
+                row.local_commit_ts,
+                row.remote_tuple_json,
+                row.remote_origin,
+                row.remote_commit_ts,
+                transport::libpq::format_lsn(row.remote_commit_lsn),
+                row.has_before_triggers,
+            )
+        }))
+    }
+
     #[pg_aggregate]
     impl Aggregate<lthash_state> for lthash_state {
         type State = PgVarlena<Self>;
@@ -2432,6 +2536,185 @@ mod tests {
         .unwrap();
         let ahead = Spi::get_one::<String>(&compare_sql).unwrap().unwrap();
         assert_eq!(ahead, "ahead_of_window;false");
+
+        let _ = crate::transport::libpq::execute_command(
+            &local_dsn,
+            &format!("DROP DATABASE IF EXISTS {peer_db} WITH (FORCE)"),
+        );
+    }
+
+    #[pg_test]
+    fn conflict_history_correlation_attaches_key_evidence() {
+        let backend_pid = Spi::get_one::<i32>("SELECT pg_backend_pid()")
+            .unwrap()
+            .unwrap();
+        let peer_db = identifier(&format!("pgl_validate_conflict_peer_{backend_pid}"));
+        let table_name = identifier(&format!("pgl_validate_conflict_{backend_pid}"));
+        let local_dsn = local_dsn();
+        let remote_dsn = peer_dsn(&peer_db);
+
+        let _ = crate::transport::libpq::execute_command(
+            &local_dsn,
+            &format!("DROP DATABASE IF EXISTS {peer_db} WITH (FORCE)"),
+        );
+        crate::transport::libpq::execute_command(&local_dsn, &format!("CREATE DATABASE {peer_db}"))
+            .unwrap();
+        crate::transport::libpq::execute_command(
+            &remote_dsn,
+            &format!(
+                "
+                CREATE SCHEMA pglogical;
+                CREATE TABLE pglogical.conflict_history (
+                    id bigserial,
+                    recorded_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+                    sub_id oid NOT NULL,
+                    sub_name name,
+                    conflict_type text NOT NULL,
+                    resolution text NOT NULL,
+                    schema_name name NOT NULL,
+                    table_name name NOT NULL,
+                    index_name name,
+                    local_tuple jsonb,
+                    local_xid xid,
+                    local_origin integer,
+                    local_commit_ts timestamptz,
+                    remote_tuple jsonb,
+                    remote_origin integer NOT NULL,
+                    remote_commit_ts timestamptz NOT NULL,
+                    remote_commit_lsn pg_lsn NOT NULL,
+                    has_before_triggers boolean NOT NULL DEFAULT false
+                );
+                INSERT INTO pglogical.conflict_history(
+                    recorded_at, sub_id, sub_name, conflict_type, resolution,
+                    schema_name, table_name, index_name, local_tuple, remote_tuple,
+                    remote_origin, remote_commit_ts, remote_commit_lsn
+                )
+                VALUES
+                    (
+                        now(), '1'::oid, 'sub', 'update_update', 'keep_local',
+                        'public', {table_name}, {index_name},
+                        '{{\"id\": 1, \"value\": \"local\"}}'::jsonb,
+                        '{{\"id\": 1, \"value\": \"remote\"}}'::jsonb,
+                        1, now(), '0/16B6C50'::pg_lsn
+                    ),
+                    (
+                        now(), '1'::oid, 'sub', 'update_update', 'keep_local',
+                        'public', {table_name}, {index_name},
+                        '{{\"id\": 2, \"value\": \"local\"}}'::jsonb,
+                        '{{\"id\": 2, \"value\": \"remote\"}}'::jsonb,
+                        1, now(), '0/16B6C60'::pg_lsn
+                    );
+                ",
+                table_name = sql_literal(&table_name),
+                index_name = sql_literal(&format!("{table_name}_pkey"))
+            ),
+        )
+        .unwrap();
+
+        Spi::run(&format!(
+            "
+            CREATE TABLE public.{table_name}(id int PRIMARY KEY, value text);
+            INSERT INTO pgl_validate.peer(name, dsn, backend, subscription_name)
+            VALUES ('target_history', {remote_dsn}, 'pglogical', 'sub');
+            ",
+            remote_dsn = sql_literal(&remote_dsn)
+        ))
+        .unwrap();
+
+        let fetched_conflicts = Spi::get_one::<i64>(&format!(
+            "
+            SELECT count(*)
+            FROM pgl_validate.remote_pglogical_conflict_history(
+                {remote_dsn},
+                'sub',
+                'public',
+                {table_name},
+                (now() - interval '24 hours')::text,
+                10
+            )
+            ",
+            remote_dsn = sql_literal(&remote_dsn),
+            table_name = sql_literal(&table_name)
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(fetched_conflicts, 2);
+
+        let run_id = Spi::get_one::<i64>(&format!(
+            "
+            WITH run AS (
+                INSERT INTO pgl_validate.run(status, started_at)
+                VALUES ('completed', now() - interval '1 hour')
+                RETURNING run_id
+            ), epoch AS (
+                INSERT INTO pgl_validate.fence_epoch(run_id, epoch_seq)
+                SELECT run_id, 1 FROM run
+                RETURNING run_id
+            ), plan AS (
+                INSERT INTO pgl_validate.table_plan(
+                    run_id, schema_name, table_name, key_cols, att_list,
+                    validated_property
+                )
+                SELECT run_id, 'public', {table_name}, ARRAY['id'], ARRAY['id','value'], 'full'
+                FROM run
+                RETURNING run_id
+            ), divergence AS (
+                INSERT INTO pgl_validate.divergence(
+                    run_id, schema_name, table_name, key_text, key_bytes,
+                    classification, node, status, detected_epoch, tuple
+                )
+                SELECT run_id, 'public', {table_name},
+                       '{{\"id\": 1}}',
+                       decode('01', 'hex'),
+                       'differs',
+                       'target_history',
+                       'confirmed',
+                       1,
+                       '{{\"local\": {{\"id\": 1, \"value\": \"local\"}},
+                          \"peer\": {{\"id\": 1, \"value\": \"remote\"}}}}'::jsonb
+                FROM run
+            )
+            SELECT run_id
+            FROM run
+            ",
+            table_name = sql_literal(&table_name)
+        ))
+        .unwrap()
+        .unwrap();
+        let evidence_count = Spi::get_one::<i64>(&format!(
+            "SELECT pgl_validate.correlate_conflict_history({run_id}, interval '24 hours', 10)::bigint"
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(evidence_count, 1);
+
+        let evidence = Spi::get_one::<String>(&format!(
+            "
+            SELECT count(*)::text || ';' ||
+                   min(conflict_type) || ';' ||
+                   min(resolution) || ';' ||
+                   bool_or('local_tuple_key' = ANY(matched_on))::text || ';' ||
+                   bool_or('remote_tuple_key' = ANY(matched_on))::text
+            FROM pgl_validate.conflict_evidence({run_id})
+            "
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(evidence, "1;update_update;keep_local;true;true");
+
+        let report_has_evidence = Spi::get_one::<bool>(&format!(
+            "
+            SELECT jsonb_array_length(
+                pgl_validate.report({run_id})
+                    -> 'tables' -> 0
+                    -> 'divergences' -> 0
+                    -> 'conflict_evidence'
+            ) = 1
+            "
+        ))
+        .unwrap()
+        .unwrap();
+        assert!(report_has_evidence);
 
         let _ = crate::transport::libpq::execute_command(
             &local_dsn,

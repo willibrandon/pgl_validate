@@ -33,6 +33,8 @@ COMMENT ON TABLE pgl_validate.divergence IS
     'Candidate and confirmed key-level divergences found during validation.';
 COMMENT ON TABLE pgl_validate.divergence_recheck IS
     'Digest-stability recheck history for a divergent key.';
+COMMENT ON TABLE pgl_validate.conflict_evidence IS
+    'Optional pglogical conflict-history evidence correlated to confirmed divergences.';
 COMMENT ON TABLE pgl_validate.sequence_result IS
     'Sequence validation result using pglogical sequence-window semantics.';
 COMMENT ON TABLE pgl_validate.schema_issue IS
@@ -93,10 +95,14 @@ COMMENT ON FUNCTION pgl_validate.generate_repair(bigint, text) IS
     'Generate reviewable node-labeled DML and sequence setval statements for confirmed divergences using the selected authoritative node.';
 COMMENT ON FUNCTION pgl_validate.apply_repair(bigint, text, text, text, text, boolean) IS
     'Apply target-labeled generated repair statements after explicit target confirmation, then run focused revalidation and record repair_run and repair_result audit rows.';
+COMMENT ON FUNCTION pgl_validate.correlate_conflict_history(bigint, interval, integer) IS
+    'Attach pglogical conflict-history rows to confirmed divergences when tuple JSON contains the divergent key.';
 COMMENT ON FUNCTION pgl_validate.run_status(bigint) IS
     'Return the persisted state for a validation run.';
 COMMENT ON FUNCTION pgl_validate.divergences(bigint) IS
     'Return persisted divergences for a validation run.';
+COMMENT ON FUNCTION pgl_validate.conflict_evidence(bigint) IS
+    'Return pglogical conflict-history evidence attached to a validation run.';
 COMMENT ON FUNCTION pgl_validate.sequences(bigint) IS
     'Return persisted sequence results for a validation run.';
 COMMENT ON FUNCTION pgl_validate.report(bigint) IS
@@ -138,6 +144,8 @@ COMMENT ON FUNCTION pgl_validate.remote_pglogical_subscription_status(text, text
     'Fetch pglogical subscription status from a remote target over libpq with bounded timeouts.';
 COMMENT ON FUNCTION pgl_validate.remote_pglogical_forwarding_subscriptions(text, text, integer, integer, integer) IS
     'Fetch enabled pglogical subscriptions on a remote subscriber that would forward all origins for the named provider node.';
+COMMENT ON FUNCTION pgl_validate.remote_pglogical_conflict_history(text, text, text, text, text, integer, integer, integer, integer) IS
+    'Fetch pglogical conflict-history rows for one remote subscription and relation, returning typed text fields for catalog-side casting.';
 COMMENT ON TYPE pgl_validate.lthash_state IS
     'Internal varlena state for the LtHash multiset accumulator.';
 COMMENT ON FUNCTION pgl_validate.lthash_state_in(cstring) IS

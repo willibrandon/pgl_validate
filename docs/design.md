@@ -615,6 +615,7 @@ State is persisted (typed, normalized, FK-linked) so runs are resumable and audi
 - `chunk_node_result` — per (chunk, node): `n_rows`, `lthash`.
 - `divergence` — per key: `classification (missing_on|extra_on|differs)`, `node`, `key_text`, `key_bytes`, `status (candidate|confirmed|cleared|indeterminate|advisory)`, detection epoch FK, optional `tuple jsonb` (capped). The `advisory` status carries the §9.4 filtered-table presence differences that the contract permits and that are therefore **never** promoted to `confirmed`.
 - `divergence_recheck` — per (divergence, epoch_seq): outcome.
+- `conflict_evidence` — optional pglogical conflict-history rows correlated to confirmed divergences by subscription, relation, time window, and tuple JSON containing the divergent key. This is explanatory evidence (`update_update` + `keep_local`, `skip`, etc.), never a source of validation truth.
 - `sequence_result` — per sequence: provider/subscriber `last_value`, `cache_size`, `within_contract boolean`, verdict.
 - `schema_issue` — per precondition failure (FKs).
 
@@ -707,7 +708,7 @@ Bounded per-chunk statements (`chunk_max_duration`, `statement_timeout_per_chunk
 
 ### 19.3 Observability
 
-Views: `runs`, `run_progress` (chunks done/total, ETA, bytes scanned, phase, current epoch), `table_results`, `chunk_results`, `divergences`, `sequence_results`, `schema_issues`. `report(run_id)` returns a complete structured JSON verdict (per-table contract + property validated, counts per node, confirmed keys, sequence windows, timing, resource stats) suitable for CI gates. `metrics()` exposes stable counters/gauges (runs by status, tables matched/differing, last successful validation per table, rows scanned, bytes transferred) for scraping. Phase transitions, per-epoch fence vectors, convergence waits, throttle events, and re-fences are logged with the run id via `log!`/`ereport!`.
+Reporting surfaces: `runs`, `run_progress` (chunks done/total, ETA, bytes scanned, phase, current epoch), `table_results`, `chunk_results`, `divergences`, `conflict_evidence`, `sequence_results`, `schema_issues`. `report(run_id)` returns a complete structured JSON verdict (per-table contract + property validated, counts per node, confirmed keys, correlated pglogical conflict evidence, sequence windows, timing, resource stats) suitable for CI gates. `metrics()` exposes stable counters/gauges (runs by status, tables matched/differing, last successful validation per table, rows scanned, bytes transferred) for scraping. Phase transitions, per-epoch fence vectors, convergence waits, throttle events, and re-fences are logged with the run id via `log!`/`ereport!`.
 
 ---
 
@@ -848,7 +849,7 @@ Each milestone is independently shippable and fully tested before the next (no d
 - **Incremental validation** — re-validate only key ranges whose `pg_xact_commit_timestamp` watermark advanced since the last clean run, for cheap continuous assurance (catalog already records per-chunk verdicts and epochs).
 - **Explicit sampling mode** — statistically-bounded partial validation for very large tables, with a *reported* confidence level (never silent scope reduction).
 - **Slot-peek fence** — derive an exact provider fence LSN from a logical slot peek instead of `pg_current_wal_lsn()`, if a future need arises.
-- **Conflict-history correlation** — cross-reference confirmed divergences with `pglogical.conflict_history` to explain *why* a key diverged.
+- **Conflict-history summaries** — conflict-history correlation is part of the catalog/API path; future work should add compact cause summaries and retention-policy controls for long-running fleets.
 
 ---
 
@@ -1099,6 +1100,40 @@ CREATE TABLE pgl_validate.divergence_recheck (
     outcome     text NOT NULL CHECK (outcome IN ('still_differs','cleared','still_hot')),
     at          timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (run_id, schema_name, table_name, key_bytes, node, epoch_seq),
+    FOREIGN KEY (run_id, schema_name, table_name, key_bytes, node)
+        REFERENCES pgl_validate.divergence(run_id, schema_name, table_name, key_bytes, node)
+        ON DELETE CASCADE
+);
+
+CREATE TABLE pgl_validate.conflict_evidence (
+    run_id               bigint NOT NULL,
+    schema_name          text NOT NULL,
+    table_name           text NOT NULL,
+    key_bytes            bytea NOT NULL,
+    node                 text NOT NULL,
+    source               text NOT NULL DEFAULT 'pglogical_conflict_history'
+                         CHECK (source IN ('pglogical_conflict_history')),
+    conflict_id          bigint NOT NULL,
+    recorded_at          timestamptz NOT NULL,
+    subscription_name    text,
+    conflict_type        text NOT NULL,
+    resolution           text NOT NULL,
+    index_name           text,
+    local_tuple          jsonb,
+    local_xid            text,
+    local_origin         integer,
+    local_commit_ts      timestamptz,
+    remote_tuple         jsonb,
+    remote_origin        integer NOT NULL,
+    remote_commit_ts     timestamptz NOT NULL,
+    remote_commit_lsn    pg_lsn NOT NULL,
+    has_before_triggers  boolean NOT NULL,
+    matched_on           text[] NOT NULL DEFAULT ARRAY[]::text[],
+    observed_at          timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (
+        run_id, schema_name, table_name, key_bytes, node,
+        source, recorded_at, conflict_id
+    ),
     FOREIGN KEY (run_id, schema_name, table_name, key_bytes, node)
         REFERENCES pgl_validate.divergence(run_id, schema_name, table_name, key_bytes, node)
         ON DELETE CASCADE

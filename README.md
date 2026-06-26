@@ -69,5 +69,6 @@ catalog DDL, row digest framing, LtHash state, pglogical contract discovery,
 edge-specific barrier fencing, pglogical row-filter intersection semantics,
 sequence-window validation, multi-table and replication-set compare
 orchestration, structured JSON reports, reviewable repair generation, audited
-repair application, run-control and retention APIs, and fenced paths exercised
-against a real pglogical subscription.
+repair application, conflict-history evidence correlation, run-control and
+retention APIs, and fenced paths exercised against a real pglogical
+subscription.
