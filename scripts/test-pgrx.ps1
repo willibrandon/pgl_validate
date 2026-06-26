@@ -5,7 +5,7 @@ param(
     [switch] $KeepData,
 
     [ValidateRange(1, 86400)]
-    [int] $TimeoutSeconds = 900,
+    [int] $TimeoutSeconds = 180,
 
     [Parameter(ValueFromRemainingArguments = $true)]
     [string[]] $CargoPgrxArgs = @()

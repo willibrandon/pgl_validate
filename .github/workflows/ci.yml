@@ -105,7 +105,7 @@ jobs:
       - name: Run pgrx pg_test suite
         env:
           PGL_VALIDATE_MSVC_ARCH: ${{ matrix.target.msvc_arch }}
-        run: ./scripts/pgrx-vs.ps1 pwsh -NoProfile -ExecutionPolicy Bypass -File ./scripts/test-pgrx.ps1 -PgMajor ${{ matrix.pg }} -TimeoutSeconds 1800
+        run: ./scripts/pgrx-vs.ps1 pwsh -NoProfile -ExecutionPolicy Bypass -File ./scripts/test-pgrx.ps1 -PgMajor ${{ matrix.pg }} -TimeoutSeconds 600
 
       - name: Run async worker smoke harness
         env:
@@ -198,7 +198,7 @@ jobs:
       - name: Run pglogical fence harness
         env:
           PGL_VALIDATE_MSVC_ARCH: ${{ matrix.target.msvc_arch }}
-        run: ./scripts/pgrx-vs.ps1 pwsh -NoProfile -ExecutionPolicy Bypass -File ./scripts/test-pglogical-fence.ps1 -PgMajor ${{ matrix.pg }} -TimeoutSeconds 900
+        run: ./scripts/pgrx-vs.ps1 pwsh -NoProfile -ExecutionPolicy Bypass -File ./scripts/test-pglogical-fence.ps1 -PgMajor ${{ matrix.pg }} -TimeoutSeconds 300
 
       - name: Clean test clusters
         if: always()
@@ -283,13 +283,13 @@ jobs:
         if: matrix.backend == 'native-logical'
         env:
           PGL_VALIDATE_MSVC_ARCH: ${{ matrix.target.msvc_arch }}
-        run: ./scripts/pgrx-vs.ps1 pwsh -NoProfile -ExecutionPolicy Bypass -File ./scripts/test-native-logical-fence.ps1 -PgMajor ${{ matrix.pg }} -TimeoutSeconds 900
+        run: ./scripts/pgrx-vs.ps1 pwsh -NoProfile -ExecutionPolicy Bypass -File ./scripts/test-native-logical-fence.ps1 -PgMajor ${{ matrix.pg }} -TimeoutSeconds 300
 
       - name: Run physical standby harness
         if: matrix.backend == 'physical-standby'
         env:
           PGL_VALIDATE_MSVC_ARCH: ${{ matrix.target.msvc_arch }}
-        run: ./scripts/pgrx-vs.ps1 pwsh -NoProfile -ExecutionPolicy Bypass -File ./scripts/test-physical-standby-fence.ps1 -PgMajor ${{ matrix.pg }} -TimeoutSeconds 900
+        run: ./scripts/pgrx-vs.ps1 pwsh -NoProfile -ExecutionPolicy Bypass -File ./scripts/test-physical-standby-fence.ps1 -PgMajor ${{ matrix.pg }} -TimeoutSeconds 300
 
       - name: Clean test clusters
         if: always()
