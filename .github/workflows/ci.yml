@@ -87,6 +87,7 @@ jobs:
             ~/.cargo/bin/cargo-pgrx*
             ~/.cargo/.crates.toml
             ~/.cargo/.crates2.json
+            ~/.pgrx
             target
           key: cargo-pgrx-pg${{ matrix.pg }}-${{ matrix.target.platform }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
@@ -180,6 +181,7 @@ jobs:
             ~/.cargo/bin/cargo-pgrx*
             ~/.cargo/.crates.toml
             ~/.cargo/.crates2.json
+            ~/.pgrx
             target
           key: cargo-pglogical-pg${{ matrix.pg }}-${{ matrix.target.platform }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
@@ -267,6 +269,7 @@ jobs:
             ~/.cargo/bin/cargo-pgrx*
             ~/.cargo/.crates.toml
             ~/.cargo/.crates2.json
+            ~/.pgrx
             target
           key: cargo-pglogical-mixed-pg15-pg18-${{ matrix.target.platform }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
@@ -356,6 +359,7 @@ jobs:
             ~/.cargo/bin/cargo-pgrx*
             ~/.cargo/.crates.toml
             ~/.cargo/.crates2.json
+            ~/.pgrx
             target
           key: cargo-${{ matrix.backend }}-pg${{ matrix.pg }}-${{ matrix.target.platform }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |

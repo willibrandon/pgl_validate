@@ -247,22 +247,7 @@ function Install-HomebrewFormula {
             continue
         }
 
-        Write-Host "+ brew install $formula"
-        $output = & $brew install $formula 2>&1
-        $exitCode = $LASTEXITCODE
-        foreach ($line in $output) {
-            $text = "$line"
-            if ($text -match '^Warning: postgresql@\d+ was installed but not linked because .+ already installed\. To link this version, run: brew link postgresql@\d+$') {
-                Write-Host "Homebrew did not link $formula; CI uses its explicit pg_config path."
-                continue
-            }
-
-            Write-Host $text
-        }
-
-        if ($exitCode -ne 0) {
-            throw "brew install $formula exited with code $exitCode."
-        }
+        Invoke-Logged -FilePath $brew -Arguments @('install', $formula)
     }
 }
 
@@ -404,31 +389,6 @@ function Remove-UntrustedHomebrewTaps {
     }
 }
 
-<#
-.SYNOPSIS
-Unlinks installed versioned PostgreSQL formulae so CI uses explicit pg_config paths instead of Homebrew's global links.
-#>
-function Disconnect-HomebrewPostgresLinks {
-    $brew = Get-PglCommandSource -Name 'brew'
-    if (-not $brew) {
-        return
-    }
-
-    foreach ($major in @(15, 16, 17, 18)) {
-        $formula = "postgresql@$major"
-        $installed = & $brew list --versions $formula 2>$null
-        if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace(($installed -join ''))) {
-            continue
-        }
-
-        Write-Host "+ brew unlink $formula"
-        & $brew unlink $formula
-        if ($LASTEXITCODE -ne 0) {
-            Write-Warning "Could not unlink $formula; continuing because pgrx uses the explicit pg_config path."
-        }
-    }
-}
-
 function Initialize-LinuxPostgres {
     $packages = @(
         'build-essential',
@@ -482,20 +442,27 @@ function Initialize-LinuxPostgres {
 
 function Initialize-MacPostgres {
     Remove-UntrustedHomebrewTaps
-    Disconnect-HomebrewPostgresLinks
-    Install-HomebrewFormula -Formulae @('llvm', 'pkg-config', "postgresql@$PgMajor")
+    Install-HomebrewFormula -Formulae @('llvm', 'icu4c', 'pkg-config')
 
     $llvmPrefix = (& brew --prefix llvm).Trim()
     $llvmBin = Join-Path $llvmPrefix 'bin'
     $libclangPath = Join-Path $llvmPrefix 'lib'
+    $icuPrefix = (& brew --prefix icu4c).Trim()
+    $icuPkgConfigPath = Join-Path (Join-Path $icuPrefix 'lib') 'pkgconfig'
     Add-GitHubPath -Path $llvmBin
     Add-GitHubEnv -Name 'LIBCLANG_PATH' -Value $libclangPath
+    $pkgConfigPath = if ($env:PKG_CONFIG_PATH) {
+        "$icuPkgConfigPath$([IO.Path]::PathSeparator)$env:PKG_CONFIG_PATH"
+    }
+    else {
+        $icuPkgConfigPath
+    }
+    Add-GitHubEnv -Name 'PKG_CONFIG_PATH' -Value $pkgConfigPath
 
-    $pgPrefix = (& brew --prefix "postgresql@$PgMajor").Trim()
-    $pgConfig = Join-Path (Join-Path $pgPrefix 'bin') 'pg_config'
+    Invoke-Logged -FilePath 'cargo' -Arguments @('pgrx', 'init', "--pg$PgMajor", 'download')
+    $pgConfig = Get-PglPgrxPgConfig -PgMajor $PgMajor
     Invoke-Logged -FilePath 'cargo' -Arguments @('pgrx', 'init', "--pg$PgMajor", $pgConfig)
     Enable-PostgresInstallWrites -PgConfig $pgConfig
-    Disconnect-HomebrewPostgresLinks
 }
 
 function Initialize-WindowsPostgres {
