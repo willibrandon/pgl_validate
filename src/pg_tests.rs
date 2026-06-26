@@ -1712,6 +1712,63 @@ mod tests {
     }
 
     #[pg_test]
+    fn remote_checksum_batch_runs_tasks_concurrently_when_parallelism_allows() {
+        let dsn = local_dsn();
+        let lock_key = 904_209_i64;
+
+        let concurrent_sql = format!(
+            "
+            SELECT n_rows
+            FROM pgl_validate.remote_checksum_batch(
+                jsonb_build_array(
+                    jsonb_build_object(
+                        'task_id', 1,
+                        'dsn', {dsn},
+                        'checksum_sql', format(
+                            'WITH held AS (SELECT pg_advisory_lock(%s) AS locked),
+                                  waited AS (SELECT pg_sleep(0.5) FROM held)
+                             SELECT 1::bigint AS n_rows, decode(''01'', ''hex'') AS lthash, NULL::bytea AS set_hash
+                             FROM waited',
+                            {lock_key}
+                        ),
+                        'connect_timeout_seconds', 10,
+                        'statement_timeout_ms', 600000,
+                        'lock_timeout_ms', 30000
+                    ),
+                    jsonb_build_object(
+                        'task_id', 2,
+                        'dsn', {dsn},
+                        'checksum_sql', format(
+                            'WITH waited AS (SELECT pg_sleep(0.1) AS slept),
+                                  probe AS (SELECT pg_try_advisory_lock(%s) AS got_lock FROM waited)
+                             SELECT CASE WHEN got_lock THEN 1 ELSE 2 END::bigint AS n_rows,
+                                    decode(''02'', ''hex'') AS lthash,
+                                    NULL::bytea AS set_hash
+                             FROM probe',
+                            {lock_key}
+                        ),
+                        'connect_timeout_seconds', 10,
+                        'statement_timeout_ms', 600000,
+                        'lock_timeout_ms', 30000
+                    )
+                ),
+                2
+            )
+            WHERE task_id = 2
+            ",
+            dsn = sql_literal(&dsn),
+            lock_key = lock_key
+        );
+
+        let concurrent_probe = Spi::get_one::<i64>(&concurrent_sql).unwrap().unwrap();
+        assert_eq!(concurrent_probe, 2);
+
+        let serial_sql = concurrent_sql.replace("                2\n            )", "                1\n            )");
+        let serial_probe = Spi::get_one::<i64>(&serial_sql).unwrap().unwrap();
+        assert_eq!(serial_probe, 1);
+    }
+
+    #[pg_test]
     fn remote_inject_barrier_returns_visible_token_and_lsn() {
         let dsn = local_dsn();
         let sql = format!(
