@@ -1932,6 +1932,7 @@ DECLARE
     child_chunk_id bigint;
     planned_chunk_count int := 0;
     chunk_differ_count int := 0;
+    range_target_rows int;
     checksum_sql text;
     remote_checksum_sql text;
     localize_sql text;
@@ -1952,6 +1953,7 @@ DECLARE
     result_row pgl_validate.table_result;
     paranoid_confirm boolean := COALESCE((options->>'paranoid_confirm')::boolean, false);
     chunk_target_rows int := COALESCE((NULLIF(options->>'chunk_target_rows', ''))::int, 50000);
+    localize_threshold int := COALESCE((NULLIF(options->>'localize_threshold', ''))::int, 1000);
     correlate_conflict_history boolean := COALESCE((options->>'correlate_conflict_history')::boolean, true);
     conflict_history_lookback interval := COALESCE((NULLIF(options->>'conflict_history_lookback', ''))::interval, interval '24 hours');
     conflict_history_max_rows int := COALESCE((NULLIF(options->>'conflict_history_max_rows', ''))::int, 1000);
@@ -1996,6 +1998,9 @@ BEGIN
     END IF;
     IF chunk_target_rows <= 0 THEN
         RAISE EXCEPTION 'chunk_target_rows must be greater than zero';
+    END IF;
+    IF localize_threshold <= 0 THEN
+        RAISE EXCEPTION 'localize_threshold must be greater than zero';
     END IF;
 
     IF peers IS NULL OR cardinality(peers) = 0 THEN
@@ -2494,9 +2499,14 @@ BEGIN
         END IF;
     END LOOP;
 
+    range_target_rows := CASE
+        WHEN differ_count > 0 THEN LEAST(chunk_target_rows, localize_threshold)
+        ELSE chunk_target_rows
+    END;
+
     IF key_cols IS NOT NULL
        AND cardinality(key_cols) > 0
-       AND n_rows > chunk_target_rows THEN
+       AND n_rows > range_target_rows THEN
         FOR range_rec IN
             SELECT *
             FROM pgl_validate.plan_key_ranges(
@@ -2504,7 +2514,7 @@ BEGIN
                 key_cols,
                 NULL,
                 NULL,
-                chunk_target_rows,
+                range_target_rows,
                 row_filter_sql
             )
             ORDER BY chunk_id
@@ -2632,23 +2642,6 @@ BEGIN
         VALUES (v_run_id, initial_epoch)
         ON CONFLICT DO NOTHING;
 
-        localize_sql := pgl_validate.plan_localize_sql(
-            p_table_name,
-            key_cols,
-            NULL,
-            NULL,
-            cols,
-            row_filter_sql
-        );
-        remote_localize_sql := pgl_validate.plan_localize_sql(
-            p_table_name,
-            key_cols,
-            NULL,
-            NULL,
-            cols,
-            NULL
-        );
-
         IF to_regclass('pg_temp.pgl_validate_localized_sample') IS NOT NULL THEN
             DROP TABLE pg_temp.pgl_validate_localized_sample;
         END IF;
@@ -2661,13 +2654,46 @@ BEGIN
             row_json   jsonb NOT NULL
         ) ON COMMIT DROP;
 
-        EXECUTE format(
-            'INSERT INTO pg_temp.pgl_validate_localized_sample(sample, node, key_text, key_bytes, row_digest, row_json)
-             SELECT %L, %L, q.key_text, q.key_bytes, q.row_digest, q.row_json::jsonb FROM (%s) AS q',
-            'A',
-            'local',
-            localize_sql
-        );
+        FOR range_rec IN
+            SELECT *
+            FROM (
+                SELECT 1::bigint AS chunk_id, NULL::bytea AS lo, NULL::bytea AS hi
+                WHERE planned_chunk_count = 0
+                   OR NOT EXISTS (
+                       SELECT 1
+                       FROM pgl_validate.chunk_result fallback_cr
+                       WHERE fallback_cr.run_id = v_run_id
+                         AND fallback_cr.schema_name = v_schema_name
+                         AND fallback_cr.table_name = v_rel_name
+                         AND fallback_cr.state = 'divergent'
+                   )
+                UNION ALL
+                SELECT cr.chunk_id, cr.lo, cr.hi
+                FROM pgl_validate.chunk_result cr
+                WHERE cr.run_id = v_run_id
+                  AND cr.schema_name = v_schema_name
+                  AND cr.table_name = v_rel_name
+                  AND cr.state = 'divergent'
+            ) localized_ranges
+            ORDER BY chunk_id
+        LOOP
+            localize_sql := pgl_validate.plan_localize_sql(
+                p_table_name,
+                key_cols,
+                range_rec.lo,
+                range_rec.hi,
+                cols,
+                row_filter_sql
+            );
+
+            EXECUTE format(
+                'INSERT INTO pg_temp.pgl_validate_localized_sample(sample, node, key_text, key_bytes, row_digest, row_json)
+                 SELECT %L, %L, q.key_text, q.key_bytes, q.row_digest, q.row_json::jsonb FROM (%s) AS q',
+                'A',
+                'local',
+                localize_sql
+            );
+        END LOOP;
 
         FOR peer_rec IN
             SELECT p.name, p.dsn, p.backend,
@@ -2678,17 +2704,50 @@ BEGIN
             WHERE p.name = ANY (peer_names)
             ORDER BY p.name
         LOOP
-            INSERT INTO pg_temp.pgl_validate_localized_sample(
-                sample, node, key_text, key_bytes, row_digest, row_json
-            )
-            SELECT 'A', peer_rec.name, r.key_text, r.key_bytes, r.row_digest, r.row_json::jsonb
-            FROM pgl_validate.remote_localize_rows(
-                peer_rec.dsn,
-                remote_localize_sql,
-                peer_rec.connect_timeout_seconds,
-                peer_rec.statement_timeout_ms,
-                peer_rec.lock_timeout_ms
-            ) AS r;
+            FOR range_rec IN
+                SELECT *
+                FROM (
+                    SELECT 1::bigint AS chunk_id, NULL::bytea AS lo, NULL::bytea AS hi
+                    WHERE planned_chunk_count = 0
+                       OR NOT EXISTS (
+                           SELECT 1
+                           FROM pgl_validate.chunk_result fallback_cr
+                           WHERE fallback_cr.run_id = v_run_id
+                             AND fallback_cr.schema_name = v_schema_name
+                             AND fallback_cr.table_name = v_rel_name
+                             AND fallback_cr.state = 'divergent'
+                       )
+                    UNION ALL
+                    SELECT cr.chunk_id, cr.lo, cr.hi
+                    FROM pgl_validate.chunk_result cr
+                    WHERE cr.run_id = v_run_id
+                      AND cr.schema_name = v_schema_name
+                      AND cr.table_name = v_rel_name
+                      AND cr.state = 'divergent'
+                ) localized_ranges
+                ORDER BY chunk_id
+            LOOP
+                remote_localize_sql := pgl_validate.plan_localize_sql(
+                    p_table_name,
+                    key_cols,
+                    range_rec.lo,
+                    range_rec.hi,
+                    cols,
+                    NULL
+                );
+
+                INSERT INTO pg_temp.pgl_validate_localized_sample(
+                    sample, node, key_text, key_bytes, row_digest, row_json
+                )
+                SELECT 'A', peer_rec.name, r.key_text, r.key_bytes, r.row_digest, r.row_json::jsonb
+                FROM pgl_validate.remote_localize_rows(
+                    peer_rec.dsn,
+                    remote_localize_sql,
+                    peer_rec.connect_timeout_seconds,
+                    peer_rec.statement_timeout_ms,
+                    peer_rec.lock_timeout_ms
+                ) AS r;
+            END LOOP;
 
             INSERT INTO pgl_validate.divergence(
                 run_id, schema_name, table_name, key_text, key_bytes,
@@ -2856,13 +2915,46 @@ BEGIN
                 END IF;
             END LOOP;
 
-            EXECUTE format(
-                'INSERT INTO pg_temp.pgl_validate_localized_sample(sample, node, key_text, key_bytes, row_digest, row_json)
-                 SELECT %L, %L, q.key_text, q.key_bytes, q.row_digest, q.row_json::jsonb FROM (%s) AS q',
-                'B',
-                'local',
-                localize_sql
-            );
+            FOR range_rec IN
+                SELECT *
+                FROM (
+                    SELECT 1::bigint AS chunk_id, NULL::bytea AS lo, NULL::bytea AS hi
+                    WHERE planned_chunk_count = 0
+                       OR NOT EXISTS (
+                           SELECT 1
+                           FROM pgl_validate.chunk_result fallback_cr
+                           WHERE fallback_cr.run_id = v_run_id
+                             AND fallback_cr.schema_name = v_schema_name
+                             AND fallback_cr.table_name = v_rel_name
+                             AND fallback_cr.state = 'divergent'
+                       )
+                    UNION ALL
+                    SELECT cr.chunk_id, cr.lo, cr.hi
+                    FROM pgl_validate.chunk_result cr
+                    WHERE cr.run_id = v_run_id
+                      AND cr.schema_name = v_schema_name
+                      AND cr.table_name = v_rel_name
+                      AND cr.state = 'divergent'
+                ) localized_ranges
+                ORDER BY chunk_id
+            LOOP
+                localize_sql := pgl_validate.plan_localize_sql(
+                    p_table_name,
+                    key_cols,
+                    range_rec.lo,
+                    range_rec.hi,
+                    cols,
+                    row_filter_sql
+                );
+
+                EXECUTE format(
+                    'INSERT INTO pg_temp.pgl_validate_localized_sample(sample, node, key_text, key_bytes, row_digest, row_json)
+                     SELECT %L, %L, q.key_text, q.key_bytes, q.row_digest, q.row_json::jsonb FROM (%s) AS q',
+                    'B',
+                    'local',
+                    localize_sql
+                );
+            END LOOP;
 
             FOR peer_rec IN
                 SELECT p.name, p.dsn, p.backend,
@@ -2874,17 +2966,50 @@ BEGIN
                   AND p.backend IN ('pglogical','standby')
                 ORDER BY p.name
             LOOP
-                INSERT INTO pg_temp.pgl_validate_localized_sample(
-                    sample, node, key_text, key_bytes, row_digest, row_json
-                )
-                SELECT 'B', peer_rec.name, r.key_text, r.key_bytes, r.row_digest, r.row_json::jsonb
-                FROM pgl_validate.remote_localize_rows(
-                    peer_rec.dsn,
-                    remote_localize_sql,
-                    peer_rec.connect_timeout_seconds,
-                    peer_rec.statement_timeout_ms,
-                    peer_rec.lock_timeout_ms
-                ) AS r;
+                FOR range_rec IN
+                    SELECT *
+                    FROM (
+                        SELECT 1::bigint AS chunk_id, NULL::bytea AS lo, NULL::bytea AS hi
+                        WHERE planned_chunk_count = 0
+                           OR NOT EXISTS (
+                               SELECT 1
+                               FROM pgl_validate.chunk_result fallback_cr
+                               WHERE fallback_cr.run_id = v_run_id
+                                 AND fallback_cr.schema_name = v_schema_name
+                                 AND fallback_cr.table_name = v_rel_name
+                                 AND fallback_cr.state = 'divergent'
+                           )
+                        UNION ALL
+                        SELECT cr.chunk_id, cr.lo, cr.hi
+                        FROM pgl_validate.chunk_result cr
+                        WHERE cr.run_id = v_run_id
+                          AND cr.schema_name = v_schema_name
+                          AND cr.table_name = v_rel_name
+                          AND cr.state = 'divergent'
+                    ) localized_ranges
+                    ORDER BY chunk_id
+                LOOP
+                    remote_localize_sql := pgl_validate.plan_localize_sql(
+                        p_table_name,
+                        key_cols,
+                        range_rec.lo,
+                        range_rec.hi,
+                        cols,
+                        NULL
+                    );
+
+                    INSERT INTO pg_temp.pgl_validate_localized_sample(
+                        sample, node, key_text, key_bytes, row_digest, row_json
+                    )
+                    SELECT 'B', peer_rec.name, r.key_text, r.key_bytes, r.row_digest, r.row_json::jsonb
+                    FROM pgl_validate.remote_localize_rows(
+                        peer_rec.dsn,
+                        remote_localize_sql,
+                        peer_rec.connect_timeout_seconds,
+                        peer_rec.statement_timeout_ms,
+                        peer_rec.lock_timeout_ms
+                    ) AS r;
+                END LOOP;
 
                 INSERT INTO pgl_validate.divergence_recheck(
                     run_id, schema_name, table_name, key_bytes, node, epoch_seq, outcome

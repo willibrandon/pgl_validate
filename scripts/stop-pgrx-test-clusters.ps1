@@ -205,3 +205,5 @@ if ($RemoveData) {
         }
     }
 }
+
+$global:LASTEXITCODE = 0

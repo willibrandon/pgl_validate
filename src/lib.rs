@@ -1145,6 +1145,92 @@ mod tests {
     }
 
     #[pg_test]
+    fn compare_table_localizes_only_divergent_key_ranges() {
+        let backend_pid = Spi::get_one::<i32>("SELECT pg_backend_pid()")
+            .unwrap()
+            .unwrap();
+        let peer_db = identifier(&format!("pgl_validate_range_peer_{backend_pid}"));
+        let table_name = identifier(&format!("range_diff_target_{backend_pid}"));
+        let local_dsn = local_dsn();
+        let remote_dsn = peer_dsn(&peer_db);
+
+        let _ = crate::transport::libpq::execute_command(
+            &local_dsn,
+            &format!("DROP DATABASE IF EXISTS {peer_db} WITH (FORCE)"),
+        );
+        crate::transport::libpq::execute_command(&local_dsn, &format!("CREATE DATABASE {peer_db}"))
+            .unwrap();
+        crate::transport::libpq::execute_command(
+            &remote_dsn,
+            &format!(
+                "CREATE EXTENSION pgl_validate;
+                 CREATE TABLE public.{table_name}(id int PRIMARY KEY, value text);
+                 INSERT INTO public.{table_name}
+                 SELECT g, CASE WHEN g = 4 THEN 'remote-diff' ELSE 'same-' || g::text END
+                 FROM generate_series(1, 5) AS g;"
+            ),
+        )
+        .unwrap();
+
+        Spi::run(&format!(
+            "
+            DELETE FROM pgl_validate.peer;
+            CREATE TABLE public.{table_name}(id int PRIMARY KEY, value text);
+            INSERT INTO public.{table_name}
+            SELECT g, 'same-' || g::text
+            FROM generate_series(1, 5) AS g;
+            INSERT INTO pgl_validate.peer(name, dsn, backend)
+            VALUES ('remote_range_diff', {remote_dsn}, 'native');
+            ",
+            remote_dsn = sql_literal(&remote_dsn)
+        ))
+        .unwrap();
+
+        let run_id = Spi::get_one::<i64>(&format!(
+            "
+            SELECT (pgl_validate.compare_table(
+                {table_name}::regclass,
+                ARRAY['remote_range_diff'],
+                '{{\"chunk_target_rows\":2,\"localize_threshold\":2}}'::jsonb
+            )).run_id
+            ",
+            table_name = sql_literal(&format!("public.{table_name}"))
+        ))
+        .unwrap()
+        .unwrap();
+
+        let chunk_states = Spi::get_one::<String>(&format!(
+            "
+            SELECT string_agg(chunk_id::text || ':' || state, ',' ORDER BY chunk_id)
+            FROM pgl_validate.chunk_result
+            WHERE run_id = {run_id}
+              AND table_name = {table_name}
+            ",
+            table_name = sql_literal(&table_name)
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(chunk_states, "1:split,2:clean,3:divergent,4:clean");
+
+        let divergence_keys = Spi::get_one::<String>(&format!(
+            "
+            SELECT string_agg(key_text || ':' || classification || ':' || status, ',' ORDER BY key_text)
+            FROM pgl_validate.divergence
+            WHERE run_id = {run_id}
+              AND node = 'remote_range_diff'
+            "
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(divergence_keys, "{\"id\": 4}:differs:confirmed");
+
+        let _ = crate::transport::libpq::execute_command(
+            &local_dsn,
+            &format!("DROP DATABASE IF EXISTS {peer_db} WITH (FORCE)"),
+        );
+    }
+
+    #[pg_test]
     fn comparison_key_cols_prefers_replica_identity_and_safe_unique_indexes() {
         let backend_pid = Spi::get_one::<i32>("SELECT pg_backend_pid()")
             .unwrap()

@@ -874,3 +874,5 @@ finally {
         Stop-ProcessTree -ProcessId $watchdog.Id
     }
 }
+
+$global:LASTEXITCODE = 0
