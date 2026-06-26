@@ -123,6 +123,21 @@ pub(crate) struct SubscriptionStatus {
     pub(crate) forward_origins_json: String,
 }
 
+/// Native logical subscription status fetched from a remote target node.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) struct NativeSubscriptionStatus {
+    /// Whether the subscription is enabled on the target.
+    pub(crate) enabled: bool,
+    /// Subscription OID on the target.
+    pub(crate) subid: i64,
+    /// Provider-side logical replication slot name, when the subscription uses one.
+    pub(crate) slot_name: Option<String>,
+    /// JSON text for the subscription publication array.
+    pub(crate) publications_json: String,
+    /// Replication-origin name used by core logical replication for this subscription.
+    pub(crate) origin_name: String,
+}
+
 /// pglogical subscription that would forward an origin-tagged repair.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub(crate) struct ForwardingSubscription {
@@ -408,6 +423,26 @@ pub(crate) fn wait_slot_confirm_lsn(
     })
 }
 
+/// Fetch a provider logical slot's current `confirmed_flush_lsn`.
+pub(crate) fn fetch_slot_confirmed_flush_lsn(
+    dsn: &str,
+    slot_name: &str,
+    connect_timeout_seconds: i32,
+    statement_timeout_ms: i32,
+    lock_timeout_ms: i32,
+) -> Result<u64, String> {
+    let conn = Connection::connect_with_timeout(dsn, connect_timeout_seconds)?;
+    conn.set_query_timeouts(statement_timeout_ms, lock_timeout_ms)?;
+
+    let slot = sql_literal(slot_name);
+    let result = conn.exec(&format!(
+        "SELECT COALESCE(confirmed_flush_lsn, '0/0'::pg_lsn)::text \
+         FROM pg_replication_slots \
+         WHERE slot_name = {slot}"
+    ))?;
+    parse_lsn(&result.single_value()?)
+}
+
 /// Observe target-side origin progress and token visibility for a barrier.
 pub(crate) fn observe_barrier(
     dsn: &str,
@@ -535,6 +570,50 @@ pub(crate) fn fetch_subscription_status(
         slot_name: result.value(0, 3)?,
         replication_sets_json: result.value(0, 4)?,
         forward_origins_json: result.value(0, 5)?,
+    })
+}
+
+/// Fetch native logical subscription status from a remote target node.
+pub(crate) fn fetch_native_subscription_status(
+    dsn: &str,
+    subscription_name: &str,
+    connect_timeout_seconds: i32,
+    statement_timeout_ms: i32,
+    lock_timeout_ms: i32,
+) -> Result<NativeSubscriptionStatus, String> {
+    let conn = Connection::connect_with_timeout(dsn, connect_timeout_seconds)?;
+    conn.set_query_timeouts(statement_timeout_ms, lock_timeout_ms)?;
+
+    let subscription_name = sql_literal(subscription_name);
+    let result = conn.exec(&format!(
+        "SELECT s.subenabled::text, \
+                s.oid::bigint::text, \
+                s.subslotname::text, \
+                COALESCE(to_json(s.subpublications)::text, '[]') AS publications_json, \
+                ('pg_' || s.oid::text) AS origin_name \
+         FROM pg_subscription s \
+         JOIN pg_database d ON d.oid = s.subdbid \
+         WHERE s.subname = {subscription_name}::name \
+           AND d.datname = current_database()"
+    ))?;
+    result.require_status(PGRES_TUPLES_OK)?;
+    if result.ntuples() != 1 || result.nfields() != 5 {
+        return Err(format!(
+            "expected one native subscription status row with 5 columns, got {} row(s) and {} column(s)",
+            result.ntuples(),
+            result.nfields()
+        ));
+    }
+
+    Ok(NativeSubscriptionStatus {
+        enabled: parse_bool(&result.value(0, 0)?)?,
+        subid: result
+            .value(0, 1)?
+            .parse::<i64>()
+            .map_err(|err| format!("invalid native subscription oid: {err}"))?,
+        slot_name: result.value_opt(0, 2)?,
+        publications_json: result.value(0, 3)?,
+        origin_name: result.value(0, 4)?,
     })
 }
 

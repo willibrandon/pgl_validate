@@ -908,6 +908,66 @@ BEGIN
 END
 $$;
 
+-- Ensure the native logical barrier publication exists on the current provider
+-- and publishes only INSERTs for the standalone barrier table.
+CREATE FUNCTION pgl_validate.ensure_native_barrier_publication(
+    p_publication text DEFAULT 'pgl_validate_barrier'
+)
+RETURNS void
+LANGUAGE plpgsql
+VOLATILE
+AS $$
+DECLARE
+    publication_rec record;
+    table_member boolean;
+BEGIN
+    IF p_publication IS NULL OR btrim(p_publication) = '' THEN
+        RAISE EXCEPTION 'publication name is required';
+    END IF;
+
+    SELECT p.*
+    INTO publication_rec
+    FROM pg_publication p
+    WHERE p.pubname = p_publication::name;
+
+    IF NOT FOUND THEN
+        EXECUTE format(
+            'CREATE PUBLICATION %I FOR TABLE pgl_validate.fence_barrier WITH (publish = %L)',
+            p_publication,
+            'insert'
+        );
+        RETURN;
+    END IF;
+
+    IF NOT (
+        publication_rec.pubinsert
+        AND NOT publication_rec.pubupdate
+        AND NOT publication_rec.pubdelete
+        AND NOT publication_rec.pubtruncate
+    ) THEN
+        RAISE EXCEPTION
+            'native publication % exists but is not insert-only',
+            p_publication;
+    END IF;
+
+    SELECT EXISTS (
+        SELECT 1
+        FROM pg_publication_tables pt
+        WHERE pt.pubname = p_publication
+          AND pt.schemaname = 'pgl_validate'
+          AND pt.tablename = 'fence_barrier'
+    )
+    INTO table_member;
+
+    IF NOT table_member THEN
+        EXECUTE format(
+            'ALTER PUBLICATION %I ADD TABLE pgl_validate.fence_barrier',
+            p_publication
+        );
+    END IF;
+END
+$$;
+
 -- Fence one pglogical provider->target edge by injecting a real replicated
 -- barrier, waiting for provider-side slot flush, then polling target-side
 -- origin progress and token visibility until convergence or timeout.
@@ -1063,6 +1123,177 @@ BEGIN
 END
 $$;
 
+-- Fence one native logical provider->target edge by injecting a replicated
+-- barrier, waiting for provider slot flush, then polling target-side core
+-- replication-origin progress and token visibility until convergence.
+CREATE FUNCTION pgl_validate.fence_native_edge(
+    p_run_id bigint,
+    p_epoch_seq int,
+    p_edge_id int,
+    p_provider_node text,
+    p_target_node text,
+    p_provider_dsn text,
+    p_target_dsn text,
+    p_subscription_name text,
+    p_slot_name text,
+    p_origin_name text,
+    p_publications text[] DEFAULT ARRAY['pgl_validate_barrier']::text[],
+    p_connect_timeout_seconds int DEFAULT 10,
+    p_statement_timeout_ms int DEFAULT 600000,
+    p_lock_timeout_ms int DEFAULT 30000,
+    p_fence_timeout_ms int DEFAULT 300000,
+    p_poll_interval_ms int DEFAULT 100
+)
+RETURNS pgl_validate.fence_attempt
+LANGUAGE plpgsql
+VOLATILE
+AS $$
+DECLARE
+    injection record;
+    confirmed_flush_lsn pg_lsn := '0/0'::pg_lsn;
+    observation record;
+    deadline timestamptz;
+    attempt_status text;
+    result_row pgl_validate.fence_attempt;
+BEGIN
+    IF p_run_id IS NULL THEN
+        RAISE EXCEPTION 'run_id is required';
+    END IF;
+    IF p_epoch_seq IS NULL THEN
+        RAISE EXCEPTION 'epoch_seq is required';
+    END IF;
+    IF p_edge_id IS NULL THEN
+        RAISE EXCEPTION 'edge_id is required';
+    END IF;
+    IF p_provider_node IS NULL OR p_target_node IS NULL THEN
+        RAISE EXCEPTION 'provider_node and target_node are required';
+    END IF;
+    IF p_provider_dsn IS NULL OR p_target_dsn IS NULL THEN
+        RAISE EXCEPTION 'provider_dsn and target_dsn are required';
+    END IF;
+    IF p_slot_name IS NULL THEN
+        RAISE EXCEPTION 'slot_name is required';
+    END IF;
+    IF p_origin_name IS NULL THEN
+        RAISE EXCEPTION 'origin_name is required';
+    END IF;
+    IF p_fence_timeout_ms <= 0 THEN
+        RAISE EXCEPTION 'fence_timeout_ms must be greater than zero';
+    END IF;
+    IF p_poll_interval_ms <= 0 THEN
+        RAISE EXCEPTION 'poll_interval_ms must be greater than zero';
+    END IF;
+
+    INSERT INTO pgl_validate.run_edge(
+        run_id, edge_id, provider_node, target_node, backend,
+        subscription, slot_name, origin_name, repsets
+    )
+    VALUES (
+        p_run_id, p_edge_id, p_provider_node, p_target_node, 'native',
+        p_subscription_name, p_slot_name, p_origin_name, p_publications
+    )
+    ON CONFLICT (run_id, edge_id) DO UPDATE
+    SET provider_node = EXCLUDED.provider_node,
+        target_node = EXCLUDED.target_node,
+        backend = 'native',
+        subscription = EXCLUDED.subscription,
+        slot_name = EXCLUDED.slot_name,
+        origin_name = EXCLUDED.origin_name,
+        repsets = EXCLUDED.repsets;
+
+    SELECT *
+    INTO injection
+    FROM pgl_validate.remote_inject_barrier(
+        p_provider_dsn,
+        p_connect_timeout_seconds,
+        p_statement_timeout_ms,
+        p_lock_timeout_ms
+    );
+
+    PERFORM pgl_validate.record_barrier_fence(
+        p_run_id,
+        p_epoch_seq,
+        p_edge_id,
+        injection.token,
+        p_provider_node,
+        injection.barrier_end_lsn
+    );
+
+    deadline := clock_timestamp() + make_interval(secs => p_fence_timeout_ms / 1000.0);
+    LOOP
+        SELECT pgl_validate.remote_slot_confirmed_flush_lsn(
+            p_provider_dsn,
+            p_slot_name,
+            p_connect_timeout_seconds,
+            p_statement_timeout_ms,
+            p_lock_timeout_ms
+        )
+        INTO confirmed_flush_lsn;
+
+        EXIT WHEN confirmed_flush_lsn >= injection.barrier_end_lsn;
+
+        IF clock_timestamp() >= deadline THEN
+            attempt_status := 'timeout';
+            EXIT;
+        END IF;
+
+        PERFORM pg_sleep(p_poll_interval_ms / 1000.0);
+    END LOOP;
+
+    SELECT *
+    INTO observation
+    FROM pgl_validate.remote_observe_barrier(
+        p_target_dsn,
+        p_origin_name,
+        injection.token,
+        injection.barrier_end_lsn,
+        p_connect_timeout_seconds,
+        p_statement_timeout_ms,
+        p_lock_timeout_ms
+    );
+
+    IF attempt_status IS DISTINCT FROM 'timeout' THEN
+        LOOP
+            EXIT WHEN observation.converged;
+
+            IF clock_timestamp() >= deadline THEN
+                attempt_status := 'timeout';
+                EXIT;
+            END IF;
+
+            PERFORM pg_sleep(p_poll_interval_ms / 1000.0);
+
+            SELECT *
+            INTO observation
+            FROM pgl_validate.remote_observe_barrier(
+                p_target_dsn,
+                p_origin_name,
+                injection.token,
+                injection.barrier_end_lsn,
+                p_connect_timeout_seconds,
+                p_statement_timeout_ms,
+                p_lock_timeout_ms
+            );
+        END LOOP;
+    END IF;
+
+    SELECT *
+    INTO result_row
+    FROM pgl_validate.record_fence_attempt(
+        p_run_id,
+        p_epoch_seq,
+        p_edge_id,
+        injection.barrier_end_lsn,
+        observation.origin_progress_lsn,
+        observation.token_visible,
+        confirmed_flush_lsn,
+        attempt_status
+    );
+
+    RETURN result_row;
+END
+$$;
+
 -- Record an explicit degraded pglogical fence for an edge that cannot carry the
 -- barrier table. This is never exact: it waits only for provider-side slot
 -- flush through a captured WAL LSN and persists status=degraded.
@@ -1154,6 +1385,151 @@ BEGIN
             confirmed_flush_lsn,
             target_lsn;
     END IF;
+
+    INSERT INTO pgl_validate.fence_epoch(run_id, epoch_seq)
+    VALUES (p_run_id, p_epoch_seq)
+    ON CONFLICT DO NOTHING;
+
+    INSERT INTO pgl_validate.fence_edge(
+        run_id, epoch_seq, edge_id, fence_kind, barrier_token, barrier_end_lsn
+    )
+    VALUES (
+        p_run_id,
+        p_epoch_seq,
+        p_edge_id,
+        'degraded',
+        NULL,
+        target_lsn
+    )
+    ON CONFLICT (run_id, epoch_seq, edge_id) DO UPDATE
+    SET fence_kind = 'degraded',
+        barrier_token = NULL,
+        barrier_end_lsn = EXCLUDED.barrier_end_lsn;
+
+    SELECT *
+    INTO result_row
+    FROM pgl_validate.record_fence_attempt(
+        p_run_id,
+        p_epoch_seq,
+        p_edge_id,
+        target_lsn,
+        NULL,
+        false,
+        confirmed_flush_lsn,
+        'degraded'
+    );
+
+    RETURN result_row;
+END
+$$;
+
+-- Record an explicit degraded native logical fence for an edge whose
+-- subscription cannot carry barrier tokens. This is never exact: only provider
+-- slot flush is known, so the persisted attempt is status=degraded.
+CREATE FUNCTION pgl_validate.fence_native_degraded_edge(
+    p_run_id bigint,
+    p_epoch_seq int,
+    p_edge_id int,
+    p_provider_node text,
+    p_target_node text,
+    p_provider_dsn text,
+    p_subscription_name text,
+    p_slot_name text,
+    p_origin_name text,
+    p_publications text[] DEFAULT NULL,
+    p_connect_timeout_seconds int DEFAULT 10,
+    p_statement_timeout_ms int DEFAULT 600000,
+    p_lock_timeout_ms int DEFAULT 30000,
+    p_fence_timeout_ms int DEFAULT 300000,
+    p_poll_interval_ms int DEFAULT 100
+)
+RETURNS pgl_validate.fence_attempt
+LANGUAGE plpgsql
+VOLATILE
+AS $$
+DECLARE
+    target_lsn pg_lsn;
+    confirmed_flush_lsn pg_lsn := '0/0'::pg_lsn;
+    deadline timestamptz;
+    result_row pgl_validate.fence_attempt;
+BEGIN
+    IF p_run_id IS NULL THEN
+        RAISE EXCEPTION 'run_id is required';
+    END IF;
+    IF p_epoch_seq IS NULL THEN
+        RAISE EXCEPTION 'epoch_seq is required';
+    END IF;
+    IF p_edge_id IS NULL THEN
+        RAISE EXCEPTION 'edge_id is required';
+    END IF;
+    IF p_provider_node IS NULL OR p_target_node IS NULL THEN
+        RAISE EXCEPTION 'provider_node and target_node are required';
+    END IF;
+    IF p_provider_dsn IS NULL THEN
+        RAISE EXCEPTION 'provider_dsn is required';
+    END IF;
+    IF p_slot_name IS NULL THEN
+        RAISE EXCEPTION 'slot_name is required';
+    END IF;
+    IF p_origin_name IS NULL THEN
+        RAISE EXCEPTION 'origin_name is required';
+    END IF;
+    IF p_fence_timeout_ms <= 0 THEN
+        RAISE EXCEPTION 'fence_timeout_ms must be greater than zero';
+    END IF;
+    IF p_poll_interval_ms <= 0 THEN
+        RAISE EXCEPTION 'poll_interval_ms must be greater than zero';
+    END IF;
+
+    INSERT INTO pgl_validate.run_edge(
+        run_id, edge_id, provider_node, target_node, backend,
+        subscription, slot_name, origin_name, repsets
+    )
+    VALUES (
+        p_run_id, p_edge_id, p_provider_node, p_target_node, 'native',
+        p_subscription_name, p_slot_name, p_origin_name, p_publications
+    )
+    ON CONFLICT (run_id, edge_id) DO UPDATE
+    SET provider_node = EXCLUDED.provider_node,
+        target_node = EXCLUDED.target_node,
+        backend = 'native',
+        subscription = EXCLUDED.subscription,
+        slot_name = EXCLUDED.slot_name,
+        origin_name = EXCLUDED.origin_name,
+        repsets = EXCLUDED.repsets;
+
+    SELECT pgl_validate.remote_current_wal_lsn(
+        p_provider_dsn,
+        p_connect_timeout_seconds,
+        p_statement_timeout_ms,
+        p_lock_timeout_ms
+    )
+    INTO target_lsn;
+
+    deadline := clock_timestamp() + make_interval(secs => p_fence_timeout_ms / 1000.0);
+    LOOP
+        SELECT pgl_validate.remote_slot_confirmed_flush_lsn(
+            p_provider_dsn,
+            p_slot_name,
+            p_connect_timeout_seconds,
+            p_statement_timeout_ms,
+            p_lock_timeout_ms
+        )
+        INTO confirmed_flush_lsn;
+
+        EXIT WHEN confirmed_flush_lsn >= target_lsn;
+
+        IF clock_timestamp() >= deadline THEN
+            RAISE EXCEPTION
+                'slot % confirmed_flush_lsn % is behind degraded native target_lsn %',
+                p_slot_name,
+                confirmed_flush_lsn,
+                target_lsn
+                USING ERRCODE = '57014';
+        END IF;
+
+        PERFORM pg_sleep(p_poll_interval_ms / 1000.0);
+    END LOOP;
 
     INSERT INTO pgl_validate.fence_epoch(run_id, epoch_seq)
     VALUES (p_run_id, p_epoch_seq)
@@ -2179,6 +2555,7 @@ DECLARE
     selected_peer_count int := 0;
     standby_peer_count int := 0;
     pglogical_peer_count int := 0;
+    native_subscription_peer_count int := 0;
     peer_rec record;
     remote_rec record;
     range_rec record;
@@ -2328,8 +2705,9 @@ BEGIN
 
     SELECT count(*),
            count(*) FILTER (WHERE p.backend = 'standby'),
-           count(*) FILTER (WHERE p.backend = 'pglogical')
-    INTO selected_peer_count, standby_peer_count, pglogical_peer_count
+           count(*) FILTER (WHERE p.backend = 'pglogical'),
+           count(*) FILTER (WHERE p.backend = 'native' AND p.subscription_name IS NOT NULL)
+    INTO selected_peer_count, standby_peer_count, pglogical_peer_count, native_subscription_peer_count
     FROM pgl_validate.peer p
     WHERE p.name = ANY (peer_names);
 
@@ -2941,6 +3319,178 @@ BEGIN
           AND node = 'local';
     END IF;
 
+    IF native_subscription_peer_count > 0 THEN
+        IF provider_dsn IS NULL THEN
+            RAISE EXCEPTION
+                'options.provider_dsn is required when comparing native logical subscription peers'
+                USING ERRCODE = '0A000';
+        END IF;
+
+        INSERT INTO pgl_validate.fence_epoch(run_id, epoch_seq)
+        VALUES (v_run_id, initial_epoch)
+        ON CONFLICT DO NOTHING;
+
+        UPDATE pgl_validate.run
+        SET status = 'fencing'
+        WHERE pgl_validate.run.run_id = v_run_id;
+
+        FOR peer_rec IN
+            SELECT p.name, p.dsn, p.backend, p.subscription_name, p.replication_sets,
+                   p.connect_timeout_seconds,
+                   p.statement_timeout_ms,
+                   p.lock_timeout_ms
+            FROM pgl_validate.peer p
+            WHERE p.name = ANY (peer_names)
+              AND p.backend = 'native'
+              AND p.subscription_name IS NOT NULL
+            ORDER BY p.name
+        LOOP
+            BEGIN
+                SELECT *
+                INTO subscription_rec
+                FROM pgl_validate.remote_native_subscription_status(
+                    peer_rec.dsn,
+                    peer_rec.subscription_name::text,
+                    peer_rec.connect_timeout_seconds,
+                    peer_rec.statement_timeout_ms,
+                    peer_rec.lock_timeout_ms
+                );
+
+                IF NOT subscription_rec.enabled THEN
+                    RAISE EXCEPTION
+                        'native peer % subscription % is disabled',
+                        peer_rec.name,
+                        peer_rec.subscription_name
+                        USING ERRCODE = '57014';
+                END IF;
+
+                IF subscription_rec.slot_name IS NULL THEN
+                    RAISE EXCEPTION
+                        'native peer % subscription % has no provider slot',
+                        peer_rec.name,
+                        peer_rec.subscription_name
+                        USING ERRCODE = '0A000';
+                END IF;
+
+                IF NOT (subscription_rec.publications_json::jsonb ? 'pgl_validate_barrier') THEN
+                    IF NOT allow_degraded_fence THEN
+                        RAISE EXCEPTION
+                            'native peer % subscription % does not include pgl_validate_barrier',
+                            peer_rec.name,
+                            peer_rec.subscription_name
+                            USING ERRCODE = '0A000';
+                    END IF;
+
+                    edge_seq := edge_seq + 1;
+                    current_edge_ids := current_edge_ids || edge_seq;
+                    degraded_mode := true;
+
+                    SELECT *
+                    INTO fence_rec
+                    FROM pgl_validate.fence_native_degraded_edge(
+                        v_run_id,
+                        initial_epoch,
+                        edge_seq,
+                        provider_node,
+                        peer_rec.name,
+                        provider_dsn,
+                        peer_rec.subscription_name::text,
+                        subscription_rec.slot_name,
+                        subscription_rec.origin_name,
+                        peer_rec.replication_sets,
+                        peer_rec.connect_timeout_seconds,
+                        peer_rec.statement_timeout_ms,
+                        peer_rec.lock_timeout_ms,
+                        fence_timeout_ms,
+                        fence_poll_interval_ms
+                    );
+
+                    IF fence_rec.status <> 'degraded' THEN
+                        RAISE EXCEPTION
+                            'native peer % failed to record degraded fence: %',
+                            peer_rec.name,
+                            fence_rec.status
+                            USING ERRCODE = '57014';
+                    END IF;
+
+                    CONTINUE;
+                END IF;
+
+                edge_seq := edge_seq + 1;
+                current_edge_ids := current_edge_ids || edge_seq;
+                SELECT *
+                INTO fence_rec
+                FROM pgl_validate.fence_native_edge(
+                    v_run_id,
+                    initial_epoch,
+                    edge_seq,
+                    provider_node,
+                    peer_rec.name,
+                    provider_dsn,
+                    peer_rec.dsn,
+                    peer_rec.subscription_name::text,
+                    subscription_rec.slot_name,
+                    subscription_rec.origin_name,
+                    ARRAY['pgl_validate_barrier'],
+                    peer_rec.connect_timeout_seconds,
+                    peer_rec.statement_timeout_ms,
+                    peer_rec.lock_timeout_ms,
+                    fence_timeout_ms,
+                    fence_poll_interval_ms
+                );
+
+                IF fence_rec.status <> 'converged' THEN
+                    RAISE EXCEPTION
+                        'native peer % failed to converge barrier fence: %',
+                        peer_rec.name,
+                        fence_rec.status
+                        USING ERRCODE = '57014';
+                END IF;
+            EXCEPTION WHEN others THEN
+                IF on_fence_timeout <> 'skip_peer' THEN
+                    RAISE;
+                END IF;
+
+                partial_mode := true;
+                skipped_peers := skipped_peers || peer_rec.name;
+                peer_names := array_remove(peer_names, peer_rec.name);
+
+                INSERT INTO pgl_validate.run_participant(
+                    run_id, node, role, backend, pg_version, dsn_ref, status
+                )
+                VALUES (
+                    v_run_id, peer_rec.name, 'participant', peer_rec.backend,
+                    0, peer_rec.name, 'unreachable'
+                )
+                ON CONFLICT (run_id, node) DO UPDATE
+                SET backend = EXCLUDED.backend,
+                    pg_version = EXCLUDED.pg_version,
+                    dsn_ref = EXCLUDED.dsn_ref,
+                    status = 'unreachable';
+
+                INSERT INTO pgl_validate.schema_issue(
+                    run_id, node, schema_name, table_name, issue_code, detail
+                )
+                VALUES (
+                    v_run_id,
+                    peer_rec.name,
+                    v_schema_name,
+                    v_rel_name,
+                    'PEER_SKIPPED',
+                    SQLERRM
+                )
+                ON CONFLICT DO NOTHING;
+
+                CONTINUE;
+            END;
+        END LOOP;
+
+        UPDATE pgl_validate.run_participant
+        SET status = 'converged'
+        WHERE pgl_validate.run_participant.run_id = v_run_id
+          AND node = 'local';
+    END IF;
+
     IF standby_peer_count > 0 THEN
         INSERT INTO pgl_validate.fence_epoch(run_id, epoch_seq)
         VALUES (v_run_id, initial_epoch)
@@ -3501,7 +4051,17 @@ BEGIN
                   AND d.schema_name = v_schema_name
                   AND d.table_name = v_rel_name
                   AND d.status = 'candidate'
-                  AND p.backend IN ('pglogical','standby')
+                  AND (
+                      p.backend IN ('pglogical','standby')
+                      OR EXISTS (
+                          SELECT 1
+                          FROM pgl_validate.run_edge re
+                          WHERE re.run_id = v_run_id
+                            AND re.target_node = d.node
+                            AND re.backend = 'native'
+                            AND re.edge_id = ANY (current_edge_ids)
+                      )
+                  )
             );
 
             recheck_epoch := initial_epoch + recheck_pass;
@@ -3556,6 +4116,54 @@ BEGIN
                 IF fence_rec.status <> 'converged' THEN
                     RAISE EXCEPTION
                         'pglogical peer % failed to converge recheck fence: %',
+                        peer_rec.name,
+                        fence_rec.status
+                        USING ERRCODE = '57014';
+                END IF;
+            END LOOP;
+
+            FOR peer_rec IN
+                SELECT p.name, p.dsn, p.backend, p.subscription_name,
+                       p.connect_timeout_seconds,
+                       p.statement_timeout_ms,
+                       p.lock_timeout_ms,
+                       re.edge_id,
+                       re.slot_name,
+                       re.origin_name
+                FROM pgl_validate.peer p
+                JOIN pgl_validate.run_edge re
+                  ON re.run_id = v_run_id
+                 AND re.target_node = p.name
+                 AND re.edge_id = ANY (current_edge_ids)
+                 AND re.backend = 'native'
+                WHERE p.name = ANY (peer_names)
+                  AND p.backend = 'native'
+                ORDER BY p.name
+            LOOP
+                SELECT *
+                INTO fence_rec
+                FROM pgl_validate.fence_native_edge(
+                    v_run_id,
+                    recheck_epoch,
+                    peer_rec.edge_id,
+                    provider_node,
+                    peer_rec.name,
+                    provider_dsn,
+                    peer_rec.dsn,
+                    peer_rec.subscription_name::text,
+                    peer_rec.slot_name,
+                    peer_rec.origin_name,
+                    ARRAY['pgl_validate_barrier'],
+                    peer_rec.connect_timeout_seconds,
+                    peer_rec.statement_timeout_ms,
+                    peer_rec.lock_timeout_ms,
+                    fence_timeout_ms,
+                    fence_poll_interval_ms
+                );
+
+                IF fence_rec.status <> 'converged' THEN
+                    RAISE EXCEPTION
+                        'native peer % failed to converge recheck fence: %',
                         peer_rec.name,
                         fence_rec.status
                         USING ERRCODE = '57014';
@@ -3654,7 +4262,17 @@ BEGIN
                        p.lock_timeout_ms
                 FROM pgl_validate.peer p
                 WHERE p.name = ANY (peer_names)
-                  AND p.backend IN ('pglogical','standby')
+                  AND (
+                      p.backend IN ('pglogical','standby')
+                      OR EXISTS (
+                          SELECT 1
+                          FROM pgl_validate.run_edge re
+                          WHERE re.run_id = v_run_id
+                            AND re.target_node = p.name
+                            AND re.backend = 'native'
+                            AND re.edge_id = ANY (current_edge_ids)
+                      )
+                  )
                 ORDER BY p.name
             LOOP
                 FOR range_rec IN
@@ -3768,6 +4386,14 @@ BEGIN
         FROM pgl_validate.peer p
         WHERE p.name = d.node
           AND p.backend NOT IN ('pglogical','standby')
+          AND NOT EXISTS (
+              SELECT 1
+              FROM pgl_validate.run_edge re
+              WHERE re.run_id = v_run_id
+                AND re.target_node = d.node
+                AND re.backend = 'native'
+                AND re.edge_id = ANY (current_edge_ids)
+          )
           AND d.run_id = v_run_id
           AND d.schema_name = v_schema_name
           AND d.table_name = v_rel_name

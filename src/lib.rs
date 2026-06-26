@@ -474,6 +474,45 @@ AS 'MODULE_PATHNAME', 'remote_wait_slot_confirm_lsn_wrapper';
         confirmation.confirmed_flush_lsn as i64
     }
 
+    /// Fetch a provider logical slot's current confirmed flush LSN.
+    #[pg_extern(
+        volatile,
+        parallel_unsafe,
+        sql = r#"
+CREATE FUNCTION pgl_validate.remote_slot_confirmed_flush_lsn(
+    dsn text,
+    slot_name text,
+    connect_timeout_seconds integer DEFAULT 10,
+    statement_timeout_ms integer DEFAULT 600000,
+    lock_timeout_ms integer DEFAULT 30000
+)
+RETURNS pg_lsn
+LANGUAGE c
+STRICT
+VOLATILE
+PARALLEL UNSAFE
+AS 'MODULE_PATHNAME', 'remote_slot_confirmed_flush_lsn_wrapper';
+"#
+    )]
+    fn remote_slot_confirmed_flush_lsn(
+        dsn: &str,
+        slot_name: &str,
+        connect_timeout_seconds: default!(i32, 10),
+        statement_timeout_ms: default!(i32, 600000),
+        lock_timeout_ms: default!(i32, 30000),
+    ) -> i64 {
+        let lsn = transport::libpq::fetch_slot_confirmed_flush_lsn(
+            dsn,
+            slot_name,
+            connect_timeout_seconds,
+            statement_timeout_ms,
+            lock_timeout_ms,
+        )
+        .unwrap_or_else(|err| pgrx::error!("{err}"));
+
+        lsn as i64
+    }
+
     /// Fetch a provider's current WAL LSN for an explicitly degraded fence.
     #[pg_extern(
         volatile,
@@ -686,6 +725,66 @@ AS 'MODULE_PATHNAME', 'remote_pglogical_subscription_status_wrapper';
             status.slot_name,
             status.replication_sets_json,
             status.forward_origins_json,
+        ))
+    }
+
+    /// Fetch native logical subscription status from a remote target node.
+    #[pg_extern(
+        volatile,
+        parallel_unsafe,
+        sql = r#"
+CREATE FUNCTION pgl_validate.remote_native_subscription_status(
+    dsn text,
+    subscription_name text,
+    connect_timeout_seconds integer DEFAULT 10,
+    statement_timeout_ms integer DEFAULT 600000,
+    lock_timeout_ms integer DEFAULT 30000
+)
+RETURNS TABLE (
+    enabled boolean,
+    subid bigint,
+    slot_name text,
+    publications_json text,
+    origin_name text
+)
+LANGUAGE c
+STRICT
+VOLATILE
+PARALLEL UNSAFE
+AS 'MODULE_PATHNAME', 'remote_native_subscription_status_wrapper';
+"#
+    )]
+    fn remote_native_subscription_status(
+        dsn: &str,
+        subscription_name: &str,
+        connect_timeout_seconds: default!(i32, 10),
+        statement_timeout_ms: default!(i32, 600000),
+        lock_timeout_ms: default!(i32, 30000),
+    ) -> TableIterator<
+        'static,
+        (
+            name!(enabled, bool),
+            name!(subid, i64),
+            name!(slot_name, Option<String>),
+            name!(publications_json, String),
+            name!(origin_name, String),
+        ),
+    > {
+        let status = transport::libpq::fetch_native_subscription_status(
+            dsn,
+            subscription_name,
+            connect_timeout_seconds,
+            statement_timeout_ms,
+            lock_timeout_ms,
+        )
+        .unwrap_or_else(|err| pgrx::error!("{err}"));
+
+        TableIterator::once((
+            status.enabled,
+            status.subid,
+            status.slot_name,
+            status.publications_json,
+            status.origin_name,
         ))
     }
 
@@ -2099,6 +2198,161 @@ mod tests {
         .unwrap()
         .unwrap();
         assert!(waiting);
+    }
+
+    #[pg_test]
+    fn native_barrier_publication_is_insert_only() {
+        let backend_pid = Spi::get_one::<i32>("SELECT pg_backend_pid()")
+            .unwrap()
+            .unwrap();
+        let publication_name = identifier(&format!("pgl_validate_native_barrier_{backend_pid}"));
+
+        Spi::run(&format!("DROP PUBLICATION IF EXISTS {publication_name}")).unwrap();
+        Spi::run(&format!(
+            "SELECT pgl_validate.ensure_native_barrier_publication({})",
+            sql_literal(&publication_name)
+        ))
+        .unwrap();
+
+        let publication = Spi::get_one::<String>(&format!(
+            "
+            SELECT p.pubinsert::text || ';' ||
+                   p.pubupdate::text || ';' ||
+                   p.pubdelete::text || ';' ||
+                   p.pubtruncate::text || ';' ||
+                   EXISTS (
+                       SELECT 1
+                       FROM pg_publication_tables pt
+                       WHERE pt.pubname = p.pubname
+                         AND pt.schemaname = 'pgl_validate'
+                         AND pt.tablename = 'fence_barrier'
+                   )::text
+            FROM pg_publication p
+            WHERE p.pubname = {}::name
+            ",
+            sql_literal(&publication_name)
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(publication, "true;false;false;false;true");
+
+        Spi::run(&format!("DROP PUBLICATION IF EXISTS {publication_name}")).unwrap();
+    }
+
+    #[pg_test]
+    fn native_barrier_publication_rejects_wrong_action_mask() {
+        let backend_pid = Spi::get_one::<i32>("SELECT pg_backend_pid()")
+            .unwrap()
+            .unwrap();
+        let publication_name =
+            identifier(&format!("pgl_validate_native_bad_barrier_{backend_pid}"));
+
+        Spi::run(&format!("DROP PUBLICATION IF EXISTS {publication_name}")).unwrap();
+        Spi::run(&format!(
+            "CREATE PUBLICATION {publication_name}
+             FOR TABLE pgl_validate.fence_barrier
+             WITH (publish = 'insert, update')"
+        ))
+        .unwrap();
+
+        let rejected = Spi::get_one::<bool>(&format!(
+            "
+            DO $$
+            BEGIN
+                PERFORM pgl_validate.ensure_native_barrier_publication({});
+                RAISE EXCEPTION 'expected native publication action-mask rejection';
+            EXCEPTION WHEN others THEN
+                IF SQLERRM = {} THEN
+                    RETURN;
+                END IF;
+                RAISE;
+            END
+            $$;
+            SELECT true
+            ",
+            sql_literal(&publication_name),
+            sql_literal(&format!(
+                "native publication {publication_name} exists but is not insert-only"
+            ))
+        ))
+        .unwrap()
+        .unwrap();
+        assert!(rejected);
+
+        Spi::run(&format!("DROP PUBLICATION IF EXISTS {publication_name}")).unwrap();
+    }
+
+    #[pg_test]
+    fn compare_table_skip_peer_fence_timeout_handles_native_subscription_peer() {
+        let backend_pid = Spi::get_one::<i32>("SELECT pg_backend_pid()")
+            .unwrap()
+            .unwrap();
+        let table_name = identifier(&format!("native_skip_peer_target_{backend_pid}"));
+        let publication_name = identifier(&format!("pgl_validate_native_skip_{backend_pid}"));
+        let dsn = local_dsn();
+
+        Spi::run(&format!(
+            "
+            CREATE TABLE public.{table_name}(id int PRIMARY KEY, value text);
+            INSERT INTO public.{table_name} VALUES (1, 'same');
+            CREATE PUBLICATION {publication_name} FOR TABLE public.{table_name};
+            INSERT INTO pgl_validate.peer(name, dsn, backend, subscription_name, replication_sets)
+            VALUES (
+                'unreachable_native',
+                'host=127.0.0.1 port=1 dbname=missing',
+                'native',
+                'native_sub',
+                ARRAY[{publication}]
+            );
+            ",
+            publication = sql_literal(&publication_name)
+        ))
+        .unwrap();
+
+        let result = Spi::get_one::<String>(&format!(
+            "
+            SELECT (r).run_id::text || ';' || (r).verdict
+            FROM (
+                SELECT pgl_validate.compare_table(
+                    'public.{table_name}'::regclass,
+                    ARRAY['unreachable_native'],
+                    jsonb_build_object(
+                        'backend', 'native',
+                        'publications', jsonb_build_array({publication}),
+                        'provider_dsn', {provider_dsn},
+                        'provider_node', 'local',
+                        'on_fence_timeout', 'skip_peer'
+                    )
+                ) AS r
+            ) s
+            ",
+            publication = sql_literal(&publication_name),
+            provider_dsn = sql_literal(&dsn)
+        ))
+        .unwrap()
+        .unwrap();
+        let (run_id, verdict) = result
+            .split_once(';')
+            .expect("compare_table result should include run id and verdict");
+        assert_eq!(verdict, "partial");
+
+        let persisted = Spi::get_one::<String>(&format!(
+            "
+            SELECT rp.status || ';' || si.issue_code || ';' ||
+                   (tr.reason LIKE '%on_fence_timeout=skip_peer%')::text
+            FROM pgl_validate.run_participant rp
+            JOIN pgl_validate.schema_issue si
+              ON si.run_id = rp.run_id
+             AND si.node = rp.node
+            JOIN pgl_validate.table_result tr
+              ON tr.run_id = rp.run_id
+            WHERE rp.run_id = {run_id}
+              AND rp.node = 'unreachable_native'
+            "
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(persisted, "unreachable;PEER_SKIPPED;true");
     }
 
     #[pg_test]

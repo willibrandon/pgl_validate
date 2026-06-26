@@ -86,8 +86,9 @@ SET pgl_validate.conflict_history_max_rows = 1000;
 
 The repository is being built from the design outward. The current slice covers
 catalog DDL, row digest framing, LtHash state, pglogical contract discovery,
-native publication contract discovery, cryptographic set confirmation,
-edge-specific barrier fencing, pglogical row-filter intersection semantics,
+native publication contract discovery, native barrier fencing, cryptographic
+set confirmation, edge-specific barrier fencing, pglogical row-filter
+intersection semantics,
 physical-standby replay fence plumbing, sequence-window validation, keyless
 whole-relation validation, multi-table and replication-set compare
 orchestration, structured JSON reports, reviewable repair generation, audited

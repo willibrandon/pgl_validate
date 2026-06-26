@@ -71,10 +71,16 @@ COMMENT ON FUNCTION pgl_validate.native_table_contract(regclass, text[], name) I
     'Resolve native logical publication actions, effective column list, exact row filter, sync state, and validated property for a relation.';
 COMMENT ON FUNCTION pgl_validate.ensure_pglogical_barrier_repset() IS
     'Create or verify the dedicated insert-only pglogical replication set that carries fence barrier tokens.';
+COMMENT ON FUNCTION pgl_validate.ensure_native_barrier_publication(text) IS
+    'Create or verify the dedicated insert-only native logical publication that carries fence barrier tokens.';
 COMMENT ON FUNCTION pgl_validate.fence_pglogical_edge(bigint, integer, integer, text, text, text, text, text, text, text, text[], integer, integer, integer, integer, integer) IS
     'Inject and converge an exact pglogical barrier for one provider-to-target run edge.';
+COMMENT ON FUNCTION pgl_validate.fence_native_edge(bigint, integer, integer, text, text, text, text, text, text, text, text[], integer, integer, integer, integer, integer) IS
+    'Inject and converge an exact native logical barrier for one provider-to-target run edge.';
 COMMENT ON FUNCTION pgl_validate.fence_pglogical_degraded_edge(bigint, integer, integer, text, text, text, text, text, text, text[], integer, integer, integer) IS
     'Persist an explicitly degraded pglogical fence when a barrier cannot be carried on the edge.';
+COMMENT ON FUNCTION pgl_validate.fence_native_degraded_edge(bigint, integer, integer, text, text, text, text, text, text, text[], integer, integer, integer, integer, integer) IS
+    'Persist an explicitly degraded native logical fence when a barrier cannot be carried on the edge.';
 COMMENT ON FUNCTION pgl_validate.fence_standby_edge(bigint, integer, integer, text, text, text, pg_lsn, integer, integer, integer, integer, integer) IS
     'Converge one physical standby edge by waiting for replay to reach a primary WAL LSN.';
 COMMENT ON FUNCTION pgl_validate.plan_key_range_predicate(regclass, text[], bytea, bytea) IS
@@ -154,6 +160,8 @@ COMMENT ON FUNCTION pgl_validate.remote_inject_barrier(text, integer, integer, i
     'Insert a barrier token on a remote origin over libpq and return the exact barrier commit end LSN.';
 COMMENT ON FUNCTION pgl_validate.remote_wait_slot_confirm_lsn(text, text, pg_lsn, integer, integer, integer) IS
     'Call pglogical.wait_slot_confirm_lsn on a provider and return the slot confirmed_flush_lsn.';
+COMMENT ON FUNCTION pgl_validate.remote_slot_confirmed_flush_lsn(text, text, integer, integer, integer) IS
+    'Fetch a provider logical slot confirmed_flush_lsn without using pglogical-specific helpers.';
 COMMENT ON FUNCTION pgl_validate.remote_current_wal_lsn(text, integer, integer, integer) IS
     'Fetch a provider current WAL LSN for an explicitly degraded fence.';
 COMMENT ON FUNCTION pgl_validate.remote_observe_barrier(text, text, uuid, pg_lsn, integer, integer, integer) IS
@@ -162,6 +170,8 @@ COMMENT ON FUNCTION pgl_validate.remote_standby_replay_status(text, integer, int
     'Fetch a remote participant''s recovery state, replay LSN, and replay-pause status.';
 COMMENT ON FUNCTION pgl_validate.remote_pglogical_subscription_status(text, text, integer, integer, integer) IS
     'Fetch pglogical subscription status from a remote target over libpq with bounded timeouts.';
+COMMENT ON FUNCTION pgl_validate.remote_native_subscription_status(text, text, integer, integer, integer) IS
+    'Fetch native logical subscription status from a remote target over libpq with bounded timeouts.';
 COMMENT ON FUNCTION pgl_validate.remote_pglogical_forwarding_subscriptions(text, text, integer, integer, integer) IS
     'Fetch enabled pglogical subscriptions on a remote subscriber that would forward all origins for the named provider node.';
 COMMENT ON FUNCTION pgl_validate.remote_pglogical_conflict_history(text, text, text, text, text, integer, integer, integer, integer) IS
