@@ -352,10 +352,14 @@ try {
     $targetDsn = "host=localhost port=$script:Port dbname=target user=postgres connect_timeout=5 application_name=pgl_validate_pglogical"
     $degradedDsn = "host=localhost port=$script:Port dbname=degraded user=postgres connect_timeout=5 application_name=pgl_validate_pglogical"
     $cascadeDsn = "host=localhost port=$script:Port dbname=cascade user=postgres connect_timeout=5 application_name=pgl_validate_pglogical"
+    $sequenceProviderDsn = "host=localhost port=$script:Port dbname=seq_provider user=postgres connect_timeout=5 application_name=pgl_validate_pglogical"
+    $sequenceTargetDsn = "host=localhost port=$script:Port dbname=seq_target user=postgres connect_timeout=5 application_name=pgl_validate_pglogical"
     $providerDsnSql = Sql-Literal $providerDsn
     $targetDsnSql = Sql-Literal $targetDsn
     $degradedDsnSql = Sql-Literal $degradedDsn
     $cascadeDsnSql = Sql-Literal $cascadeDsn
+    $sequenceProviderDsnSql = Sql-Literal $sequenceProviderDsn
+    $sequenceTargetDsnSql = Sql-Literal $sequenceTargetDsn
 
     Write-Step 'Creating pglogical provider node and barrier replication set'
     Invoke-Sql -Database 'provider' -Sql 'CREATE EXTENSION pgl_validate' | Out-Null
@@ -959,61 +963,6 @@ SELECT EXISTS (
         throw 'pglogical filtered-table presence difference was not recorded as advisory'
     }
 
-    Write-Step 'Validating pglogical sequence buffer-window semantics'
-    Invoke-Sql -Database 'provider' -Sql @"
-CREATE SEQUENCE public.account_seq CACHE 5;
-SELECT pglogical.replication_set_add_sequence(
-    'default',
-    'public.account_seq'::regclass,
-    true
-);
-"@ | Out-Null
-    Invoke-Sql -Database 'target' -Sql 'CREATE SEQUENCE public.account_seq CACHE 5' | Out-Null
-    Invoke-Sql -Database 'provider' -Sql @"
-SELECT setval('public.account_seq'::regclass, 10, true);
-SELECT pglogical.synchronize_sequence('public.account_seq'::regclass);
-"@ | Out-Null
-    Wait-SqlEquals `
-        -Database 'target' `
-        -Sql 'SELECT (last_value >= 10)::text FROM public.account_seq' `
-        -Expected 'true' `
-        -TimeoutSeconds $TimeoutSeconds
-
-    $sequenceVerdict = Invoke-Sql -Database 'provider' -Sql @"
-SELECT verdict || ';' || within_contract::text
-FROM pgl_validate.compare_sequence(
-    'public.account_seq'::regclass,
-    ARRAY['target'],
-    jsonb_build_object(
-        'provider_dsn', $providerDsnSql,
-        'provider_node', 'provider',
-        'fence_timeout_ms', 30000,
-        'fence_poll_interval_ms', 100
-    )
-)
-"@
-    if ($sequenceVerdict -ne 'match;true') {
-        throw "unexpected sequence compare result: $sequenceVerdict"
-    }
-
-    Invoke-Sql -Database 'target' -Sql "SELECT setval('public.account_seq'::regclass, 1, true)" | Out-Null
-    $sequenceBehind = Invoke-Sql -Database 'provider' -Sql @"
-SELECT verdict || ';' || within_contract::text
-FROM pgl_validate.compare_sequence(
-    'public.account_seq'::regclass,
-    ARRAY['target'],
-    jsonb_build_object(
-        'provider_dsn', $providerDsnSql,
-        'provider_node', 'provider',
-        'fence_timeout_ms', 30000,
-        'fence_poll_interval_ms', 100
-    )
-)
-"@
-    if ($sequenceBehind -ne 'behind;false') {
-        throw "subscriber-behind sequence drift was not detected: $sequenceBehind"
-    }
-
     Write-Step 'Creating subscriber-side drift and applying audited pglogical repair'
     Invoke-Sql -Database 'target' -Sql "UPDATE public.accounts SET value = 'target-drift' WHERE id = 1" | Out-Null
     Invoke-Sql -Database 'target' -Sql @"
@@ -1129,34 +1078,6 @@ SELECT (pgl_validate.compare_table(
         throw "unexpected post-repair compare_table verdict: $repairedVerdict"
     }
 
-    Write-Step 'Creating pglogical cascade node with forward_origins={all} for repair guard validation'
-    Invoke-Sql -Database 'target' -Sql 'SELECT pgl_validate.ensure_pglogical_barrier_repset()' | Out-Null
-    Invoke-Sql -Database 'target' -Sql "SELECT pglogical.replication_set_add_table('default', 'public.accounts'::regclass, false)" | Out-Null
-    Invoke-Sql -Database 'cascade' -Sql 'CREATE EXTENSION pgl_validate' | Out-Null
-    Invoke-Sql -Database 'cascade' -Sql 'CREATE EXTENSION pglogical' | Out-Null
-    Invoke-Sql -Database 'cascade' -Sql 'CREATE TABLE public.accounts(id int PRIMARY KEY, value text)' | Out-Null
-    Invoke-Sql -Database 'cascade' -Sql "INSERT INTO public.accounts VALUES (1, 'same')" | Out-Null
-    Invoke-Sql -Database 'cascade' -Sql "SELECT pglogical.create_node('cascade', $cascadeDsnSql)" | Out-Null
-    Invoke-Sql -Database 'cascade' -Sql @"
-SELECT pglogical.create_subscription(
-    'sub_from_target',
-    $targetDsnSql,
-    ARRAY['default','pgl_validate_barrier'],
-    false,
-    false,
-    ARRAY['all']
-)
-"@ | Out-Null
-    $null = Wait-SubscriptionReady `
-        -SubscriberDatabase 'cascade' `
-        -SubscriptionName 'sub_from_target' `
-        -ProviderDatabase 'target' `
-        -TimeoutSeconds $TimeoutSeconds
-    Invoke-Sql -Database 'provider' -Sql @"
-INSERT INTO pgl_validate.peer(name, dsn, backend, subscription_name, replication_sets)
-VALUES ('cascade', $cascadeDsnSql, 'pglogical', 'sub_from_target', ARRAY['default'])
-"@ | Out-Null
-
     Write-Step 'Creating subscriber-side drift and confirming key-level divergence'
     Invoke-Sql -Database 'target' -Sql "UPDATE public.accounts SET value = 'target-drift' WHERE id = 1" | Out-Null
     $driftResult = Invoke-Sql -Database 'provider' -Sql @"
@@ -1215,6 +1136,34 @@ WHERE run_id = $driftRunId
         throw "stable drift should confirm after one recheck epoch, saw: $driftRecheckShape"
     }
 
+    Write-Step 'Creating pglogical cascade node with forward_origins={all} for repair guard validation'
+    Invoke-Sql -Database 'target' -Sql 'SELECT pgl_validate.ensure_pglogical_barrier_repset()' | Out-Null
+    Invoke-Sql -Database 'target' -Sql "SELECT pglogical.replication_set_add_table('default', 'public.accounts'::regclass, false)" | Out-Null
+    Invoke-Sql -Database 'cascade' -Sql 'CREATE EXTENSION pgl_validate' | Out-Null
+    Invoke-Sql -Database 'cascade' -Sql 'CREATE EXTENSION pglogical' | Out-Null
+    Invoke-Sql -Database 'cascade' -Sql 'CREATE TABLE public.accounts(id int PRIMARY KEY, value text)' | Out-Null
+    Invoke-Sql -Database 'cascade' -Sql "INSERT INTO public.accounts VALUES (1, 'target-drift')" | Out-Null
+    Invoke-Sql -Database 'cascade' -Sql "SELECT pglogical.create_node('cascade', $cascadeDsnSql)" | Out-Null
+    Invoke-Sql -Database 'cascade' -Sql @"
+SELECT pglogical.create_subscription(
+    'sub_from_target',
+    $targetDsnSql,
+    ARRAY['default','pgl_validate_barrier'],
+    false,
+    false,
+    ARRAY['all']
+)
+"@ | Out-Null
+    $null = Wait-SubscriptionReady `
+        -SubscriberDatabase 'cascade' `
+        -SubscriptionName 'sub_from_target' `
+        -ProviderDatabase 'target' `
+        -TimeoutSeconds $TimeoutSeconds
+    Invoke-Sql -Database 'provider' -Sql @"
+INSERT INTO pgl_validate.peer(name, dsn, backend, subscription_name, replication_sets)
+VALUES ('cascade', $cascadeDsnSql, 'pglogical', 'sub_from_target', ARRAY['default'])
+"@ | Out-Null
+
     Write-Step 'Refusing local_only repair while a forward_origins={all} cascade subscription is enabled'
     $blockedRepairResult = Invoke-Sql -Database 'provider' -Sql @"
 SELECT repair_id::text || ';' || status
@@ -1242,6 +1191,89 @@ WHERE repair_id = $blockedRepairId
     $targetStillDrifted = Invoke-Sql -Database 'target' -Sql "SELECT value FROM public.accounts WHERE id = 1"
     if ($targetStillDrifted -ne 'target-drift') {
         throw "blocked repair unexpectedly modified target row: $targetStillDrifted"
+    }
+
+    Write-Step 'Validating pglogical sequence buffer-window semantics in an isolated topology'
+    Invoke-Sql -Database 'postgres' -Sql 'CREATE DATABASE seq_provider' | Out-Null
+    Invoke-Sql -Database 'postgres' -Sql 'CREATE DATABASE seq_target' | Out-Null
+    Invoke-Sql -Database 'seq_provider' -Sql 'CREATE EXTENSION pgl_validate' | Out-Null
+    Invoke-Sql -Database 'seq_provider' -Sql 'CREATE EXTENSION pglogical' | Out-Null
+    Invoke-Sql -Database 'seq_provider' -Sql "SELECT pglogical.create_node('seq_provider', $sequenceProviderDsnSql)" | Out-Null
+    Invoke-Sql -Database 'seq_provider' -Sql 'SELECT pgl_validate.ensure_pglogical_barrier_repset()' | Out-Null
+    Invoke-Sql -Database 'seq_provider' -Sql @"
+CREATE SEQUENCE public.account_seq CACHE 5;
+SELECT pglogical.replication_set_add_sequence(
+    'default',
+    'public.account_seq'::regclass,
+    true
+);
+"@ | Out-Null
+    Invoke-Sql -Database 'seq_target' -Sql 'CREATE EXTENSION pgl_validate' | Out-Null
+    Invoke-Sql -Database 'seq_target' -Sql 'CREATE EXTENSION pglogical' | Out-Null
+    Invoke-Sql -Database 'seq_target' -Sql 'CREATE SEQUENCE public.account_seq CACHE 5' | Out-Null
+    Invoke-Sql -Database 'seq_target' -Sql "SELECT pglogical.create_node('seq_target', $sequenceTargetDsnSql)" | Out-Null
+    Invoke-Sql -Database 'seq_target' -Sql @"
+SELECT pglogical.create_subscription(
+    'seq_sub',
+    $sequenceProviderDsnSql,
+    ARRAY['default','pgl_validate_barrier'],
+    false,
+    false,
+    ARRAY[]::text[]
+)
+"@ | Out-Null
+    $null = Wait-SubscriptionReady `
+        -SubscriberDatabase 'seq_target' `
+        -SubscriptionName 'seq_sub' `
+        -ProviderDatabase 'seq_provider' `
+        -TimeoutSeconds $TimeoutSeconds
+    Invoke-Sql -Database 'seq_provider' -Sql @"
+INSERT INTO pgl_validate.peer(name, dsn, backend, subscription_name, replication_sets)
+VALUES ('seq_target', $sequenceTargetDsnSql, 'pglogical', 'seq_sub', ARRAY['default'])
+"@ | Out-Null
+    Invoke-Sql -Database 'seq_provider' -Sql @"
+SELECT setval('public.account_seq'::regclass, 10, true);
+SELECT pglogical.synchronize_sequence('public.account_seq'::regclass);
+"@ | Out-Null
+    Wait-SqlEquals `
+        -Database 'seq_target' `
+        -Sql 'SELECT (last_value >= 10)::text FROM public.account_seq' `
+        -Expected 'true' `
+        -TimeoutSeconds $TimeoutSeconds
+
+    $sequenceVerdict = Invoke-Sql -Database 'seq_provider' -Sql @"
+SELECT verdict || ';' || within_contract::text
+FROM pgl_validate.compare_sequence(
+    'public.account_seq'::regclass,
+    ARRAY['seq_target'],
+    jsonb_build_object(
+        'provider_dsn', $sequenceProviderDsnSql,
+        'provider_node', 'seq_provider',
+        'fence_timeout_ms', 30000,
+        'fence_poll_interval_ms', 100
+    )
+)
+"@
+    if ($sequenceVerdict -ne 'match;true') {
+        throw "unexpected sequence compare result: $sequenceVerdict"
+    }
+
+    Invoke-Sql -Database 'seq_target' -Sql "SELECT setval('public.account_seq'::regclass, 1, true)" | Out-Null
+    $sequenceBehind = Invoke-Sql -Database 'seq_provider' -Sql @"
+SELECT verdict || ';' || within_contract::text
+FROM pgl_validate.compare_sequence(
+    'public.account_seq'::regclass,
+    ARRAY['seq_target'],
+    jsonb_build_object(
+        'provider_dsn', $sequenceProviderDsnSql,
+        'provider_node', 'seq_provider',
+        'fence_timeout_ms', 30000,
+        'fence_poll_interval_ms', 100
+    )
+)
+"@
+    if ($sequenceBehind -ne 'behind;false') {
+        throw "subscriber-behind sequence drift was not detected: $sequenceBehind"
     }
 
     Write-Output "pglogical fence, compare_table, divergence recheck, audited repair, and cascade repair guard tests passed on pg$PgMajor using slot $slotName"
