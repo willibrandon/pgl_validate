@@ -1036,6 +1036,38 @@ mod tests {
     }
 
     #[pg_test]
+    fn classify_recheck_outcome_covers_cleared_stable_and_hot_keys() {
+        let outcomes = Spi::get_one::<String>(
+            r#"
+            WITH cases(label, previous_local, previous_peer, current_local, current_peer) AS (
+                VALUES
+                    ('cleared_update', '\x01'::bytea, '\x02'::bytea, '\x03'::bytea, '\x03'::bytea),
+                    ('cleared_delete', '\x01'::bytea, NULL::bytea, NULL::bytea, NULL::bytea),
+                    ('still_differs', '\x01'::bytea, '\x02'::bytea, '\x01'::bytea, '\x02'::bytea),
+                    ('still_hot', '\x01'::bytea, '\x02'::bytea, '\x04'::bytea, '\x02'::bytea)
+            )
+            SELECT string_agg(
+                label || ':' || pgl_validate.classify_recheck_outcome(
+                    previous_local,
+                    previous_peer,
+                    current_local,
+                    current_peer
+                ),
+                ',' ORDER BY label
+            )
+            FROM cases
+            "#,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(
+            outcomes,
+            "cleared_delete:cleared,cleared_update:cleared,still_differs:still_differs,still_hot:still_hot"
+        );
+    }
+
+    #[pg_test]
     fn compare_table_localizes_only_divergent_key_ranges() {
         let backend_pid = Spi::get_one::<i32>("SELECT pg_backend_pid()")
             .unwrap()

@@ -28,6 +28,38 @@ BEGIN
 END
 $$;
 
+-- Classify one digest-stability recheck for a localized candidate key. NULL
+-- digest inputs represent absence in that sample; row_digest() itself never
+-- returns NULL for a present row.
+CREATE FUNCTION pgl_validate.classify_recheck_outcome(
+    previous_local_digest bytea,
+    previous_peer_digest bytea,
+    current_local_digest bytea,
+    current_peer_digest bytea
+)
+RETURNS text
+LANGUAGE sql
+IMMUTABLE
+PARALLEL SAFE
+AS $$
+    SELECT CASE
+        WHEN (
+                current_local_digest IS NOT NULL
+            AND current_peer_digest IS NOT NULL
+            AND current_local_digest IS NOT DISTINCT FROM current_peer_digest
+        )
+        OR (
+                current_local_digest IS NULL
+            AND current_peer_digest IS NULL
+        )
+        THEN 'cleared'
+        WHEN previous_local_digest IS NOT DISTINCT FROM current_local_digest
+         AND previous_peer_digest IS NOT DISTINCT FROM current_peer_digest
+        THEN 'still_differs'
+        ELSE 'still_hot'
+    END
+$$;
+
 CREATE FUNCTION pgl_validate.compare(
     tables regclass[] DEFAULT NULL,
     repset text DEFAULT NULL,
@@ -3497,16 +3529,12 @@ BEGIN
                     d.key_bytes,
                     d.node,
                     recheck_epoch,
-                    CASE
-                        WHEN (lb.key_bytes IS NOT NULL AND pb.key_bytes IS NOT NULL
-                              AND lb.row_digest IS NOT DISTINCT FROM pb.row_digest)
-                          OR (lb.key_bytes IS NULL AND pb.key_bytes IS NULL)
-                        THEN 'cleared'
-                        WHEN la.row_digest IS NOT DISTINCT FROM lb.row_digest
-                         AND pa.row_digest IS NOT DISTINCT FROM pb.row_digest
-                        THEN 'still_differs'
-                        ELSE 'still_hot'
-                    END
+                    pgl_validate.classify_recheck_outcome(
+                        la.row_digest,
+                        pa.row_digest,
+                        lb.row_digest,
+                        pb.row_digest
+                    )
                 FROM pgl_validate.divergence d
                 LEFT JOIN pg_temp.pgl_validate_localized_sample la
                   ON la.sample = previous_sample AND la.node = 'local' AND la.key_bytes = d.key_bytes

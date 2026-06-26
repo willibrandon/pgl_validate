@@ -204,6 +204,63 @@ function Invoke-Sql {
     return ($output -join "`n").Trim()
 }
 
+function Start-AsyncSql {
+    param(
+        [string] $Database,
+        [string] $Sql
+    )
+
+    $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $script:Psql
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    foreach ($argument in @(
+        '-X',
+        '-w',
+        '-h',
+        'localhost',
+        '-p',
+        "$script:Port",
+        '-U',
+        'postgres',
+        '-d',
+        $Database,
+        '-v',
+        'ON_ERROR_STOP=1',
+        '-Atq',
+        '-c',
+        $Sql
+    )) {
+        [void] $startInfo.ArgumentList.Add($argument)
+    }
+
+    return [System.Diagnostics.Process]::Start($startInfo)
+}
+
+function Wait-AsyncSql {
+    param(
+        [System.Diagnostics.Process] $Process,
+        [int] $TimeoutSeconds,
+        [string] $Context
+    )
+
+    if (-not $Process.WaitForExit($TimeoutSeconds * 1000)) {
+        Stop-ProcessTree -ProcessId $Process.Id
+        throw "$Context timed out after ${TimeoutSeconds}s."
+    }
+
+    $stdout = $Process.StandardOutput.ReadToEnd().Trim()
+    $stderr = $Process.StandardError.ReadToEnd().Trim()
+    $Process.Refresh()
+    if ($Process.ExitCode -ne 0) {
+        throw "$Context exited with code $($Process.ExitCode): $stderr $stdout"
+    }
+
+    return $stdout
+}
+
 function Wait-SubscriptionReady {
     param(
         [string] $SubscriberDatabase = 'target',
@@ -285,6 +342,21 @@ function Wait-SqlEquals {
     }
 
     throw "timed out waiting for SQL result '$Expected' on ${Database}; last result: $last"
+}
+
+function Wait-AdvisoryLockHeld {
+    param(
+        [string] $Database,
+        [int] $ClassId,
+        [int] $ObjectId,
+        [int] $TimeoutSeconds
+    )
+
+    Wait-SqlEquals `
+        -Database $Database `
+        -Sql "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE locktype = 'advisory' AND classid = $ClassId AND objid = $ObjectId AND granted)::text" `
+        -Expected 'true' `
+        -TimeoutSeconds $TimeoutSeconds
 }
 
 $pgConfig = Get-PgrxPgConfig -PgMajor $PgMajor
@@ -963,6 +1035,127 @@ SELECT EXISTS (
         throw 'pglogical filtered-table presence difference was not recorded as advisory'
     }
 
+    Write-Step 'Validating post-fence provider UPDATE is cleared by digest-stability recheck'
+    $clearedTimeoutSeconds = [Math]::Min($TimeoutSeconds, 60)
+    Invoke-Sql -Database 'provider' -Sql @"
+CREATE FUNCTION public.pgl_validate_recheck_gate(i int)
+RETURNS boolean
+LANGUAGE plpgsql
+IMMUTABLE
+AS `$pgl_validate_gate`$
+DECLARE
+    call_no int;
+BEGIN
+    IF current_setting('application_name', true) = 'pgl_validate_recheck_clear' THEN
+        call_no := COALESCE(NULLIF(current_setting('pgl_validate.recheck_gate_calls', true), '')::int, 0) + 1;
+        PERFORM set_config('pgl_validate.recheck_gate_calls', call_no::text, false);
+        IF call_no = 2 THEN
+            PERFORM pg_advisory_lock(76422, 2);
+            PERFORM pg_sleep(4);
+            PERFORM pg_advisory_unlock(76422, 2);
+        END IF;
+    END IF;
+    RETURN true;
+END
+`$pgl_validate_gate`$;
+CREATE TABLE public.post_fence_update_accounts(
+    id int PRIMARY KEY,
+    value text
+);
+SELECT pglogical.replication_set_add_table(
+    'default',
+    'public.post_fence_update_accounts'::regclass,
+    false,
+    NULL,
+    'public.pgl_validate_recheck_gate(id)'
+);
+"@ | Out-Null
+    Invoke-Sql -Database 'target' -Sql @"
+CREATE TABLE public.post_fence_update_accounts(
+    id int PRIMARY KEY,
+    value text
+)
+"@ | Out-Null
+    Invoke-Sql -Database 'provider' -Sql "INSERT INTO public.post_fence_update_accounts VALUES (1, 'before-update')" | Out-Null
+    Wait-SqlEquals `
+        -Database 'target' `
+        -Sql "SELECT value FROM public.post_fence_update_accounts WHERE id = 1" `
+        -Expected 'before-update' `
+        -TimeoutSeconds $TimeoutSeconds
+    Invoke-Sql -Database 'target' -Sql "UPDATE public.post_fence_update_accounts SET value = 'after-update' WHERE id = 1" | Out-Null
+
+    $clearedCompareSql = @"
+SET application_name = 'pgl_validate_recheck_clear';
+SET pgl_validate.recheck_gate_calls = '0';
+SELECT run_id::text || ';' || verdict
+FROM pgl_validate.compare_table(
+    'public.post_fence_update_accounts'::regclass,
+    ARRAY['target'],
+    jsonb_build_object(
+        'provider_dsn', $providerDsnSql,
+        'provider_node', 'provider',
+        'repsets', jsonb_build_array('default'),
+        'recheck_passes', 2,
+        'fence_timeout_ms', 30000,
+        'fence_poll_interval_ms', 100
+    )
+)
+"@
+    $clearedProcess = Start-AsyncSql -Database 'provider' -Sql $clearedCompareSql
+    try {
+        Wait-AdvisoryLockHeld `
+            -Database 'provider' `
+            -ClassId 76422 `
+            -ObjectId 2 `
+            -TimeoutSeconds $clearedTimeoutSeconds
+
+        Invoke-Sql -Database 'provider' -Sql "UPDATE public.post_fence_update_accounts SET value = 'after-update' WHERE id = 1" | Out-Null
+        Wait-SqlEquals `
+            -Database 'target' `
+            -Sql "SELECT value FROM public.post_fence_update_accounts WHERE id = 1" `
+            -Expected 'after-update' `
+            -TimeoutSeconds $clearedTimeoutSeconds
+
+        $clearedResult = Wait-AsyncSql `
+            -Process $clearedProcess `
+            -TimeoutSeconds $clearedTimeoutSeconds `
+            -Context 'post-fence UPDATE compare_table'
+    }
+    finally {
+        if ($clearedProcess -and -not $clearedProcess.HasExited) {
+            Stop-ProcessTree -ProcessId $clearedProcess.Id
+        }
+    }
+
+    $clearedParts = $clearedResult.Split(';', 2)
+    if ($clearedParts.Count -ne 2) {
+        throw "unexpected post-fence UPDATE compare_table result: $clearedResult"
+    }
+    $clearedRunId = $clearedParts[0]
+    $clearedVerdict = $clearedParts[1]
+    if ($clearedVerdict -ne 'match') {
+        throw "post-fence UPDATE should clear to match after recheck, saw: $clearedResult"
+    }
+
+    $clearedEvidence = Invoke-Sql -Database 'provider' -Sql @"
+SELECT d.classification || ';' ||
+       d.status || ';' ||
+       dr.outcome || ';' ||
+       tr.verdict || ';' ||
+       tp.validated_property
+FROM pgl_validate.divergence d
+JOIN pgl_validate.divergence_recheck dr USING (run_id, schema_name, table_name, key_bytes, node)
+JOIN pgl_validate.table_result tr USING (run_id, schema_name, table_name)
+JOIN pgl_validate.table_plan tp USING (run_id, schema_name, table_name)
+WHERE d.run_id = $clearedRunId
+  AND d.schema_name = 'public'
+  AND d.table_name = 'post_fence_update_accounts'
+  AND d.node = 'target'
+"@
+    if ($clearedEvidence -ne 'differs;cleared;cleared;match;filtered_intersection') {
+        throw "post-fence UPDATE did not persist a cleared recheck outcome: $clearedEvidence"
+    }
+
     Write-Step 'Creating subscriber-side drift and applying audited pglogical repair'
     Invoke-Sql -Database 'target' -Sql "UPDATE public.accounts SET value = 'target-drift' WHERE id = 1" | Out-Null
     Invoke-Sql -Database 'target' -Sql @"
@@ -1159,6 +1352,7 @@ SELECT pglogical.create_subscription(
         -SubscriptionName 'sub_from_target' `
         -ProviderDatabase 'target' `
         -TimeoutSeconds $TimeoutSeconds
+
     Invoke-Sql -Database 'provider' -Sql @"
 INSERT INTO pgl_validate.peer(name, dsn, backend, subscription_name, replication_sets)
 VALUES ('cascade', $cascadeDsnSql, 'pglogical', 'sub_from_target', ARRAY['default'])

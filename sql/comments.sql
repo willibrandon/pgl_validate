@@ -111,6 +111,8 @@ COMMENT ON FUNCTION pgl_validate.compare(regclass[], text, text[], text, jsonb) 
     'Run a validation over explicit tables, a pglogical replication set including its sequences, or auto-discovered local relations and return the parent run id.';
 COMMENT ON FUNCTION pgl_validate.reported_tuple_json(jsonb, integer) IS
     'Return a divergent tuple payload, or a bounded truncation marker when it exceeds max_reported_tuple_bytes.';
+COMMENT ON FUNCTION pgl_validate.classify_recheck_outcome(bytea, bytea, bytea, bytea) IS
+    'Classify one digest-stability recheck as cleared, still_differs, or still_hot from previous and current row digests.';
 COMMENT ON FUNCTION pgl_validate.compare_table(regclass, text[], jsonb) IS
     'Run the current table comparison path and return the persisted table verdict.';
 COMMENT ON FUNCTION pgl_validate.compare_sequence(regclass, text[], jsonb) IS
