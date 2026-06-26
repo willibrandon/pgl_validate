@@ -16,6 +16,7 @@ extension_sql_file!("../sql/bootstrap.sql", name = "bootstrap", bootstrap);
 extension_sql_file!("../sql/comments.sql", name = "comments", finalize);
 
 static PARANOID_CONFIRM: GucSetting<bool> = GucSetting::<bool>::new(false);
+static PARANOID_CONFIRM_MAX_ROWS: GucSetting<i32> = GucSetting::<i32>::new(1000);
 static CHUNK_TARGET_ROWS: GucSetting<i32> = GucSetting::<i32>::new(50000);
 static LOCALIZE_THRESHOLD: GucSetting<i32> = GucSetting::<i32>::new(1000);
 static RECHECK_PASSES: GucSetting<i32> = GucSetting::<i32>::new(3);
@@ -35,6 +36,16 @@ pub extern "C-unwind" fn _PG_init() {
         c"Confirm clean chunks cryptographically.",
         c"Run hash_digest_array confirmation for clean chunks in addition to LtHash.",
         &PARANOID_CONFIRM,
+        GucContext::Userset,
+        flags,
+    );
+    GucRegistry::define_int_guc(
+        c"pgl_validate.paranoid_confirm_max_rows",
+        c"Rows per paranoid set confirmation.",
+        c"Bounds the sorted hash_digest_array input used for cryptographic clean-chunk confirmation.",
+        &PARANOID_CONFIRM_MAX_ROWS,
+        1,
+        i32::MAX,
         GucContext::Userset,
         flags,
     );
@@ -2141,6 +2152,195 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(confirmed_nodes, 2);
+    }
+
+    #[pg_test]
+    fn compare_table_bounds_clean_paranoid_confirmation_by_key_range() {
+        let dsn = local_dsn();
+        let backend_pid = Spi::get_one::<i32>("SELECT pg_backend_pid()")
+            .unwrap()
+            .unwrap();
+        let table_name = identifier(&format!("bounded_paranoid_target_{backend_pid}"));
+
+        let _ = crate::transport::libpq::execute_command(
+            &dsn,
+            &format!("DROP TABLE IF EXISTS public.{table_name}"),
+        );
+        crate::transport::libpq::execute_command(
+            &dsn,
+            &format!(
+                "CREATE TABLE public.{table_name}(id int PRIMARY KEY, value text);
+                 INSERT INTO public.{table_name}
+                 SELECT g, 'same-' || g::text
+                 FROM generate_series(1, 5) AS g;"
+            ),
+        )
+        .unwrap();
+
+        Spi::run(&format!(
+            "
+            DELETE FROM pgl_validate.peer;
+            INSERT INTO pgl_validate.peer(name, dsn, backend)
+            VALUES ('self_bounded_paranoid', {}, 'native');
+            ",
+            sql_literal(&dsn)
+        ))
+        .unwrap();
+
+        let result = Spi::get_one::<String>(&format!(
+            "
+            SELECT (r).run_id::text || ';' || (r).verdict
+            FROM (
+                SELECT pgl_validate.compare_table(
+                    {}::regclass,
+                    ARRAY['self_bounded_paranoid'],
+                    '{{\"paranoid_confirm\":true,\"paranoid_confirm_max_rows\":2,\"chunk_target_rows\":10}}'::jsonb
+                ) AS r
+            ) s
+            ",
+            sql_literal(&format!("public.{table_name}"))
+        ))
+        .unwrap()
+        .unwrap();
+        let (run_id, verdict) = result
+            .split_once(';')
+            .expect("compare_table result should include run id and verdict");
+        assert_eq!(verdict, "match");
+
+        let chunk_shape = Spi::get_one::<String>(&format!(
+            "
+            SELECT string_agg(chunk_id::text || ':' || state, ',' ORDER BY chunk_id)
+            FROM pgl_validate.chunk_result
+            WHERE run_id = {run_id}
+              AND table_name = {table_name}
+            ",
+            table_name = sql_literal(&table_name)
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(chunk_shape, "1:split,2:clean,3:clean,4:clean");
+
+        let largest_confirmed_range = Spi::get_one::<i64>(&format!(
+            "
+            SELECT max(cnr.n_rows)
+            FROM pgl_validate.chunk_result cr
+            JOIN pgl_validate.chunk_node_result cnr
+              USING (run_id, schema_name, table_name, chunk_id)
+            WHERE cr.run_id = {run_id}
+              AND cr.table_name = {table_name}
+              AND cr.parent_id = 1
+              AND cnr.node = 'local'
+            ",
+            table_name = sql_literal(&table_name)
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(largest_confirmed_range, 2);
+
+        let root_set_hashes = Spi::get_one::<i64>(&format!(
+            "
+            SELECT count(*)
+            FROM pgl_validate.table_node_result
+            WHERE run_id = {run_id}
+              AND table_name = {table_name}
+              AND set_hash IS NOT NULL
+            ",
+            table_name = sql_literal(&table_name)
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(root_set_hashes, 0);
+
+        let _ = crate::transport::libpq::execute_command(
+            &dsn,
+            &format!("DROP TABLE IF EXISTS public.{table_name}"),
+        );
+    }
+
+    #[pg_test]
+    fn compare_table_fails_closed_for_oversized_keyless_paranoid_confirmation() {
+        let dsn = local_dsn();
+        let backend_pid = Spi::get_one::<i32>("SELECT pg_backend_pid()")
+            .unwrap()
+            .unwrap();
+        let table_name = identifier(&format!("keyless_paranoid_target_{backend_pid}"));
+
+        let _ = crate::transport::libpq::execute_command(
+            &dsn,
+            &format!("DROP TABLE IF EXISTS public.{table_name}"),
+        );
+        crate::transport::libpq::execute_command(
+            &dsn,
+            &format!(
+                "CREATE TABLE public.{table_name}(value text);
+                 INSERT INTO public.{table_name}
+                 SELECT 'same-' || g::text
+                 FROM generate_series(1, 3) AS g;"
+            ),
+        )
+        .unwrap();
+
+        Spi::run(&format!(
+            "
+            DELETE FROM pgl_validate.peer;
+            INSERT INTO pgl_validate.peer(name, dsn, backend)
+            VALUES ('self_keyless_paranoid', {}, 'native');
+            ",
+            sql_literal(&dsn)
+        ))
+        .unwrap();
+
+        let result = Spi::get_one::<String>(&format!(
+            "
+            SELECT (r).run_id::text || ';' || (r).verdict
+            FROM (
+                SELECT pgl_validate.compare_table(
+                    {}::regclass,
+                    ARRAY['self_keyless_paranoid'],
+                    '{{\"paranoid_confirm\":true,\"paranoid_confirm_max_rows\":2}}'::jsonb
+                ) AS r
+            ) s
+            ",
+            sql_literal(&format!("public.{table_name}"))
+        ))
+        .unwrap()
+        .unwrap();
+        let (run_id, verdict) = result
+            .split_once(';')
+            .expect("compare_table result should include run id and verdict");
+        assert_eq!(verdict, "indeterminate");
+
+        let issue = Spi::get_one::<bool>(&format!(
+            "
+            SELECT EXISTS (
+                SELECT 1
+                FROM pgl_validate.schema_issue
+                WHERE run_id = {run_id}
+                  AND table_name = {table_name}
+                  AND issue_code = 'PARANOID_CONFIRM_REQUIRES_KEY'
+            )
+            ",
+            table_name = sql_literal(&table_name)
+        ))
+        .unwrap()
+        .unwrap();
+        assert!(issue);
+
+        let run_counts = Spi::get_one::<String>(&format!(
+            "
+            SELECT tables_matched::text || ';' || tables_differ::text
+            FROM pgl_validate.run
+            WHERE run_id = {run_id}
+            "
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(run_counts, "0;0");
+
+        let _ = crate::transport::libpq::execute_command(
+            &dsn,
+            &format!("DROP TABLE IF EXISTS public.{table_name}"),
+        );
     }
 
     #[pg_test]

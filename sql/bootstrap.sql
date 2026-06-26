@@ -1939,6 +1939,7 @@ DECLARE
     range_target_rows int;
     checksum_sql text;
     remote_checksum_sql text;
+    remote_set_hash_sql text;
     localize_sql text;
     remote_localize_sql text;
     n_rows bigint;
@@ -1955,10 +1956,16 @@ DECLARE
     verdict text;
     result_reason text;
     result_row pgl_validate.table_result;
+    paranoid_unbounded boolean := false;
     paranoid_confirm boolean := COALESCE(
         (NULLIF(options->>'paranoid_confirm', ''))::boolean,
         NULLIF(current_setting('pgl_validate.paranoid_confirm', true), '')::boolean,
         false
+    );
+    paranoid_confirm_max_rows int := COALESCE(
+        (NULLIF(options->>'paranoid_confirm_max_rows', ''))::int,
+        NULLIF(current_setting('pgl_validate.paranoid_confirm_max_rows', true), '')::int,
+        1000
     );
     chunk_target_rows int := COALESCE(
         (NULLIF(options->>'chunk_target_rows', ''))::int,
@@ -2032,6 +2039,9 @@ BEGIN
     END IF;
     IF fence_poll_interval_ms <= 0 THEN
         RAISE EXCEPTION 'fence_poll_interval_ms must be greater than zero';
+    END IF;
+    IF paranoid_confirm_max_rows <= 0 THEN
+        RAISE EXCEPTION 'paranoid_confirm_max_rows must be greater than zero';
     END IF;
     IF chunk_target_rows <= 0 THEN
         RAISE EXCEPTION 'chunk_target_rows must be greater than zero';
@@ -2479,7 +2489,7 @@ BEGIN
         cols,
         NULL,
         row_filter_sql,
-        paranoid_confirm
+        false
     );
     remote_checksum_sql := pgl_validate.plan_chunk_sql(
         p_table_name,
@@ -2489,9 +2499,23 @@ BEGIN
         cols,
         NULL,
         NULL,
-        paranoid_confirm
+        false
     );
     EXECUTE checksum_sql INTO n_rows, lthash, set_hash;
+
+    IF paranoid_confirm AND n_rows <= paranoid_confirm_max_rows THEN
+        checksum_sql := pgl_validate.plan_chunk_sql(
+            p_table_name,
+            key_cols,
+            NULL,
+            NULL,
+            cols,
+            NULL,
+            row_filter_sql,
+            true
+        );
+        EXECUTE checksum_sql INTO n_rows, lthash, set_hash;
+    END IF;
 
     INSERT INTO pgl_validate.table_node_result(
         run_id, schema_name, table_name, node, n_rows, lthash, set_hash
@@ -2516,6 +2540,31 @@ BEGIN
             peer_rec.statement_timeout_ms,
             peer_rec.lock_timeout_ms
         ) AS rc;
+
+        IF paranoid_confirm
+           AND n_rows <= paranoid_confirm_max_rows
+           AND remote_rec.n_rows <= paranoid_confirm_max_rows THEN
+            remote_set_hash_sql := pgl_validate.plan_chunk_sql(
+                p_table_name,
+                key_cols,
+                NULL,
+                NULL,
+                cols,
+                NULL,
+                NULL,
+                true
+            );
+
+            SELECT rc.pg_version, rc.n_rows, rc.lthash, rc.set_hash
+            INTO remote_rec
+            FROM pgl_validate.remote_checksum(
+                peer_rec.dsn,
+                remote_set_hash_sql,
+                peer_rec.connect_timeout_seconds,
+                peer_rec.statement_timeout_ms,
+                peer_rec.lock_timeout_ms
+            ) AS rc;
+        END IF;
 
         participant_count := participant_count + 1;
 
@@ -2547,10 +2596,39 @@ BEGIN
         END IF;
     END LOOP;
 
-    range_target_rows := CASE
-        WHEN differ_count > 0 THEN LEAST(chunk_target_rows, localize_threshold)
-        ELSE chunk_target_rows
-    END;
+    range_target_rows := chunk_target_rows;
+    IF differ_count > 0 THEN
+        range_target_rows := LEAST(range_target_rows, localize_threshold);
+    END IF;
+    IF paranoid_confirm
+       AND key_cols IS NOT NULL
+       AND cardinality(key_cols) > 0 THEN
+        range_target_rows := LEAST(range_target_rows, paranoid_confirm_max_rows);
+    END IF;
+
+    paranoid_unbounded :=
+        paranoid_confirm
+        AND (key_cols IS NULL OR cardinality(key_cols) = 0)
+        AND n_rows > paranoid_confirm_max_rows;
+
+    IF paranoid_unbounded THEN
+        INSERT INTO pgl_validate.schema_issue(
+            run_id, node, schema_name, table_name, issue_code, detail
+        )
+        VALUES (
+            v_run_id,
+            provider_node,
+            v_schema_name,
+            v_rel_name,
+            'PARANOID_CONFIRM_REQUIRES_KEY',
+            format(
+                'paranoid_confirm requested for %s row keyless relation; cap is %s rows and no comparison key exists for bounded subdivision',
+                n_rows,
+                paranoid_confirm_max_rows
+            )
+        )
+        ON CONFLICT DO NOTHING;
+    END IF;
 
     IF key_cols IS NOT NULL
        AND cardinality(key_cols) > 0
@@ -3172,7 +3250,15 @@ BEGIN
         END IF;
     END IF;
 
-    IF differ_count = 0 THEN
+    IF differ_count = 0 AND paranoid_unbounded THEN
+        verdict := 'indeterminate';
+        result_reason := format(
+            'paranoid_confirm requested but %s row keyless relation cannot be subdivided under paranoid_confirm_max_rows=%s; validated_property=%s',
+            n_rows,
+            paranoid_confirm_max_rows,
+            validated_property
+        );
+    ELSIF differ_count = 0 THEN
         verdict := 'match';
         IF participant_count = 1 THEN
             result_reason := format(
@@ -3277,8 +3363,8 @@ BEGIN
         UPDATE pgl_validate.run
         SET status = 'completed',
             finished_at = now(),
-            tables_matched = CASE WHEN differ_count = 0 THEN 1 ELSE 0 END,
-            tables_differ = CASE WHEN differ_count = 0 THEN 0 ELSE 1 END
+            tables_matched = CASE WHEN verdict = 'match' THEN 1 ELSE 0 END,
+            tables_differ = CASE WHEN verdict = 'differ' THEN 1 ELSE 0 END
         WHERE pgl_validate.run.run_id = v_run_id;
 
         UPDATE pgl_validate.run_participant
