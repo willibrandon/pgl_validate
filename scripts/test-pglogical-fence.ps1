@@ -411,7 +411,7 @@ SELECT pglogical.create_subscription(
     ARRAY['default','pgl_validate_barrier'],
     false,
     false,
-    ARRAY['all']
+    ARRAY[]::text[]
 )
 "@ | Out-Null
 
@@ -431,7 +431,7 @@ SELECT pglogical.create_subscription(
     ARRAY['default'],
     false,
     false,
-    ARRAY['all']
+    ARRAY[]::text[]
 )
 "@ | Out-Null
     $degradedSlotName = Wait-SubscriptionReady `
@@ -540,6 +540,102 @@ SELECT EXISTS (
     if ($compareFenceRecorded -ne 'true') {
         throw 'compare_table did not record a converged fence'
     }
+
+    Write-Step 'Validating bidirectional pglogical fence vector'
+    Invoke-Sql -Database 'target' -Sql 'SELECT pgl_validate.ensure_pglogical_barrier_repset()' | Out-Null
+    Invoke-Sql -Database 'provider' -Sql @"
+CREATE TABLE public.bidir_accounts(id int PRIMARY KEY, value text);
+SELECT pglogical.create_replication_set('pgl_validate_bidir');
+SELECT pglogical.replication_set_add_table('pgl_validate_bidir', 'public.bidir_accounts'::regclass, false);
+"@ | Out-Null
+    Invoke-Sql -Database 'target' -Sql @"
+CREATE TABLE public.bidir_accounts(id int PRIMARY KEY, value text);
+SELECT pglogical.create_replication_set('pgl_validate_bidir');
+SELECT pglogical.replication_set_add_table('pgl_validate_bidir', 'public.bidir_accounts'::regclass, false);
+SELECT pglogical.alter_subscription_add_replication_set('sub', 'pgl_validate_bidir');
+"@ | Out-Null
+    Invoke-Sql -Database 'provider' -Sql @"
+SELECT pglogical.create_subscription(
+    'sub_from_target',
+    $targetDsnSql,
+    ARRAY['pgl_validate_bidir','pgl_validate_barrier'],
+    false,
+    true,
+    ARRAY[]::text[]
+)
+"@ | Out-Null
+    $reverseSlotName = Wait-SubscriptionReady `
+        -SubscriberDatabase 'provider' `
+        -SubscriptionName 'sub_from_target' `
+        -ProviderDatabase 'target' `
+        -TimeoutSeconds $TimeoutSeconds
+    Wait-SqlEquals `
+        -Database 'provider' `
+        -Sql "SELECT COALESCE((SELECT left(status, 1) FROM pglogical.show_subscription_table('sub_from_target'::name, 'public.bidir_accounts'::regclass)), '<missing>')" `
+        -Expected 'r' `
+        -TimeoutSeconds $TimeoutSeconds
+
+    Invoke-Sql -Database 'provider' -Sql @"
+UPDATE pgl_validate.peer
+SET replication_sets = ARRAY['pgl_validate_bidir'],
+    reverse_subscription_name = 'sub_from_target'
+WHERE name = 'target'
+"@ | Out-Null
+    $bidirectionalResult = Invoke-Sql -Database 'provider' -Sql @"
+SELECT run_id::text || ';' || verdict
+FROM pgl_validate.compare_table(
+    'public.bidir_accounts'::regclass,
+    ARRAY['target'],
+    jsonb_build_object(
+        'provider_dsn', $providerDsnSql,
+        'provider_node', 'provider',
+        'repsets', jsonb_build_array('pgl_validate_bidir'),
+        'fence_timeout_ms', 30000,
+        'fence_poll_interval_ms', 100
+    )
+)
+"@
+    $bidirectionalParts = $bidirectionalResult.Split(';', 2)
+    if ($bidirectionalParts.Count -ne 2) {
+        throw "unexpected bidirectional compare_table result: $bidirectionalResult"
+    }
+    $bidirectionalRunId = $bidirectionalParts[0]
+    $bidirectionalVerdict = $bidirectionalParts[1]
+    if ($bidirectionalVerdict -ne 'match') {
+        throw "unexpected bidirectional compare_table verdict: $bidirectionalVerdict"
+    }
+
+    $bidirectionalFenceShape = Invoke-Sql -Database 'provider' -Sql @"
+SELECT
+    count(*) FILTER (
+        WHERE re.provider_node = 'provider'
+          AND re.target_node = 'target'
+          AND fa.status = 'converged'
+    )::text || ';' ||
+    count(*) FILTER (
+        WHERE re.provider_node = 'target'
+          AND re.target_node = 'provider'
+          AND fa.status = 'converged'
+    )::text || ';' ||
+    count(*) FILTER (
+        WHERE br.origin_node = 'target'
+    )::text
+FROM pgl_validate.run_edge re
+JOIN pgl_validate.fence_attempt fa USING (run_id, edge_id)
+LEFT JOIN pgl_validate.fence_barrier_run br USING (run_id, epoch_seq, edge_id)
+WHERE re.run_id = $bidirectionalRunId
+  AND re.backend = 'pglogical'
+  AND fa.epoch_seq = 1
+"@
+    if ($bidirectionalFenceShape -ne '1;1;1') {
+        throw "bidirectional pglogical fence vector was not recorded: $bidirectionalFenceShape using reverse slot $reverseSlotName"
+    }
+    Invoke-Sql -Database 'provider' -Sql @"
+UPDATE pgl_validate.peer
+SET replication_sets = ARRAY['default'],
+    reverse_subscription_name = NULL
+WHERE name = 'target'
+"@ | Out-Null
 
     Write-Step 'Validating pglogical mid-sync table is skipped before fencing'
     $pglogicalOriginalSync = Invoke-Sql -Database 'target' -Sql @"
@@ -705,6 +801,7 @@ SELECT EXISTS (
     if ($degradedFenceRecorded -ne 'true') {
         throw 'degraded fence catalog rows were not recorded'
     }
+    Invoke-Sql -Database 'degraded' -Sql "SELECT pglogical.alter_subscription_disable('sub_degraded', true)" | Out-Null
 
     Write-Step 'Validating pglogical row-filter intersection semantics'
     Invoke-Sql -Database 'provider' -Sql @"

@@ -90,13 +90,16 @@ SET pgl_validate.correlate_conflict_history = on;
 SET pgl_validate.conflict_history_max_rows = 1000;
 ```
 
+For bidirectional pglogical validation, set `pgl_validate.peer.reverse_subscription_name`
+to the local subscription that replicates from that peer back to the coordinator.
+
 ## Status
 
 The repository is being built from the design outward. The current slice covers
 catalog DDL, row digest framing, LtHash state, pglogical contract discovery,
 native publication contract discovery, native barrier fencing, cryptographic
 set confirmation, edge-specific barrier fencing, pglogical row-filter
-intersection semantics,
+intersection semantics, bidirectional pglogical reverse-edge fencing,
 physical-standby replay fence plumbing, sequence-window validation, keyless
 whole-relation validation, multi-table and replication-set compare
 orchestration, structured JSON reports, reviewable repair generation, audited
