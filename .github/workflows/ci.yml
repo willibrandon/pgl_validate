@@ -36,11 +36,18 @@ jobs:
             platform: windows-x64
             msvc_arch: x64
           - os: windows-11-vs2026-arm
+            platform: windows-arm64
+            msvc_arch: arm64
+            rust_toolchain: stable-aarch64-pc-windows-msvc
+            postgres_from_source: true
+          - os: windows-11-vs2026-arm
             platform: windows-arm64-hosted-x64
             msvc_arch: x64
             rust_toolchain: stable-x86_64-pc-windows-msvc
           - os: macos-15
             platform: macos-arm64
+          - os: macos-15-intel
+            platform: macos-x64
     defaults:
       run:
         shell: pwsh
@@ -59,6 +66,13 @@ jobs:
         with:
           key: pgrx-pg${{ matrix.pg }}-${{ matrix.target.platform }}
 
+      - name: Cache source-built PostgreSQL
+        if: ${{ matrix.target.postgres_from_source == true }}
+        uses: actions/cache@v4
+        with:
+          path: ~/.pgrx/postgresql-*
+          key: postgres-source-pg${{ matrix.pg }}-${{ matrix.target.platform }}-v1
+
       - name: Enter MSVC developer environment
         if: runner.os == 'Windows'
         uses: ilammy/msvc-dev-cmd@v1
@@ -68,7 +82,13 @@ jobs:
       - name: Set up PostgreSQL and pgrx
         env:
           PGL_VALIDATE_MSVC_ARCH: ${{ matrix.target.msvc_arch }}
-        run: ./scripts/ci-setup.ps1 -PgMajor ${{ matrix.pg }}
+          PGL_VALIDATE_POSTGRES_FROM_SOURCE: ${{ matrix.target.postgres_from_source }}
+        run: |
+          $setupArgs = @('-PgMajor', '${{ matrix.pg }}')
+          if ($env:PGL_VALIDATE_POSTGRES_FROM_SOURCE -eq 'true') {
+            $setupArgs += '-BuildPostgresFromSource'
+          }
+          ./scripts/ci-setup.ps1 @setupArgs
 
       - name: Install pglogical release
         env:
@@ -106,11 +126,18 @@ jobs:
             platform: windows-x64
             msvc_arch: x64
           - os: windows-11-vs2026-arm
+            platform: windows-arm64
+            msvc_arch: arm64
+            rust_toolchain: stable-aarch64-pc-windows-msvc
+            postgres_from_source: true
+          - os: windows-11-vs2026-arm
             platform: windows-arm64-hosted-x64
             msvc_arch: x64
             rust_toolchain: stable-x86_64-pc-windows-msvc
           - os: macos-15
             platform: macos-arm64
+          - os: macos-15-intel
+            platform: macos-x64
     defaults:
       run:
         shell: pwsh
@@ -129,6 +156,13 @@ jobs:
         with:
           key: pglogical-pg${{ matrix.pg }}-${{ matrix.target.platform }}
 
+      - name: Cache source-built PostgreSQL
+        if: ${{ matrix.target.postgres_from_source == true }}
+        uses: actions/cache@v4
+        with:
+          path: ~/.pgrx/postgresql-*
+          key: postgres-source-pg${{ matrix.pg }}-${{ matrix.target.platform }}-v1
+
       - name: Enter MSVC developer environment
         if: runner.os == 'Windows'
         uses: ilammy/msvc-dev-cmd@v1
@@ -138,7 +172,13 @@ jobs:
       - name: Set up PostgreSQL and pgrx
         env:
           PGL_VALIDATE_MSVC_ARCH: ${{ matrix.target.msvc_arch }}
-        run: ./scripts/ci-setup.ps1 -PgMajor ${{ matrix.pg }}
+          PGL_VALIDATE_POSTGRES_FROM_SOURCE: ${{ matrix.target.postgres_from_source }}
+        run: |
+          $setupArgs = @('-PgMajor', '${{ matrix.pg }}')
+          if ($env:PGL_VALIDATE_POSTGRES_FROM_SOURCE -eq 'true') {
+            $setupArgs += '-BuildPostgresFromSource'
+          }
+          ./scripts/ci-setup.ps1 @setupArgs
 
       - name: Install pglogical release
         env:
@@ -172,11 +212,18 @@ jobs:
             platform: windows-x64
             msvc_arch: x64
           - os: windows-11-vs2026-arm
+            platform: windows-arm64
+            msvc_arch: arm64
+            rust_toolchain: stable-aarch64-pc-windows-msvc
+            postgres_from_source: true
+          - os: windows-11-vs2026-arm
             platform: windows-arm64-hosted-x64
             msvc_arch: x64
             rust_toolchain: stable-x86_64-pc-windows-msvc
           - os: macos-15
             platform: macos-arm64
+          - os: macos-15-intel
+            platform: macos-x64
     defaults:
       run:
         shell: pwsh
@@ -195,6 +242,13 @@ jobs:
         with:
           key: ${{ matrix.backend }}-pg${{ matrix.pg }}-${{ matrix.target.platform }}
 
+      - name: Cache source-built PostgreSQL
+        if: ${{ matrix.target.postgres_from_source == true }}
+        uses: actions/cache@v4
+        with:
+          path: ~/.pgrx/postgresql-*
+          key: postgres-source-pg${{ matrix.pg }}-${{ matrix.target.platform }}-v1
+
       - name: Enter MSVC developer environment
         if: runner.os == 'Windows'
         uses: ilammy/msvc-dev-cmd@v1
@@ -204,7 +258,13 @@ jobs:
       - name: Set up PostgreSQL and pgrx
         env:
           PGL_VALIDATE_MSVC_ARCH: ${{ matrix.target.msvc_arch }}
-        run: ./scripts/ci-setup.ps1 -PgMajor ${{ matrix.pg }}
+          PGL_VALIDATE_POSTGRES_FROM_SOURCE: ${{ matrix.target.postgres_from_source }}
+        run: |
+          $setupArgs = @('-PgMajor', '${{ matrix.pg }}')
+          if ($env:PGL_VALIDATE_POSTGRES_FROM_SOURCE -eq 'true') {
+            $setupArgs += '-BuildPostgresFromSource'
+          }
+          ./scripts/ci-setup.ps1 @setupArgs
 
       - name: Run native logical harness
         if: matrix.backend == 'native-logical'

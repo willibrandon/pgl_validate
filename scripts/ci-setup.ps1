@@ -2,7 +2,9 @@ param(
     [ValidateSet(15, 16, 17, 18)]
     [int] $PgMajor = 18,
 
-    [string] $CargoPgrxVersion = '0.19.1'
+    [string] $CargoPgrxVersion = '0.19.1',
+
+    [switch] $BuildPostgresFromSource
 )
 
 $ErrorActionPreference = 'Stop'
@@ -45,8 +47,52 @@ function Invoke-Logged {
     }
 }
 
+function Get-PostgresSourceVersion {
+    param([int] $Major)
+
+    switch ($Major) {
+        15 { return '15.18' }
+        16 { return '16.14' }
+        17 { return '17.10' }
+        18 { return '18.4' }
+        default { throw "Unsupported PostgreSQL major: $Major" }
+    }
+}
+
 function Install-CargoPgrx {
     Invoke-Logged -FilePath 'cargo' -Arguments @('install', '--locked', 'cargo-pgrx', '--version', $CargoPgrxVersion)
+}
+
+function Ensure-ChocolateyPackage {
+    param(
+        [string] $CommandName,
+        [string] $PackageName
+    )
+
+    if (Get-PglCommandSource -Name $CommandName) {
+        return
+    }
+
+    $choco = Get-PglCommandSource -Name 'choco'
+    if (-not $choco) {
+        throw "$CommandName was not found and Chocolatey is unavailable."
+    }
+
+    Invoke-Logged -FilePath $choco -Arguments @('install', $PackageName, '-y', '--no-progress')
+
+    if ($PackageName -eq 'strawberryperl') {
+        foreach ($path in @('C:\Strawberry\perl\bin', 'C:\Strawberry\c\bin')) {
+            if (Test-Path -LiteralPath $path) {
+                Add-GitHubPath -Path $path
+            }
+        }
+    }
+    elseif ($PackageName -eq 'cmake') {
+        $path = 'C:\Program Files\CMake\bin'
+        if (Test-Path -LiteralPath $path) {
+            Add-GitHubPath -Path $path
+        }
+    }
 }
 
 function Enable-PostgresInstallWrites {
@@ -146,10 +192,70 @@ function Initialize-WindowsPostgres {
     Invoke-Logged -FilePath 'cargo' -Arguments @('pgrx', 'init', "--pg$PgMajor", 'download')
 }
 
+function Initialize-WindowsSourcePostgres {
+    Ensure-ChocolateyPackage -CommandName 'perl' -PackageName 'strawberryperl'
+    Ensure-ChocolateyPackage -CommandName 'cmake' -PackageName 'cmake'
+
+    $postgresVersion = Get-PostgresSourceVersion -Major $PgMajor
+    $architecture = if ($env:PGL_VALIDATE_MSVC_ARCH) {
+        $env:PGL_VALIDATE_MSVC_ARCH.ToLowerInvariant()
+    }
+    else {
+        [Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString().ToLowerInvariant()
+    }
+    $pgrxHome = Get-PglPgrxHome
+    $installRoot = Join-Path $pgrxHome "postgresql-$postgresVersion-$architecture"
+    $pgConfig = Join-Path (Join-Path $installRoot 'bin') 'pg_config.exe'
+
+    if (-not (Test-Path -LiteralPath $pgConfig)) {
+        $workDir = Join-Path ([IO.Path]::GetTempPath()) "pgl_validate-postgresql-$postgresVersion-$([guid]::NewGuid())"
+        $archivePath = Join-Path $workDir "postgresql-$postgresVersion.tar.gz"
+        $sourceUri = "https://ftp.postgresql.org/pub/source/v$postgresVersion/postgresql-$postgresVersion.tar.gz"
+        New-Item -ItemType Directory -Force -Path $workDir | Out-Null
+
+        try {
+            Invoke-WebRequest -Uri $sourceUri -OutFile $archivePath
+            $tar = Get-PglCommandSource -Name 'tar'
+            if (-not $tar) {
+                throw 'tar is required to extract PostgreSQL source.'
+            }
+
+            Invoke-Logged -FilePath $tar -Arguments @('-xzf', $archivePath, '-C', $workDir)
+            $sourceRoot = Join-Path $workDir "postgresql-$postgresVersion"
+
+            Push-Location $sourceRoot
+            try {
+                $buildScript = Join-Path (Join-Path 'src' 'tools') (Join-Path 'msvc' 'build.pl')
+                $installScript = Join-Path (Join-Path 'src' 'tools') (Join-Path 'msvc' 'install.pl')
+                Invoke-Logged -FilePath 'perl' -Arguments @($buildScript)
+                Invoke-Logged -FilePath 'perl' -Arguments @($installScript, $installRoot)
+            }
+            finally {
+                Pop-Location
+            }
+        }
+        finally {
+            Remove-Item -LiteralPath $workDir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    if (-not (Test-Path -LiteralPath $pgConfig)) {
+        throw "PostgreSQL source build did not produce $pgConfig."
+    }
+
+    Invoke-Logged -FilePath 'cargo' -Arguments @('pgrx', 'init', "--pg$PgMajor", $pgConfig)
+    Enable-PostgresInstallWrites -PgConfig $pgConfig
+}
+
 Install-CargoPgrx
 
 if (Test-PglWindows) {
-    Initialize-WindowsPostgres
+    if ($BuildPostgresFromSource) {
+        Initialize-WindowsSourcePostgres
+    }
+    else {
+        Initialize-WindowsPostgres
+    }
 }
 elseif (Test-PglMacOS) {
     Initialize-MacPostgres
