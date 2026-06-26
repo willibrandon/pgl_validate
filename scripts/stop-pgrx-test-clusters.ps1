@@ -6,11 +6,28 @@ param(
 $ErrorActionPreference = 'Stop'
 
 $workspace = (Resolve-Path -LiteralPath $Root).Path
-$targets = @(
+$configuredTargets = @(
     'target\test-pgdata',
     'target\pglogical-test-pgdata',
     'target\diag-pgdata'
 ) | ForEach-Object { Join-Path $workspace $_ }
+
+function Assert-WorkspaceTargetPath {
+    param([string] $Path)
+
+    $resolvedPath = (Resolve-Path -LiteralPath $Path).Path
+    $targetRoot = Join-Path $workspace 'target'
+    $resolvedTargetRoot = (Resolve-Path -LiteralPath $targetRoot -ErrorAction SilentlyContinue).Path
+    if (-not $resolvedTargetRoot) {
+        $resolvedTargetRoot = $targetRoot
+    }
+
+    if (-not $resolvedPath.StartsWith($resolvedTargetRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "Refusing to operate on path outside workspace target directory: $resolvedPath"
+    }
+
+    return $resolvedPath
+}
 
 function Stop-ProcessTree {
     param([int] $ProcessId)
@@ -104,6 +121,29 @@ function Stop-DataDirectoryCluster {
     }
 }
 
+function Get-RepoClusterDataDirectories {
+    $known = $configuredTargets | Where-Object { Test-Path -LiteralPath $_ }
+
+    $targetRoot = Join-Path $workspace 'target'
+    $discovered = @()
+    if (Test-Path -LiteralPath $targetRoot) {
+        $discovered = Get-ChildItem -LiteralPath $targetRoot -Recurse -Force -File -Filter 'postmaster.pid' -ErrorAction SilentlyContinue |
+            ForEach-Object {
+                $dataDirectory = $_.Directory.FullName
+                if (Test-Path -LiteralPath (Join-Path $dataDirectory 'PG_VERSION')) {
+                    $dataDirectory
+                }
+            }
+    }
+
+    @($known + $discovered) |
+        Where-Object { $_ } |
+        ForEach-Object { Assert-WorkspaceTargetPath -Path $_ } |
+        Sort-Object -Unique
+}
+
+$targets = Get-RepoClusterDataDirectories
+
 foreach ($target in $targets) {
     Stop-DataDirectoryCluster -DataDirectory $target
 }
@@ -133,16 +173,16 @@ foreach ($proc in $procs) {
 Start-Sleep -Milliseconds 500
 
 if ($RemoveData) {
-    foreach ($target in $targets) {
-        if (Test-Path -LiteralPath $target) {
-            $resolvedTarget = (Resolve-Path -LiteralPath $target).Path
-            if (-not $resolvedTarget.StartsWith($workspace, [System.StringComparison]::OrdinalIgnoreCase)) {
-                throw "Refusing to remove path outside workspace: $resolvedTarget"
-            }
+    $removalTargets = @($configuredTargets + $targets) |
+        Where-Object { Test-Path -LiteralPath $_ } |
+        ForEach-Object { Assert-WorkspaceTargetPath -Path $_ } |
+        Sort-Object -Unique
 
+    foreach ($target in $removalTargets) {
+        if (Test-Path -LiteralPath $target) {
             for ($attempt = 1; $attempt -le 20; $attempt++) {
                 try {
-                    Remove-Item -LiteralPath $resolvedTarget -Recurse -Force
+                    Remove-Item -LiteralPath $target -Recurse -Force
                     break
                 }
                 catch {
