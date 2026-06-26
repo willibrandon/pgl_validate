@@ -13,6 +13,7 @@ $targetRoot = Join-Path $workspace 'target'
 $configuredTargets = @(
     'test-pgdata',
     'pglogical-test-pgdata',
+    'pglogical-cascade-pgdata',
     'native-test-pgdata',
     'standby-primary-pgdata',
     'standby-replica-pgdata',
@@ -160,6 +161,7 @@ $patterns = foreach ($target in $targets) {
 $patterns += @(
     'target[/\\]test-pgdata',
     'target[/\\]pglogical-test-pgdata',
+    'target[/\\]pglogical-cascade-pgdata',
     'target[/\\]pglogical-mixed-[^/\\]+-pg\d+',
     'target[/\\]native-test-pgdata',
     'target[/\\]standby-primary-pgdata',

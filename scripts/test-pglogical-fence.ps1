@@ -16,7 +16,9 @@ $common = Join-Path $PSScriptRoot 'pgrx-common.ps1'
 $root = Split-Path -Parent $PSScriptRoot
 $target = Join-Path $root 'target'
 $data = Join-Path $target 'pglogical-test-pgdata'
+$cascadeData = Join-Path $target 'pglogical-cascade-pgdata'
 $log = Join-Path $target 'pglogical-test.log'
+$cascadeLog = Join-Path $target 'pglogical-cascade.log'
 $runner = Join-Path $PSScriptRoot 'pgrx-vs.ps1'
 
 function Write-Step {
@@ -192,10 +194,11 @@ function ConvertTo-SqlLiteral {
 function Invoke-Sql {
     param(
         [string] $Database,
-        [string] $Sql
+        [string] $Sql,
+        [int] $Port = $script:Port
     )
 
-    $output = & $script:Psql -X -w -h localhost -p $script:Port -U postgres -d $Database `
+    $output = & $script:Psql -X -w -h localhost -p $Port -U postgres -d $Database `
         -v ON_ERROR_STOP=1 -Atq -c $Sql 2>&1
     if ($LASTEXITCODE -ne 0) {
         throw "psql failed on database ${Database}: $($output -join [Environment]::NewLine)"
@@ -266,6 +269,8 @@ function Wait-SubscriptionReady {
         [string] $SubscriberDatabase = 'target',
         [string] $SubscriptionName = 'sub',
         [string] $ProviderDatabase = 'provider',
+        [int] $SubscriberPort = $script:Port,
+        [int] $ProviderPort = $script:Port,
         [int] $TimeoutSeconds
     )
 
@@ -273,7 +278,7 @@ function Wait-SubscriptionReady {
     $last = ''
 
     while ([DateTimeOffset]::Now -lt $deadline) {
-        $status = Invoke-Sql -Database $SubscriberDatabase -Sql @"
+        $status = Invoke-Sql -Database $SubscriberDatabase -Port $SubscriberPort -Sql @"
 SELECT COALESCE((
     SELECT status || '|' || slot_name
     FROM pglogical.show_subscription_status($(ConvertTo-SqlLiteral $SubscriptionName)::name)
@@ -282,7 +287,7 @@ SELECT COALESCE((
         $parts = $status.Split('|', 2)
         $statusValue = $parts[0]
         $slotName = if ($parts.Count -gt 1) { $parts[1] } else { '' }
-        $sync = Invoke-Sql -Database $SubscriberDatabase -Sql @"
+        $sync = Invoke-Sql -Database $SubscriberDatabase -Port $SubscriberPort -Sql @"
 SELECT COALESCE(
     string_agg(
         sync_kind::text || ':' || sync_status::text || ':' || sync_statuslsn::text,
@@ -292,7 +297,7 @@ SELECT COALESCE(
 )
 FROM pglogical.local_sync_status
 "@
-        $syncReady = Invoke-Sql -Database $SubscriberDatabase -Sql @"
+        $syncReady = Invoke-Sql -Database $SubscriberDatabase -Port $SubscriberPort -Sql @"
 SELECT (NOT EXISTS (
     SELECT 1
     FROM pglogical.local_sync_status
@@ -301,7 +306,7 @@ SELECT (NOT EXISTS (
 "@
         $slotStatus = '<no-slot>'
         if ($slotName) {
-            $slotStatus = Invoke-Sql -Database $ProviderDatabase -Sql @"
+            $slotStatus = Invoke-Sql -Database $ProviderDatabase -Port $ProviderPort -Sql @"
 SELECT COALESCE((
     SELECT active::text || ':' || confirmed_flush_lsn::text
     FROM pg_replication_slots
@@ -326,6 +331,7 @@ function Wait-SqlEquals {
         [string] $Database,
         [string] $Sql,
         [string] $Expected,
+        [int] $Port = $script:Port,
         [int] $TimeoutSeconds
     )
 
@@ -333,7 +339,7 @@ function Wait-SqlEquals {
     $last = ''
 
     while ([DateTimeOffset]::Now -lt $deadline) {
-        $last = Invoke-Sql -Database $Database -Sql $Sql
+        $last = Invoke-Sql -Database $Database -Port $Port -Sql $Sql
         if ($last -eq $Expected) {
             return
         }
@@ -349,6 +355,7 @@ function Wait-AdvisoryLockHeld {
         [string] $Database,
         [int] $ClassId,
         [int] $ObjectId,
+        [int] $Port = $script:Port,
         [int] $TimeoutSeconds
     )
 
@@ -356,6 +363,7 @@ function Wait-AdvisoryLockHeld {
         -Database $Database `
         -Sql "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE locktype = 'advisory' AND classid = $ClassId AND objid = $ObjectId AND granted)::text" `
         -Expected 'true' `
+        -Port $Port `
         -TimeoutSeconds $TimeoutSeconds
 }
 
@@ -364,6 +372,9 @@ $script:InitDb = Get-PglToolPath -PgConfig $pgConfig -Name 'initdb'
 $script:PgCtl = Get-PglToolPath -PgConfig $pgConfig -Name 'pg_ctl'
 $script:Psql = Get-PglToolPath -PgConfig $pgConfig -Name 'psql'
 $script:Port = New-FreePort
+do {
+    $script:CascadePort = New-FreePort
+} while ($script:CascadePort -eq $script:Port)
 $extensionSql = Get-ExtensionSqlPath -PgConfig $pgConfig
 $watchdog = Start-CleanupWatchdog -ParentPid $PID -Data $data -PgCtl $script:PgCtl -RemoveData:(-not $KeepData)
 
@@ -372,9 +383,13 @@ try {
     Stop-TestCluster -Data $data -PgCtl $script:PgCtl
     if (-not $KeepData) {
         Remove-TestData -Data $data
+        Remove-TestData -Data $cascadeData
     }
     if (Test-Path -LiteralPath $log) {
         Remove-Item -LiteralPath $log -Force
+    }
+    if (Test-Path -LiteralPath $cascadeLog) {
+        Remove-Item -LiteralPath $cascadeLog -Force
     }
 
     Write-Step "Installing pgl_validate for pg$PgMajor"
@@ -395,6 +410,11 @@ try {
         -FilePath $script:InitDb `
         -Arguments @('--locale=C', '--auth=trust', '--username=postgres', '-D', $data) `
         -TimeoutSeconds 120 | Out-Null
+    Write-Step "Initializing cascade test cluster at $cascadeData"
+    Invoke-CheckedProcess `
+        -FilePath $script:InitDb `
+        -Arguments @('--locale=C', '--auth=trust', '--username=postgres', '-D', $cascadeData) `
+        -TimeoutSeconds 120 | Out-Null
 
     Write-Step "Starting pglogical-enabled test cluster on port $script:Port"
     $socketOption = Get-PglUnixSocketOption -Directory $target
@@ -412,18 +432,33 @@ try {
         -FilePath $script:PgCtl `
         -Arguments @('start', '-D', $data, '-l', $log, '-o', $serverOptions, '-w', '-t', '30') `
         -TimeoutSeconds 45 | Out-Null
+    Write-Step "Starting pglogical-enabled cascade test cluster on port $script:CascadePort"
+    $cascadeServerOptions = (@(
+        "-p $script:CascadePort",
+        '-h localhost',
+        $socketOption,
+        '-c shared_preload_libraries=pglogical',
+        '-c wal_level=logical',
+        '-c max_worker_processes=20',
+        '-c max_replication_slots=20',
+        '-c max_wal_senders=20'
+    ) | Where-Object { $_ }) -join ' '
+    Invoke-CheckedProcess `
+        -FilePath $script:PgCtl `
+        -Arguments @('start', '-D', $cascadeData, '-l', $cascadeLog, '-o', $cascadeServerOptions, '-w', '-t', '30') `
+        -TimeoutSeconds 45 | Out-Null
 
     Write-Step 'Creating coordinator/provider/target databases and extensions'
     Invoke-Sql -Database 'postgres' -Sql 'CREATE DATABASE provider' | Out-Null
     Invoke-Sql -Database 'postgres' -Sql 'CREATE DATABASE target' | Out-Null
     Invoke-Sql -Database 'postgres' -Sql 'CREATE DATABASE degraded' | Out-Null
-    Invoke-Sql -Database 'postgres' -Sql 'CREATE DATABASE cascade' | Out-Null
+    Invoke-Sql -Database 'postgres' -Port $script:CascadePort -Sql 'CREATE DATABASE cascade' | Out-Null
     Invoke-Sql -Database 'postgres' -Sql 'CREATE EXTENSION pgl_validate' | Out-Null
 
     $providerDsn = "host=localhost port=$script:Port dbname=provider user=postgres connect_timeout=5 application_name=pgl_validate_pglogical"
     $targetDsn = "host=localhost port=$script:Port dbname=target user=postgres connect_timeout=5 application_name=pgl_validate_pglogical"
     $degradedDsn = "host=localhost port=$script:Port dbname=degraded user=postgres connect_timeout=5 application_name=pgl_validate_pglogical"
-    $cascadeDsn = "host=localhost port=$script:Port dbname=cascade user=postgres connect_timeout=5 application_name=pgl_validate_pglogical"
+    $cascadeDsn = "host=localhost port=$script:CascadePort dbname=cascade user=postgres connect_timeout=5 application_name=pgl_validate_pglogical"
     $sequenceProviderDsn = "host=localhost port=$script:Port dbname=seq_provider user=postgres connect_timeout=5 application_name=pgl_validate_pglogical"
     $sequenceTargetDsn = "host=localhost port=$script:Port dbname=seq_target user=postgres connect_timeout=5 application_name=pgl_validate_pglogical"
     $providerDsnSql = ConvertTo-SqlLiteral $providerDsn
@@ -1488,12 +1523,12 @@ WHERE run_id = $driftRunId
     Write-Step 'Creating pglogical cascade node with forward_origins={all} for repair guard validation'
     Invoke-Sql -Database 'target' -Sql 'SELECT pgl_validate.ensure_pglogical_barrier_repset()' | Out-Null
     Invoke-Sql -Database 'target' -Sql "SELECT pglogical.replication_set_add_table('default', 'public.accounts'::regclass, false)" | Out-Null
-    Invoke-Sql -Database 'cascade' -Sql 'CREATE EXTENSION pgl_validate' | Out-Null
-    Invoke-Sql -Database 'cascade' -Sql 'CREATE EXTENSION pglogical' | Out-Null
-    Invoke-Sql -Database 'cascade' -Sql 'CREATE TABLE public.accounts(id int PRIMARY KEY, value text)' | Out-Null
-    Invoke-Sql -Database 'cascade' -Sql "INSERT INTO public.accounts VALUES (1, 'target-drift')" | Out-Null
-    Invoke-Sql -Database 'cascade' -Sql "SELECT pglogical.create_node('cascade', $cascadeDsnSql)" | Out-Null
-    Invoke-Sql -Database 'cascade' -Sql @"
+    Invoke-Sql -Database 'cascade' -Port $script:CascadePort -Sql 'CREATE EXTENSION pgl_validate' | Out-Null
+    Invoke-Sql -Database 'cascade' -Port $script:CascadePort -Sql 'CREATE EXTENSION pglogical' | Out-Null
+    Invoke-Sql -Database 'cascade' -Port $script:CascadePort -Sql 'CREATE TABLE public.accounts(id int PRIMARY KEY, value text)' | Out-Null
+    Invoke-Sql -Database 'cascade' -Port $script:CascadePort -Sql "INSERT INTO public.accounts VALUES (1, 'target-drift')" | Out-Null
+    Invoke-Sql -Database 'cascade' -Port $script:CascadePort -Sql "SELECT pglogical.create_node('cascade', $cascadeDsnSql)" | Out-Null
+    Invoke-Sql -Database 'cascade' -Port $script:CascadePort -Sql @"
 SELECT pglogical.create_subscription(
     'sub_from_target',
     $targetDsnSql,
@@ -1507,6 +1542,98 @@ SELECT pglogical.create_subscription(
         -SubscriberDatabase 'cascade' `
         -SubscriptionName 'sub_from_target' `
         -ProviderDatabase 'target' `
+        -SubscriberPort $script:CascadePort `
+        -TimeoutSeconds $TimeoutSeconds
+
+    Write-Step 'Validating cascade token visibility is not direct-edge convergence'
+    $cascadedOnlyBarrier = Invoke-Sql -Database 'provider' -Sql @"
+SELECT token::text || ';' || barrier_end_lsn::text
+FROM pgl_validate.remote_inject_barrier(
+    $providerDsnSql,
+    10,
+    30000,
+    30000
+)
+"@
+    $cascadedOnlyParts = $cascadedOnlyBarrier.Split(';', 2)
+    if ($cascadedOnlyParts.Count -ne 2) {
+        throw "unexpected cascaded-only barrier result: $cascadedOnlyBarrier"
+    }
+    $cascadedOnlyToken = $cascadedOnlyParts[0]
+    $cascadedOnlyLsn = $cascadedOnlyParts[1]
+    $cascadedOnlyTokenSql = ConvertTo-SqlLiteral $cascadedOnlyToken
+    $cascadedOnlyLsnSql = ConvertTo-SqlLiteral $cascadedOnlyLsn
+    Wait-SqlEquals `
+        -Database 'cascade' `
+        -Sql "SELECT count(*)::text FROM pgl_validate.fence_barrier WHERE token = ${cascadedOnlyTokenSql}::uuid" `
+        -Expected '1' `
+        -Port $script:CascadePort `
+        -TimeoutSeconds $TimeoutSeconds
+
+    $probeDirectOriginSql = ConvertTo-SqlLiteral 'pgl_validate_probe_direct_provider_origin'
+    Invoke-Sql -Database 'cascade' -Port $script:CascadePort -Sql @"
+DO `$`$
+BEGIN
+    PERFORM pg_replication_origin_create($probeDirectOriginSql);
+EXCEPTION WHEN duplicate_object THEN
+    NULL;
+END
+`$`$;
+"@ | Out-Null
+    $edgeSpecificObservation = Invoke-Sql -Database 'provider' -Sql @"
+SELECT token_visible::text || ';' ||
+       converged::text || ';' ||
+       (origin_progress_lsn >= ${cascadedOnlyLsnSql}::pg_lsn)::text
+FROM pgl_validate.remote_observe_barrier(
+    $cascadeDsnSql,
+    $probeDirectOriginSql,
+    ${cascadedOnlyTokenSql}::uuid,
+    ${cascadedOnlyLsnSql}::pg_lsn,
+    10,
+    30000,
+    30000
+)
+"@
+    if ($edgeSpecificObservation -ne 'true;false;false') {
+        throw "cascaded token was incorrectly treated as direct-edge convergence: $edgeSpecificObservation"
+    }
+
+    Write-Step 'Validating duplicate cascade barrier tokens do not stall pglogical apply'
+    Invoke-Sql -Database 'cascade' -Port $script:CascadePort -Sql @"
+SELECT pglogical.create_subscription(
+    'sub_direct_provider',
+    $providerDsnSql,
+    ARRAY['pgl_validate_barrier'],
+    false,
+    false,
+    ARRAY[]::text[]
+)
+"@ | Out-Null
+    $null = Wait-SubscriptionReady `
+        -SubscriberDatabase 'cascade' `
+        -SubscriptionName 'sub_direct_provider' `
+        -ProviderDatabase 'provider' `
+        -SubscriberPort $script:CascadePort `
+        -TimeoutSeconds $TimeoutSeconds
+    $duplicateBarrier = Invoke-Sql -Database 'provider' -Sql @"
+SELECT token::text || ';' || barrier_end_lsn::text
+FROM pgl_validate.remote_inject_barrier(
+    $providerDsnSql,
+    10,
+    30000,
+    30000
+)
+"@
+    $duplicateParts = $duplicateBarrier.Split(';', 2)
+    if ($duplicateParts.Count -ne 2) {
+        throw "unexpected duplicate barrier result: $duplicateBarrier"
+    }
+    $duplicateTokenSql = ConvertTo-SqlLiteral $duplicateParts[0]
+    Wait-SqlEquals `
+        -Database 'cascade' `
+        -Sql "SELECT count(*)::text FROM pgl_validate.fence_barrier WHERE token = ${duplicateTokenSql}::uuid" `
+        -Expected '2' `
+        -Port $script:CascadePort `
         -TimeoutSeconds $TimeoutSeconds
 
     Invoke-Sql -Database 'provider' -Sql @"
@@ -1633,12 +1760,17 @@ catch {
         Write-Output '--- pglogical test log tail ---'
         Get-Content -LiteralPath $log -Tail 120
     }
+    if (Test-Path -LiteralPath $cascadeLog) {
+        Write-Output '--- pglogical cascade test log tail ---'
+        Get-Content -LiteralPath $cascadeLog -Tail 120
+    }
     throw
 }
 finally {
     Stop-TestCluster -Data $data -PgCtl $script:PgCtl
     if (-not $KeepData) {
         Remove-TestData -Data $data
+        Remove-TestData -Data $cascadeData
     }
     if ($watchdog -and -not $watchdog.HasExited) {
         Stop-ProcessTree -ProcessId $watchdog.Id

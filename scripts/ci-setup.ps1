@@ -381,8 +381,8 @@ function Disconnect-HomebrewPostgresLinks {
 
     foreach ($major in @(15, 16, 17, 18)) {
         $formula = "postgresql@$major"
-        $null = & $brew --prefix $formula 2>$null
-        if ($LASTEXITCODE -ne 0) {
+        $installed = & $brew list --versions $formula 2>$null
+        if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace(($installed -join ''))) {
             continue
         }
 
