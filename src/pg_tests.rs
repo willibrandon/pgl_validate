@@ -533,6 +533,7 @@ mod tests {
             SET LOCAL pgl_validate.chunk_target_rows = 2;
             SET LOCAL pgl_validate.recheck_passes = 2;
             SET LOCAL pgl_validate.max_reported_tuple_bytes = 8192;
+            SET LOCAL pgl_validate.max_reported_divergences = 1000;
             SET LOCAL pgl_validate.hash_algorithm = 'blake3_256';
             SET LOCAL pgl_validate.chunk_max_duration = '2s';
             SET LOCAL pgl_validate.max_parallel_chunks = 4;
@@ -607,6 +608,11 @@ mod tests {
                 .unwrap()
                 .unwrap();
         assert_eq!(tuple_bytes_setting, "8192");
+        let reported_divergences_setting =
+            Spi::get_one::<String>("SHOW pgl_validate.max_reported_divergences")
+                .unwrap()
+                .unwrap();
+        assert_eq!(reported_divergences_setting, "1000");
         let statement_timeout_setting =
             Spi::get_one::<String>("SHOW pgl_validate.statement_timeout_per_chunk")
                 .unwrap()
@@ -658,6 +664,25 @@ mod tests {
 
                 IF NOT rejected THEN
                     RAISE EXCEPTION 'expected compare_table to reject max_reported_tuple_bytes=0';
+                END IF;
+
+                rejected := false;
+                BEGIN
+                    PERFORM pgl_validate.compare_table(
+                        'public.{table_name}'::regclass,
+                        ARRAY['remote_guc'],
+                        '{{"max_reported_divergences":0}}'::jsonb
+                    );
+                EXCEPTION WHEN others THEN
+                    IF SQLERRM = 'max_reported_divergences must be greater than zero' THEN
+                        rejected := true;
+                    ELSE
+                        RAISE;
+                    END IF;
+                END;
+
+                IF NOT rejected THEN
+                    RAISE EXCEPTION 'expected compare_table to reject max_reported_divergences=0';
                 END IF;
 
                 rejected := false;
@@ -2441,6 +2466,88 @@ mod tests {
             "#
         ))
         .unwrap();
+
+        let _ = crate::transport::libpq::execute_command(
+            &local_dsn,
+            &format!("DROP DATABASE IF EXISTS {peer_db} WITH (FORCE)"),
+        );
+    }
+
+    #[pg_test]
+    fn compare_table_caps_reported_divergence_keys_with_summary() {
+        let backend_pid = Spi::get_one::<i32>("SELECT pg_backend_pid()")
+            .unwrap()
+            .unwrap();
+        let peer_db = identifier(&format!("pgl_validate_div_cap_peer_{backend_pid}"));
+        let table_name = identifier(&format!("div_cap_target_{backend_pid}"));
+        let local_dsn = local_dsn();
+        let remote_dsn = peer_dsn(&peer_db);
+
+        let _ = crate::transport::libpq::execute_command(
+            &local_dsn,
+            &format!("DROP DATABASE IF EXISTS {peer_db} WITH (FORCE)"),
+        );
+        crate::transport::libpq::execute_command(&local_dsn, &format!("CREATE DATABASE {peer_db}"))
+            .unwrap();
+        crate::transport::libpq::execute_command(
+            &remote_dsn,
+            &format!(
+                "CREATE EXTENSION pgl_validate;
+                 CREATE TABLE public.{table_name}(id int PRIMARY KEY, value text);
+                 INSERT INTO public.{table_name}
+                 SELECT g, 'remote-' || g::text
+                 FROM generate_series(1, 5) AS g;"
+            ),
+        )
+        .unwrap();
+
+        Spi::run(&format!(
+            "CREATE TABLE public.{table_name}(id int PRIMARY KEY, value text);
+             INSERT INTO public.{table_name}
+             SELECT g, 'local-' || g::text
+             FROM generate_series(1, 5) AS g;
+             INSERT INTO pgl_validate.peer(name, dsn, backend)
+             VALUES ('remote_div_cap', {}, 'native');",
+            sql_literal(&remote_dsn)
+        ))
+        .unwrap();
+
+        let run_id = Spi::get_one::<i64>(&format!(
+            "
+            SELECT (pgl_validate.compare_table(
+                {}::regclass,
+                ARRAY['remote_div_cap'],
+                '{{\"max_reported_divergences\":2}}'::jsonb
+            )).run_id
+            ",
+            sql_literal(&format!("public.{table_name}"))
+        ))
+        .unwrap()
+        .unwrap();
+
+        let capped_summary = Spi::get_one::<String>(&format!(
+            "
+            SELECT
+                tr.verdict || ';' ||
+                count(d.*)::text || ';' ||
+                string_agg(d.key_text, ',' ORDER BY d.key_text) || ';' ||
+                max(si.detail)
+            FROM pgl_validate.table_result tr
+            JOIN pgl_validate.divergence d USING (run_id, schema_name, table_name)
+            JOIN pgl_validate.schema_issue si USING (run_id, schema_name, table_name)
+            WHERE tr.run_id = {run_id}
+              AND d.node = 'remote_div_cap'
+              AND si.node = 'remote_div_cap'
+              AND si.issue_code = 'DIVERGENCE_LIMIT_REACHED'
+            GROUP BY tr.verdict
+            "
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            capped_summary,
+            "differ;2;{\"id\": 1},{\"id\": 2};reported 2 of 5 key-level divergence(s); increase max_reported_divergences above 2 to persist every key"
+        );
 
         let _ = crate::transport::libpq::execute_command(
             &local_dsn,

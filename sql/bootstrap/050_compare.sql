@@ -379,6 +379,8 @@ DECLARE
     child_chunk_id bigint;
     planned_chunk_count int := 0;
     chunk_differ_count int := 0;
+    classified_divergence_count int := 0;
+    reported_divergence_count int := 0;
     range_target_rows int;
     checksum_sql text;
     remote_checksum_sql text;
@@ -419,6 +421,11 @@ DECLARE
         (NULLIF(options->>'max_reported_tuple_bytes', ''))::int,
         NULLIF(current_setting('pgl_validate.max_reported_tuple_bytes', true), '')::int,
         8192
+    );
+    max_reported_divergences int := COALESCE(
+        (NULLIF(options->>'max_reported_divergences', ''))::int,
+        NULLIF(current_setting('pgl_validate.max_reported_divergences', true), '')::int,
+        1000
     );
     hash_algorithm text := COALESCE(
         NULLIF(options->>'hash_algorithm', ''),
@@ -540,6 +547,9 @@ BEGIN
     END IF;
     IF max_reported_tuple_bytes <= 0 THEN
         RAISE EXCEPTION 'max_reported_tuple_bytes must be greater than zero';
+    END IF;
+    IF max_reported_divergences <= 0 THEN
+        RAISE EXCEPTION 'max_reported_divergences must be greater than zero';
     END IF;
     IF hash_algorithm <> 'blake3_256' THEN
         RAISE EXCEPTION 'hash_algorithm % is not implemented; only blake3_256 is currently available', hash_algorithm
@@ -2412,39 +2422,7 @@ BEGIN
                 ) AS r;
             END LOOP;
 
-            INSERT INTO pgl_validate.divergence(
-                run_id, schema_name, table_name, key_text, key_bytes,
-                classification, node, status, detected_epoch, tuple
-            )
-            SELECT
-                v_run_id,
-                v_schema_name,
-                v_rel_name,
-                classified.key_text,
-                classified.key_bytes,
-                classified.classification,
-                peer_rec.name,
-                CASE
-                    WHEN classified.classification IN ('missing_on','extra_on')
-                     AND validated_property IN ('filtered_intersection','filtered_advisory')
-                    THEN 'advisory'
-                    WHEN classified.classification = 'extra_on'
-                     AND validated_property = 'superset'
-                    THEN 'advisory'
-                    ELSE 'candidate'
-                END,
-                initial_epoch,
-                jsonb_build_object(
-                    'local', pgl_validate.reported_tuple_json(
-                        classified.local_row_json,
-                        max_reported_tuple_bytes
-                    ),
-                    'peer', pgl_validate.reported_tuple_json(
-                        classified.peer_row_json,
-                        max_reported_tuple_bytes
-                    )
-                )
-            FROM (
+            WITH classified AS (
                 SELECT
                     COALESCE(l.key_text, r.key_text) AS key_text,
                     COALESCE(l.key_bytes, r.key_bytes) AS key_bytes,
@@ -2468,14 +2446,83 @@ BEGIN
                     FROM pg_temp.pgl_validate_localized_sample
                     WHERE sample = 'A' AND node = peer_rec.name
                 ) r USING (key_bytes)
-            ) classified
-            WHERE classified.classification IS NOT NULL
-            ON CONFLICT (run_id, schema_name, table_name, key_bytes, node) DO UPDATE
-            SET classification = EXCLUDED.classification,
-                status = EXCLUDED.status,
-                tuple = EXCLUDED.tuple,
-                detected_epoch = EXCLUDED.detected_epoch,
-                detected_at = now();
+            ),
+            numbered AS (
+                SELECT
+                    c.*,
+                    count(*) OVER () AS total_divergences,
+                    row_number() OVER (ORDER BY c.key_text, c.classification, c.key_bytes) AS divergence_ordinal
+                FROM classified c
+                WHERE c.classification IS NOT NULL
+            ),
+            upserted AS (
+                INSERT INTO pgl_validate.divergence(
+                    run_id, schema_name, table_name, key_text, key_bytes,
+                    classification, node, status, detected_epoch, tuple
+                )
+                SELECT
+                    v_run_id,
+                    v_schema_name,
+                    v_rel_name,
+                    n.key_text,
+                    n.key_bytes,
+                    n.classification,
+                    peer_rec.name,
+                    CASE
+                        WHEN n.classification IN ('missing_on','extra_on')
+                         AND validated_property IN ('filtered_intersection','filtered_advisory')
+                        THEN 'advisory'
+                        WHEN n.classification = 'extra_on'
+                         AND validated_property = 'superset'
+                        THEN 'advisory'
+                        ELSE 'candidate'
+                    END,
+                    initial_epoch,
+                    jsonb_build_object(
+                        'local', pgl_validate.reported_tuple_json(
+                            n.local_row_json,
+                            max_reported_tuple_bytes
+                        ),
+                        'peer', pgl_validate.reported_tuple_json(
+                            n.peer_row_json,
+                            max_reported_tuple_bytes
+                        )
+                    )
+                FROM numbered n
+                WHERE n.divergence_ordinal <= max_reported_divergences
+                ON CONFLICT (run_id, schema_name, table_name, key_bytes, node) DO UPDATE
+                SET classification = EXCLUDED.classification,
+                    status = EXCLUDED.status,
+                    tuple = EXCLUDED.tuple,
+                    detected_epoch = EXCLUDED.detected_epoch,
+                    detected_at = now()
+                RETURNING 1
+            )
+            SELECT
+                COALESCE(max(n.total_divergences), 0)::int,
+                (SELECT count(*)::int FROM upserted)
+            INTO classified_divergence_count, reported_divergence_count
+            FROM numbered n;
+
+            IF classified_divergence_count > reported_divergence_count THEN
+                INSERT INTO pgl_validate.schema_issue(
+                    run_id, node, schema_name, table_name, issue_code, detail
+                )
+                VALUES (
+                    v_run_id,
+                    peer_rec.name,
+                    v_schema_name,
+                    v_rel_name,
+                    'DIVERGENCE_LIMIT_REACHED',
+                    format(
+                        'reported %s of %s key-level divergence(s); increase max_reported_divergences above %s to persist every key',
+                        reported_divergence_count,
+                        classified_divergence_count,
+                        max_reported_divergences
+                    )
+                )
+                ON CONFLICT DO NOTHING;
+            END IF;
         END LOOP;
 
         FOR recheck_pass IN 1..recheck_passes LOOP

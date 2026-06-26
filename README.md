@@ -106,6 +106,7 @@ SET pgl_validate.sequence_buffer_multiplier = 2;
 SET pgl_validate.paranoid_confirm = off;
 SET pgl_validate.paranoid_confirm_max_rows = 1000;
 SET pgl_validate.max_reported_tuple_bytes = 8192;
+SET pgl_validate.max_reported_divergences = 1000;
 SET pgl_validate.hash_algorithm = 'blake3_256';
 SET pgl_validate.chunk_max_duration = '2s';
 SET pgl_validate.max_parallel_chunks = 4;

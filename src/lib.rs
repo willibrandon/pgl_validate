@@ -65,6 +65,7 @@ extension_sql_file!("../sql/comments.sql", name = "comments", finalize);
 static PARANOID_CONFIRM: GucSetting<bool> = GucSetting::<bool>::new(false);
 static PARANOID_CONFIRM_MAX_ROWS: GucSetting<i32> = GucSetting::<i32>::new(1000);
 static MAX_REPORTED_TUPLE_BYTES: GucSetting<i32> = GucSetting::<i32>::new(8192);
+static MAX_REPORTED_DIVERGENCES: GucSetting<i32> = GucSetting::<i32>::new(1000);
 static HASH_ALGORITHM: GucSetting<Option<CString>> =
     GucSetting::<Option<CString>>::new(Some(c"blake3_256"));
 static ALLOW_APPROXIMATE_FILTERS: GucSetting<bool> = GucSetting::<bool>::new(false);
@@ -115,6 +116,16 @@ pub extern "C-unwind" fn _PG_init() {
         c"Maximum captured divergent tuple bytes.",
         c"Caps each captured divergent tuple body stored in pgl_validate.divergence.tuple.",
         &MAX_REPORTED_TUPLE_BYTES,
+        1,
+        i32::MAX,
+        GucContext::Userset,
+        flags,
+    );
+    GucRegistry::define_int_guc(
+        c"pgl_validate.max_reported_divergences",
+        c"Maximum reported key-level divergences per table and peer.",
+        c"Caps persisted key-level divergences while recording a schema_issue summary when more are found.",
+        &MAX_REPORTED_DIVERGENCES,
         1,
         i32::MAX,
         GucContext::Userset,
