@@ -192,12 +192,16 @@ COMMENT ON FUNCTION pgl_validate.remote_wait_slot_confirm_lsn(text, text, pg_lsn
     'Call pglogical.wait_slot_confirm_lsn on a provider and return the slot confirmed_flush_lsn.';
 COMMENT ON FUNCTION pgl_validate.remote_slot_confirmed_flush_lsn(text, text, integer, integer, integer) IS
     'Fetch a provider logical slot confirmed_flush_lsn without using pglogical-specific helpers.';
+COMMENT ON FUNCTION pgl_validate.remote_logical_slot_lag(text, text, integer, integer, integer) IS
+    'Fetch provider-side active state, time lag, and WAL-byte lag for a logical replication slot.';
 COMMENT ON FUNCTION pgl_validate.remote_current_wal_lsn(text, integer, integer, integer) IS
     'Fetch a provider current WAL LSN for an explicitly degraded fence.';
 COMMENT ON FUNCTION pgl_validate.remote_observe_barrier(text, text, uuid, pg_lsn, integer, integer, integer) IS
     'Observe target-side replication origin progress, barrier-token visibility, and convergence.';
 COMMENT ON FUNCTION pgl_validate.remote_standby_replay_status(text, integer, integer, integer) IS
     'Fetch a remote participant''s recovery state, replay LSN, and replay-pause status.';
+COMMENT ON FUNCTION pgl_validate.remote_standby_replay_lag(text, pg_lsn, integer, integer, integer) IS
+    'Fetch physical-standby recovery state, replay LSN, and time lag relative to a primary WAL LSN.';
 COMMENT ON FUNCTION pgl_validate.remote_pglogical_subscription_status(text, text, integer, integer, integer) IS
     'Fetch pglogical subscription status from a remote target over libpq with bounded timeouts.';
 COMMENT ON FUNCTION pgl_validate.remote_native_subscription_status(text, text, integer, integer, integer) IS
@@ -210,6 +214,8 @@ COMMENT ON FUNCTION pgl_validate.remote_pglogical_forwarding_subscriptions(text,
     'Fetch enabled pglogical subscriptions on a remote subscriber that would forward all origins for the named provider node.';
 COMMENT ON FUNCTION pgl_validate.remote_pglogical_conflict_history(text, text, text, text, text, integer, integer, integer, integer) IS
     'Fetch pglogical conflict-history rows for one remote subscription and relation, returning typed text fields for catalog-side casting.';
+COMMENT ON FUNCTION pgl_validate.throttle_replication_lag(bigint, text, text, text, text, int[], interval, integer, integer) IS
+    'Pause a run while any exact logical or standby edge in the current edge vector exceeds the configured replication-lag threshold.';
 COMMENT ON TYPE pgl_validate.lthash_state IS
     'Internal varlena state for the LtHash multiset accumulator.';
 COMMENT ON FUNCTION pgl_validate.lthash_state_in(cstring) IS

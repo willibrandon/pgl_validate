@@ -1336,6 +1336,103 @@ mod tests {
     }
 
     #[pg_test]
+    fn throttle_replication_lag_times_out_for_inactive_slot() {
+        let backend_pid = Spi::get_one::<i32>("SELECT pg_backend_pid()")
+            .unwrap()
+            .unwrap();
+        let slot_name = identifier(&format!("pgl_validate_lag_{backend_pid}"));
+        let dsn = local_dsn();
+
+        Spi::run(&format!(
+            "
+            SELECT pg_drop_replication_slot(slot_name)
+            FROM pg_replication_slots
+            WHERE slot_name = {slot_name};
+            SELECT pg_create_physical_replication_slot({slot_name});
+            ",
+            slot_name = sql_literal(&slot_name)
+        ))
+        .unwrap();
+
+        let lag_probe = Spi::get_one::<String>(&format!(
+            "
+            SELECT active::text || ';' || lag_ms::text || ';' || lag_bytes::text
+            FROM pgl_validate.remote_logical_slot_lag({}, {})
+            ",
+            sql_literal(&dsn),
+            sql_literal(&slot_name)
+        ))
+        .unwrap()
+        .unwrap();
+        let lag_parts: Vec<_> = lag_probe.split(';').collect();
+        assert_eq!(lag_parts[0], "false");
+        assert_eq!(lag_parts[1], "0");
+        assert!(
+            lag_parts[2].parse::<i64>().unwrap() >= 0,
+            "lag_bytes should be nonnegative: {lag_probe}"
+        );
+
+        Spi::run(&format!(
+            "
+            DO $pgl_validate_throttle$
+            DECLARE
+                v_run_id bigint;
+            BEGIN
+                INSERT INTO pgl_validate.run(status)
+                VALUES ('running')
+                RETURNING run_id INTO v_run_id;
+
+                INSERT INTO pgl_validate.run_edge(
+                    run_id, edge_id, provider_node, target_node, backend,
+                    subscription, slot_name, origin_name, repsets
+                )
+                VALUES (
+                    v_run_id, 1, 'local', 'peer', 'pglogical',
+                    'sub', {slot_name}, 'origin', ARRAY['default']
+                );
+
+                BEGIN
+                    PERFORM pgl_validate.throttle_replication_lag(
+                        v_run_id,
+                        'public',
+                        'lag_target',
+                        'local',
+                        {dsn},
+                        ARRAY[1],
+                        interval '1 millisecond',
+                        1,
+                        1
+                    );
+                EXCEPTION
+                    WHEN query_canceled THEN
+                        IF SQLERRM LIKE 'replication lag remained above throttle_max_lag%' THEN
+                            RETURN;
+                        END IF;
+                        RAISE;
+                    WHEN others THEN
+                        IF SQLERRM LIKE 'replication lag remained above throttle_max_lag%' THEN
+                            RETURN;
+                        END IF;
+                        RAISE;
+                END;
+
+                RAISE EXCEPTION 'expected throttle_replication_lag to time out';
+            END
+            $pgl_validate_throttle$;
+            ",
+            dsn = sql_literal(&dsn),
+            slot_name = sql_literal(&slot_name)
+        ))
+        .unwrap();
+
+        Spi::run(&format!(
+            "SELECT pg_drop_replication_slot({})",
+            sql_literal(&slot_name)
+        ))
+        .unwrap();
+    }
+
+    #[pg_test]
     fn record_barrier_fence_persists_epoch_edge_and_protected_token() {
         let dsn = local_dsn();
         let sql = format!(
@@ -1485,6 +1582,98 @@ mod tests {
         .unwrap();
 
         assert_eq!(status, "true;false;0/0;false");
+    }
+
+    #[pg_test]
+    fn remote_standby_replay_lag_reports_primary_not_in_recovery() {
+        let dsn = local_dsn();
+        let status = Spi::get_one::<String>(&format!(
+            "
+            SELECT in_recovery::text || ';' ||
+                   replay_lsn::text || ';' ||
+                   lag_ms::text
+            FROM pgl_validate.remote_standby_replay_lag({}, pg_current_wal_lsn())
+            ",
+            sql_literal(&dsn)
+        ))
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(status, "false;0/0;0");
+    }
+
+    #[pg_test]
+    fn throttle_standby_lag_rejects_primary_peer() {
+        let dsn = local_dsn();
+        let backend_pid = Spi::get_one::<i32>("SELECT pg_backend_pid()")
+            .unwrap()
+            .unwrap();
+        let peer_name = identifier(&format!("standby_lag_primary_{backend_pid}"));
+
+        Spi::run(&format!(
+            "
+            DO $pgl_validate_standby_throttle$
+            DECLARE
+                v_run_id bigint;
+            BEGIN
+                INSERT INTO pgl_validate.peer(name, dsn, backend)
+                VALUES ({peer_name}, {dsn}, 'standby');
+
+                INSERT INTO pgl_validate.run(status)
+                VALUES ('running')
+                RETURNING run_id INTO v_run_id;
+
+                INSERT INTO pgl_validate.run_edge(
+                    run_id, edge_id, provider_node, target_node, backend,
+                    subscription, slot_name, origin_name, repsets
+                )
+                VALUES (
+                    v_run_id, 1, 'local', {peer_name}, 'standby',
+                    NULL, NULL, NULL, NULL
+                );
+
+                INSERT INTO pgl_validate.fence_epoch(run_id, epoch_seq)
+                VALUES (v_run_id, 1);
+
+                INSERT INTO pgl_validate.fence_edge(
+                    run_id, epoch_seq, edge_id, fence_kind, barrier_token, barrier_end_lsn
+                )
+                VALUES (v_run_id, 1, 1, 'standby_replay', NULL, pg_current_wal_lsn());
+
+                BEGIN
+                    PERFORM pgl_validate.throttle_replication_lag(
+                        v_run_id,
+                        'public',
+                        'standby_lag_target',
+                        'local',
+                        {dsn},
+                        ARRAY[1],
+                        interval '1 millisecond',
+                        1,
+                        1
+                    );
+                EXCEPTION
+                    WHEN others THEN
+                        IF SQLERRM = format('standby peer %s is not in recovery', {peer_name}) THEN
+                            RETURN;
+                        END IF;
+                        RAISE;
+                END;
+
+                RAISE EXCEPTION 'expected standby throttle to reject a primary peer';
+            END
+            $pgl_validate_standby_throttle$;
+            ",
+            dsn = sql_literal(&dsn),
+            peer_name = sql_literal(&peer_name)
+        ))
+        .unwrap();
+
+        Spi::run(&format!(
+            "DELETE FROM pgl_validate.peer WHERE name = {}",
+            sql_literal(&peer_name)
+        ))
+        .unwrap();
     }
 
     #[pg_test]

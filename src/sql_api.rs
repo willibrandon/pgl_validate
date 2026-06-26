@@ -399,6 +399,56 @@ AS 'MODULE_PATHNAME', 'remote_slot_confirmed_flush_lsn_wrapper';
         lsn as i64
     }
 
+    /// Fetch provider-side time and byte lag for a logical replication slot.
+    #[pg_extern(
+        volatile,
+        parallel_unsafe,
+        sql = r#"
+CREATE FUNCTION pgl_validate.remote_logical_slot_lag(
+    dsn text,
+    slot_name text,
+    connect_timeout_seconds integer DEFAULT 10,
+    statement_timeout_ms integer DEFAULT 600000,
+    lock_timeout_ms integer DEFAULT 30000
+)
+RETURNS TABLE (
+    active boolean,
+    lag_ms bigint,
+    lag_bytes bigint
+)
+LANGUAGE c
+STRICT
+VOLATILE
+PARALLEL UNSAFE
+AS 'MODULE_PATHNAME', 'remote_logical_slot_lag_wrapper';
+"#
+    )]
+    fn remote_logical_slot_lag(
+        dsn: &str,
+        slot_name: &str,
+        connect_timeout_seconds: default!(i32, 10),
+        statement_timeout_ms: default!(i32, 600000),
+        lock_timeout_ms: default!(i32, 30000),
+    ) -> TableIterator<
+        'static,
+        (
+            name!(active, bool),
+            name!(lag_ms, i64),
+            name!(lag_bytes, i64),
+        ),
+    > {
+        let lag = transport::libpq::fetch_logical_slot_lag(
+            dsn,
+            slot_name,
+            connect_timeout_seconds,
+            statement_timeout_ms,
+            lock_timeout_ms,
+        )
+        .unwrap_or_else(|err| pgrx::error!("{err}"));
+
+        TableIterator::once((lag.active, lag.lag_ms, lag.lag_bytes))
+    }
+
     /// Fetch a provider's current WAL LSN for an explicitly degraded fence.
     #[pg_extern(
         volatile,
@@ -549,6 +599,58 @@ AS 'MODULE_PATHNAME', 'remote_standby_replay_status_wrapper';
             status.replay_lsn as i64,
             status.replay_paused,
         ))
+    }
+
+    /// Fetch physical-standby replay lag relative to a primary WAL LSN.
+    #[pg_extern(
+        volatile,
+        parallel_unsafe,
+        sql = r#"
+CREATE FUNCTION pgl_validate.remote_standby_replay_lag(
+    dsn text,
+    target_lsn pg_lsn,
+    connect_timeout_seconds integer DEFAULT 10,
+    statement_timeout_ms integer DEFAULT 600000,
+    lock_timeout_ms integer DEFAULT 30000
+)
+RETURNS TABLE (
+    in_recovery boolean,
+    replay_lsn pg_lsn,
+    lag_ms bigint
+)
+LANGUAGE c
+STRICT
+VOLATILE
+PARALLEL UNSAFE
+AS 'MODULE_PATHNAME', 'remote_standby_replay_lag_wrapper';
+"#
+    )]
+    fn remote_standby_replay_lag(
+        dsn: &str,
+        target_lsn: i64,
+        connect_timeout_seconds: default!(i32, 10),
+        statement_timeout_ms: default!(i32, 600000),
+        lock_timeout_ms: default!(i32, 30000),
+    ) -> TableIterator<
+        'static,
+        (
+            name!(in_recovery, bool),
+            name!(replay_lsn, i64),
+            name!(lag_ms, Option<i64>),
+        ),
+    > {
+        let target_lsn =
+            u64::try_from(target_lsn).unwrap_or_else(|_| pgrx::error!("pg_lsn is negative"));
+        let lag = transport::libpq::fetch_standby_replay_lag(
+            dsn,
+            target_lsn,
+            connect_timeout_seconds,
+            statement_timeout_ms,
+            lock_timeout_ms,
+        )
+        .unwrap_or_else(|err| pgrx::error!("{err}"));
+
+        TableIterator::once((lag.in_recovery, lag.replay_lsn as i64, lag.lag_ms))
     }
 
     /// Fetch pglogical subscription status from a remote target node.

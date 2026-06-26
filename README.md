@@ -57,7 +57,7 @@ and extension catalog state.
 
 pglogical is a required part of the test environment. Install the packaged
 release into the target pgrx PostgreSQL; do not build from a local pglogical
-checkout:
+checkout. Repeat this for each PostgreSQL major you run locally:
 
 ```powershell
 .\scripts\install-pglogical-release.ps1 -PgMajor 18
@@ -68,8 +68,9 @@ when one exists. If a package is not published for the host architecture, it
 builds the source release against the selected `pg_config`.
 
 CI runs PostgreSQL 15, 16, 17, and 18 across Linux x64/arm64, Windows x64,
-Windows ARM64-hosted x64, and macOS x64/arm64 runners. The pglogical job
-installs the fork release package or source release for each target.
+Windows ARM64-hosted x64, and macOS ARM64 runners. The pgrx pg_test and
+pglogical integration jobs install the fork release package or source release
+for each target.
 
 Native logical replication coverage uses PostgreSQL's built-in publication and
 subscription machinery:

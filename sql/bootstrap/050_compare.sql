@@ -2023,6 +2023,18 @@ BEGIN
         END IF;
     END IF;
 
+    PERFORM pgl_validate.throttle_replication_lag(
+        v_run_id,
+        v_schema_name,
+        v_rel_name,
+        provider_node,
+        provider_dsn,
+        current_edge_ids,
+        throttle_max_lag,
+        fence_timeout_ms,
+        fence_poll_interval_ms
+    );
+
     UPDATE pgl_validate.run
     SET status = 'running'
     WHERE pgl_validate.run.run_id = v_run_id;
@@ -2211,6 +2223,18 @@ BEGIN
             child_chunk_id := range_rec.chunk_id + 1;
             chunk_differ_count := 0;
 
+            PERFORM pgl_validate.throttle_replication_lag(
+                v_run_id,
+                v_schema_name,
+                v_rel_name,
+                provider_node,
+                provider_dsn,
+                current_edge_ids,
+                throttle_max_lag,
+                fence_timeout_ms,
+                fence_poll_interval_ms
+            );
+
             INSERT INTO pgl_validate.chunk_result(
                 run_id, schema_name, table_name, chunk_id, parent_id, lo, hi, state, updated_at
             )
@@ -2374,6 +2398,18 @@ BEGIN
             ) localized_ranges
             ORDER BY chunk_id
         LOOP
+            PERFORM pgl_validate.throttle_replication_lag(
+                v_run_id,
+                v_schema_name,
+                v_rel_name,
+                provider_node,
+                provider_dsn,
+                current_edge_ids,
+                throttle_max_lag,
+                fence_timeout_ms,
+                fence_poll_interval_ms
+            );
+
             localize_sql := pgl_validate.plan_localize_sql(
                 p_table_name,
                 key_cols,
@@ -2432,6 +2468,18 @@ BEGIN
                 ) localized_ranges
                 ORDER BY chunk_id
             LOOP
+                PERFORM pgl_validate.throttle_replication_lag(
+                    v_run_id,
+                    v_schema_name,
+                    v_rel_name,
+                    provider_node,
+                    provider_dsn,
+                    current_edge_ids,
+                    throttle_max_lag,
+                    fence_timeout_ms,
+                    fence_poll_interval_ms
+                );
+
                 remote_localize_sql := pgl_validate.plan_localize_sql(
                     p_table_name,
                     key_cols,
@@ -2803,6 +2851,18 @@ BEGIN
                 ) localized_ranges
                 ORDER BY chunk_id
             LOOP
+                PERFORM pgl_validate.throttle_replication_lag(
+                    v_run_id,
+                    v_schema_name,
+                    v_rel_name,
+                    provider_node,
+                    provider_dsn,
+                    current_edge_ids,
+                    throttle_max_lag,
+                    fence_timeout_ms,
+                    fence_poll_interval_ms
+                );
+
                 localize_sql := pgl_validate.plan_localize_sql(
                     p_table_name,
                     key_cols,
@@ -2872,6 +2932,18 @@ BEGIN
                     ) localized_ranges
                     ORDER BY chunk_id
                 LOOP
+                    PERFORM pgl_validate.throttle_replication_lag(
+                        v_run_id,
+                        v_schema_name,
+                        v_rel_name,
+                        provider_node,
+                        provider_dsn,
+                        current_edge_ids,
+                        throttle_max_lag,
+                        fence_timeout_ms,
+                        fence_poll_interval_ms
+                    );
+
                     remote_localize_sql := pgl_validate.plan_localize_sql(
                         p_table_name,
                         key_cols,

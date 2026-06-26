@@ -36,9 +36,14 @@ extension_sql_file!(
     requires = ["bootstrap_barriers"]
 );
 extension_sql_file!(
+    "../sql/bootstrap/035_throttle.sql",
+    name = "bootstrap_throttle",
+    requires = ["bootstrap_fencing"]
+);
+extension_sql_file!(
     "../sql/bootstrap/040_planning.sql",
     name = "bootstrap_planning",
-    requires = ["bootstrap_fencing"]
+    requires = ["bootstrap_throttle"]
 );
 extension_sql_file!(
     "../sql/bootstrap/050_compare.sql",

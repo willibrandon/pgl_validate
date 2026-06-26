@@ -39,8 +39,6 @@ jobs:
             platform: windows-arm64-hosted-x64
             msvc_arch: x64
             rust_toolchain: stable-x86_64-pc-windows-msvc
-          - os: macos-15-intel
-            platform: macos-x64
           - os: macos-15
             platform: macos-arm64
     defaults:
@@ -71,6 +69,11 @@ jobs:
         env:
           PGL_VALIDATE_MSVC_ARCH: ${{ matrix.target.msvc_arch }}
         run: ./scripts/ci-setup.ps1 -PgMajor ${{ matrix.pg }}
+
+      - name: Install pglogical release
+        env:
+          PGL_VALIDATE_MSVC_ARCH: ${{ matrix.target.msvc_arch }}
+        run: ./scripts/install-pglogical-release.ps1 -PgMajor ${{ matrix.pg }}
 
       - name: Run pgrx pg_test suite
         env:
@@ -106,8 +109,6 @@ jobs:
             platform: windows-arm64-hosted-x64
             msvc_arch: x64
             rust_toolchain: stable-x86_64-pc-windows-msvc
-          - os: macos-15-intel
-            platform: macos-x64
           - os: macos-15
             platform: macos-arm64
     defaults:
@@ -174,8 +175,6 @@ jobs:
             platform: windows-arm64-hosted-x64
             msvc_arch: x64
             rust_toolchain: stable-x86_64-pc-windows-msvc
-          - os: macos-15-intel
-            platform: macos-x64
           - os: macos-15
             platform: macos-arm64
     defaults:

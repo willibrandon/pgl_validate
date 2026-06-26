@@ -91,6 +91,17 @@ pub(crate) struct SlotConfirmation {
     pub(crate) confirmed_flush_lsn: u64,
 }
 
+/// Provider-side lag observation for one logical replication slot.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) struct LogicalSlotLag {
+    /// Whether the provider slot currently has an active replication backend.
+    pub(crate) active: bool,
+    /// Maximum write/flush/replay lag reported by `pg_stat_replication`, in milliseconds.
+    pub(crate) lag_ms: i64,
+    /// WAL bytes between the provider's current WAL LSN and slot confirmed flush.
+    pub(crate) lag_bytes: i64,
+}
+
 /// Target-side apply observation for a barrier.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub(crate) struct BarrierObservation {
@@ -113,6 +124,17 @@ pub(crate) struct StandbyReplayStatus {
     pub(crate) replay_lsn: u64,
     /// Whether WAL replay is paused on the remote participant.
     pub(crate) replay_paused: bool,
+}
+
+/// Physical-standby lag observation against a target primary LSN.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) struct StandbyReplayLag {
+    /// Whether the remote participant is currently in recovery.
+    pub(crate) in_recovery: bool,
+    /// Remote `pg_last_wal_replay_lsn()`, or zero when no replay LSN exists.
+    pub(crate) replay_lsn: u64,
+    /// Replay lag in milliseconds, or `None` when the standby is behind but has no replay timestamp.
+    pub(crate) lag_ms: Option<i64>,
 }
 
 /// pglogical subscription status fetched from a remote target node.
@@ -461,6 +483,66 @@ pub(crate) fn fetch_slot_confirmed_flush_lsn(
     parse_lsn(&result.single_value()?)
 }
 
+/// Fetch provider-side time and byte lag for one logical replication slot.
+pub(crate) fn fetch_logical_slot_lag(
+    dsn: &str,
+    slot_name: &str,
+    connect_timeout_seconds: i32,
+    statement_timeout_ms: i32,
+    lock_timeout_ms: i32,
+) -> Result<LogicalSlotLag, String> {
+    let conn = Connection::connect_with_timeout(dsn, connect_timeout_seconds)?;
+    conn.set_query_timeouts(statement_timeout_ms, lock_timeout_ms)?;
+
+    let slot = sql_literal(slot_name);
+    let result = conn.exec(&format!(
+        "WITH slot AS ( \
+             SELECT s.active_pid, \
+                    COALESCE(s.confirmed_flush_lsn, '0/0'::pg_lsn) AS confirmed_flush_lsn, \
+                    pg_current_wal_lsn() AS current_lsn \
+             FROM pg_replication_slots s \
+             WHERE s.slot_name = {slot} \
+         ), observed AS ( \
+             SELECT (slot.active_pid IS NOT NULL) AS active, \
+                    GREATEST( \
+                        COALESCE(sr.write_lag, '0'::interval), \
+                        COALESCE(sr.flush_lag, '0'::interval), \
+                        COALESCE(sr.replay_lag, '0'::interval) \
+                    ) AS lag_interval, \
+                    GREATEST( \
+                        pg_wal_lsn_diff(slot.current_lsn, slot.confirmed_flush_lsn), \
+                        0::numeric \
+                    ) AS lag_bytes \
+             FROM slot \
+             LEFT JOIN pg_stat_replication sr ON sr.pid = slot.active_pid \
+         ) \
+         SELECT active::text, \
+                ceil(extract(epoch FROM lag_interval) * 1000)::bigint::text, \
+                lag_bytes::bigint::text \
+         FROM observed"
+    ))?;
+    result.require_status(PGRES_TUPLES_OK)?;
+    if result.ntuples() != 1 || result.nfields() != 3 {
+        return Err(format!(
+            "logical slot lag query for {slot_name:?} returned {} row(s) and {} column(s), expected 1 row and 3 columns",
+            result.ntuples(),
+            result.nfields()
+        ));
+    }
+
+    Ok(LogicalSlotLag {
+        active: parse_bool(&result.value(0, 0)?)?,
+        lag_ms: result
+            .value(0, 1)?
+            .parse::<i64>()
+            .map_err(|err| format!("invalid logical slot lag_ms: {err}"))?,
+        lag_bytes: result
+            .value(0, 2)?
+            .parse::<i64>()
+            .map_err(|err| format!("invalid logical slot lag_bytes: {err}"))?,
+    })
+}
+
 /// Observe target-side origin progress and token visibility for a barrier.
 pub(crate) fn observe_barrier(
     dsn: &str,
@@ -548,6 +630,57 @@ pub(crate) fn fetch_standby_replay_status(
         in_recovery: parse_bool(&result.value(0, 1)?)?,
         replay_lsn: parse_lsn(&result.value(0, 2)?)?,
         replay_paused: parse_bool(&result.value(0, 3)?)?,
+    })
+}
+
+/// Fetch physical-standby replay lag against a primary WAL LSN.
+pub(crate) fn fetch_standby_replay_lag(
+    dsn: &str,
+    target_lsn: u64,
+    connect_timeout_seconds: i32,
+    statement_timeout_ms: i32,
+    lock_timeout_ms: i32,
+) -> Result<StandbyReplayLag, String> {
+    let conn = Connection::connect_with_timeout(dsn, connect_timeout_seconds)?;
+    conn.set_query_timeouts(statement_timeout_ms, lock_timeout_ms)?;
+
+    let target_lsn = format_lsn(target_lsn);
+    let result = conn.exec(&format!(
+        "WITH observed AS ( \
+             SELECT pg_is_in_recovery() AS in_recovery, \
+                    COALESCE(pg_last_wal_replay_lsn(), '0/0'::pg_lsn) AS replay_lsn, \
+                    pg_last_xact_replay_timestamp() AS replay_timestamp \
+         ) \
+         SELECT in_recovery::text, \
+                replay_lsn::text, \
+                CASE \
+                    WHEN NOT in_recovery THEN '0'::text \
+                    WHEN replay_lsn >= '{target_lsn}'::pg_lsn THEN '0'::text \
+                    WHEN replay_timestamp IS NULL THEN NULL \
+                    ELSE ceil(extract(epoch FROM (clock_timestamp() - replay_timestamp)) * 1000)::bigint::text \
+                END AS lag_ms \
+         FROM observed"
+    ))?;
+    result.require_status(PGRES_TUPLES_OK)?;
+    if result.ntuples() != 1 || result.nfields() != 3 {
+        return Err(format!(
+            "remote standby replay lag returned {} row(s) and {} column(s), expected 1 row and 3 columns",
+            result.ntuples(),
+            result.nfields()
+        ));
+    }
+
+    Ok(StandbyReplayLag {
+        in_recovery: parse_bool(&result.value(0, 0)?)?,
+        replay_lsn: parse_lsn(&result.value(0, 1)?)?,
+        lag_ms: result
+            .value_opt(0, 2)?
+            .map(|value| {
+                value
+                    .parse::<i64>()
+                    .map_err(|err| format!("invalid standby replay lag_ms: {err}"))
+            })
+            .transpose()?,
     })
 }
 

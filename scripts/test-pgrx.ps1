@@ -63,6 +63,27 @@ function Get-ExtensionSqlPath {
     return Get-PglExtensionSqlPath -Root $Root -PgConfig $PgConfig
 }
 
+function Assert-PglogicalInstalled {
+    param(
+        [string] $PgConfig,
+        [int] $PgMajor
+    )
+
+    $pkglibDir = & $PgConfig --pkglibdir
+    $sharedDir = & $PgConfig --sharedir
+    $extensionDir = Join-Path $sharedDir 'extension'
+    $controlPath = Join-Path $extensionDir 'pglogical.control'
+    $library = Get-ChildItem -LiteralPath $pkglibDir -File -Filter 'pglogical*' -ErrorAction SilentlyContinue |
+        Where-Object { $_.Extension -in @('.dll', '.so', '.dylib') } |
+        Select-Object -First 1
+
+    if ((Test-Path -LiteralPath $controlPath) -and $library) {
+        return
+    }
+
+    throw "pglogical is required for cargo pgrx test because pg_tests preload it. Run scripts\install-pglogical-release.ps1 -PgMajor $PgMajor before scripts\test-pgrx.ps1."
+}
+
 $exitCode = 0
 try {
     & (Join-Path $PSScriptRoot 'stop-pgrx-test-clusters.ps1') @stopArgs
@@ -70,6 +91,7 @@ try {
     $runner = Join-Path $PSScriptRoot 'pgrx-vs.ps1'
     $pgConfig = Get-PgrxPgConfig -Root $root -PgMajor $PgMajor
     $extensionSql = Get-ExtensionSqlPath -Root $root -PgConfig $pgConfig
+    Assert-PglogicalInstalled -PgConfig $pgConfig -PgMajor $PgMajor
 
     & $runner cargo pgrx schema "pg$PgMajor" --no-default-features --features "pg$PgMajor" --out $extensionSql
     if ($LASTEXITCODE -ne 0) {
