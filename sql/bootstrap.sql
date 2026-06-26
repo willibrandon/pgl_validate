@@ -2648,6 +2648,11 @@ DECLARE
     revalidation_table pgl_validate.table_result%ROWTYPE;
     revalidation_sequence_match boolean;
     repaired_object record;
+    repair_target_provider_node text;
+    forwarding_subscription_refs text[];
+    local_forwarding_subscription record;
+    peer_rec record;
+    remote_forwarding_subscription record;
 BEGIN
     IF authoritative IS NULL OR btrim(authoritative) = '' THEN
         RAISE EXCEPTION 'authoritative node is required'
@@ -2688,6 +2693,11 @@ BEGIN
     INTO revalidation_options
     FROM pgl_validate.run r
     WHERE r.run_id = apply_repair.run_id;
+
+    repair_target_provider_node := CASE
+        WHEN target = 'local' THEN COALESCE(NULLIF(revalidation_options->>'provider_node', ''), 'local')
+        ELSE target
+    END;
 
     IF NOT EXISTS (
         SELECT 1
@@ -2802,6 +2812,61 @@ BEGIN
             WHERE repair_id = repair.repair_id
             RETURNING * INTO repair;
             RETURN repair;
+        END IF;
+
+        IF propagation = 'local_only' THEN
+            forwarding_subscription_refs := ARRAY[]::text[];
+
+            IF to_regclass('pglogical.subscription') IS NOT NULL
+               AND to_regclass('pglogical.node') IS NOT NULL THEN
+                FOR local_forwarding_subscription IN
+                    SELECT s.sub_name::text AS subscription_name
+                    FROM pglogical.subscription AS s
+                    JOIN pglogical.node AS provider
+                      ON provider.node_id = s.sub_origin
+                    WHERE s.sub_enabled
+                      AND provider.node_name::text = repair_target_provider_node
+                      AND 'all' = ANY (s.sub_forward_origins)
+                    ORDER BY s.sub_name::text
+                LOOP
+                    forwarding_subscription_refs := array_append(
+                        forwarding_subscription_refs,
+                        format('local:%s', local_forwarding_subscription.subscription_name)
+                    );
+                END LOOP;
+            END IF;
+
+            FOR peer_rec IN
+                SELECT p.name, p.dsn, p.connect_timeout_seconds,
+                       p.statement_timeout_ms, p.lock_timeout_ms
+                FROM pgl_validate.peer p
+                WHERE p.backend = 'pglogical'
+                ORDER BY p.name
+            LOOP
+                FOR remote_forwarding_subscription IN
+                    SELECT r.subscription_name
+                    FROM pgl_validate.remote_pglogical_forwarding_subscriptions(
+                        peer_rec.dsn,
+                        repair_target_provider_node,
+                        peer_rec.connect_timeout_seconds,
+                        peer_rec.statement_timeout_ms,
+                        peer_rec.lock_timeout_ms
+                    ) AS r
+                    ORDER BY r.subscription_name
+                LOOP
+                    forwarding_subscription_refs := array_append(
+                        forwarding_subscription_refs,
+                        format('%s:%s', peer_rec.name, remote_forwarding_subscription.subscription_name)
+                    );
+                END LOOP;
+            END LOOP;
+
+            IF cardinality(forwarding_subscription_refs) > 0 THEN
+                RAISE EXCEPTION 'local_only repair target % would be forwarded by pglogical subscription(s) with forward_origins={all}: %. Change topology outside the repair run or use propagation=replicate with acknowledge_conflict_policy=true',
+                    target,
+                    array_to_string(forwarding_subscription_refs, ', ')
+                    USING ERRCODE = '55000';
+            END IF;
         END IF;
 
         IF target = 'local' AND propagation = 'local_only' THEN

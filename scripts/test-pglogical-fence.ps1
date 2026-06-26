@@ -247,6 +247,9 @@ function Invoke-Sql {
 
 function Wait-SubscriptionReady {
     param(
+        [string] $SubscriberDatabase = 'target',
+        [string] $SubscriptionName = 'sub',
+        [string] $ProviderDatabase = 'provider',
         [int] $TimeoutSeconds
     )
 
@@ -254,16 +257,16 @@ function Wait-SubscriptionReady {
     $last = ''
 
     while ([DateTimeOffset]::Now -lt $deadline) {
-        $status = Invoke-Sql -Database 'target' -Sql @"
+        $status = Invoke-Sql -Database $SubscriberDatabase -Sql @"
 SELECT COALESCE((
     SELECT status || '|' || slot_name
-    FROM pglogical.show_subscription_status('sub')
+    FROM pglogical.show_subscription_status($(Sql-Literal $SubscriptionName)::name)
 ), '<missing>|')
 "@
         $parts = $status.Split('|', 2)
         $statusValue = $parts[0]
         $slotName = if ($parts.Count -gt 1) { $parts[1] } else { '' }
-        $sync = Invoke-Sql -Database 'target' -Sql @"
+        $sync = Invoke-Sql -Database $SubscriberDatabase -Sql @"
 SELECT COALESCE(
     string_agg(
         sync_kind::text || ':' || sync_status::text || ':' || sync_statuslsn::text,
@@ -273,7 +276,7 @@ SELECT COALESCE(
 )
 FROM pglogical.local_sync_status
 "@
-        $syncReady = Invoke-Sql -Database 'target' -Sql @"
+        $syncReady = Invoke-Sql -Database $SubscriberDatabase -Sql @"
 SELECT (NOT EXISTS (
     SELECT 1
     FROM pglogical.local_sync_status
@@ -282,7 +285,7 @@ SELECT (NOT EXISTS (
 "@
         $slotStatus = '<no-slot>'
         if ($slotName) {
-            $slotStatus = Invoke-Sql -Database 'provider' -Sql @"
+            $slotStatus = Invoke-Sql -Database $ProviderDatabase -Sql @"
 SELECT COALESCE((
     SELECT active::text || ':' || confirmed_flush_lsn::text
     FROM pg_replication_slots
@@ -299,7 +302,7 @@ SELECT COALESCE((
         Start-Sleep -Milliseconds 250
     }
 
-    throw "timed out waiting for pglogical subscription readiness: $last"
+    throw "timed out waiting for pglogical subscription $SubscriptionName readiness on ${SubscriberDatabase}: $last"
 }
 
 function Wait-SqlEquals {
@@ -373,12 +376,15 @@ try {
     Write-Step 'Creating coordinator/provider/target databases and extensions'
     Invoke-Sql -Database 'postgres' -Sql 'CREATE DATABASE provider' | Out-Null
     Invoke-Sql -Database 'postgres' -Sql 'CREATE DATABASE target' | Out-Null
+    Invoke-Sql -Database 'postgres' -Sql 'CREATE DATABASE cascade' | Out-Null
     Invoke-Sql -Database 'postgres' -Sql 'CREATE EXTENSION pgl_validate' | Out-Null
 
     $providerDsn = "host=localhost port=$script:Port dbname=provider user=postgres connect_timeout=5 application_name=pgl_validate_pglogical"
     $targetDsn = "host=localhost port=$script:Port dbname=target user=postgres connect_timeout=5 application_name=pgl_validate_pglogical"
+    $cascadeDsn = "host=localhost port=$script:Port dbname=cascade user=postgres connect_timeout=5 application_name=pgl_validate_pglogical"
     $providerDsnSql = Sql-Literal $providerDsn
     $targetDsnSql = Sql-Literal $targetDsn
+    $cascadeDsnSql = Sql-Literal $cascadeDsn
 
     Write-Step 'Creating pglogical provider node and barrier replication set'
     Invoke-Sql -Database 'provider' -Sql 'CREATE EXTENSION pgl_validate' | Out-Null
@@ -632,6 +638,100 @@ FROM pgl_validate.compare_sequence(
         throw "subscriber-behind sequence drift was not detected: $sequenceBehind"
     }
 
+    Write-Step 'Creating subscriber-side drift and applying audited pglogical repair'
+    Invoke-Sql -Database 'target' -Sql "UPDATE public.accounts SET value = 'target-drift' WHERE id = 1" | Out-Null
+    $repairableDriftResult = Invoke-Sql -Database 'provider' -Sql @"
+SELECT run_id::text || ';' || verdict
+FROM pgl_validate.compare_table(
+    'public.accounts'::regclass,
+    ARRAY['target'],
+    jsonb_build_object(
+        'provider_dsn', $providerDsnSql,
+        'provider_node', 'provider',
+        'repsets', jsonb_build_array('default'),
+        'fence_timeout_ms', 30000,
+        'fence_poll_interval_ms', 100
+    )
+)
+"@
+    $repairableDriftParts = $repairableDriftResult.Split(';', 2)
+    if ($repairableDriftParts.Count -ne 2) {
+        throw "unexpected repairable drift compare_table result: $repairableDriftResult"
+    }
+    $repairableDriftRunId = $repairableDriftParts[0]
+    $repairableDriftVerdict = $repairableDriftParts[1]
+    if ($repairableDriftVerdict -ne 'differ') {
+        throw "unexpected repairable drift compare_table verdict: $repairableDriftVerdict"
+    }
+
+    $repairResult = Invoke-Sql -Database 'provider' -Sql @"
+SELECT repair_id::text || ';' || status
+FROM pgl_validate.apply_repair($repairableDriftRunId, 'local', 'target', 'target')
+"@
+    $repairParts = $repairResult.Split(';', 2)
+    if ($repairParts.Count -ne 2) {
+        throw "unexpected repair result: $repairResult"
+    }
+    $repairId = $repairParts[0]
+    $repairStatus = $repairParts[1]
+    if ($repairStatus -ne 'revalidated') {
+        throw "unexpected repair status: $repairResult"
+    }
+
+    $repairAudit = Invoke-Sql -Database 'provider' -Sql @"
+SELECT COALESCE(string_agg(action || ':' || post_verdict, ',' ORDER BY action), '<none>')
+FROM pgl_validate.repair_result
+WHERE repair_id = $repairId
+"@
+    if ($repairAudit -ne 'update:match') {
+        throw "unexpected repair audit actions: $repairAudit"
+    }
+
+    $repairedVerdict = Invoke-Sql -Database 'provider' -Sql @"
+SELECT (pgl_validate.compare_table(
+    'public.accounts'::regclass,
+    ARRAY['target'],
+    jsonb_build_object(
+        'provider_dsn', $providerDsnSql,
+        'provider_node', 'provider',
+        'repsets', jsonb_build_array('default'),
+        'fence_timeout_ms', 30000,
+        'fence_poll_interval_ms', 100
+    )
+)).verdict
+"@
+    if ($repairedVerdict -ne 'match') {
+        throw "unexpected post-repair compare_table verdict: $repairedVerdict"
+    }
+
+    Write-Step 'Creating pglogical cascade node with forward_origins={all} for repair guard validation'
+    Invoke-Sql -Database 'target' -Sql 'SELECT pgl_validate.ensure_pglogical_barrier_repset()' | Out-Null
+    Invoke-Sql -Database 'target' -Sql "SELECT pglogical.replication_set_add_table('default', 'public.accounts'::regclass, false)" | Out-Null
+    Invoke-Sql -Database 'cascade' -Sql 'CREATE EXTENSION pgl_validate' | Out-Null
+    Invoke-Sql -Database 'cascade' -Sql 'CREATE EXTENSION pglogical' | Out-Null
+    Invoke-Sql -Database 'cascade' -Sql 'CREATE TABLE public.accounts(id int PRIMARY KEY, value text)' | Out-Null
+    Invoke-Sql -Database 'cascade' -Sql "INSERT INTO public.accounts VALUES (1, 'same')" | Out-Null
+    Invoke-Sql -Database 'cascade' -Sql "SELECT pglogical.create_node('cascade', $cascadeDsnSql)" | Out-Null
+    Invoke-Sql -Database 'cascade' -Sql @"
+SELECT pglogical.create_subscription(
+    'sub_from_target',
+    $targetDsnSql,
+    ARRAY['default','pgl_validate_barrier'],
+    false,
+    false,
+    ARRAY['all']
+)
+"@ | Out-Null
+    $null = Wait-SubscriptionReady `
+        -SubscriberDatabase 'cascade' `
+        -SubscriptionName 'sub_from_target' `
+        -ProviderDatabase 'target' `
+        -TimeoutSeconds $TimeoutSeconds
+    Invoke-Sql -Database 'provider' -Sql @"
+INSERT INTO pgl_validate.peer(name, dsn, backend, subscription_name, replication_sets)
+VALUES ('cascade', $cascadeDsnSql, 'pglogical', 'sub_from_target', ARRAY['default'])
+"@ | Out-Null
+
     Write-Step 'Creating subscriber-side drift and confirming key-level divergence'
     Invoke-Sql -Database 'target' -Sql "UPDATE public.accounts SET value = 'target-drift' WHERE id = 1" | Out-Null
     $driftResult = Invoke-Sql -Database 'provider' -Sql @"
@@ -678,48 +778,36 @@ SELECT EXISTS (
         throw 'subscriber-side drift was not persisted as a confirmed divergence'
     }
 
-    Write-Step 'Applying audited pglogical repair and revalidating match'
-    $repairResult = Invoke-Sql -Database 'provider' -Sql @"
+    Write-Step 'Refusing local_only repair while a forward_origins={all} cascade subscription is enabled'
+    $blockedRepairResult = Invoke-Sql -Database 'provider' -Sql @"
 SELECT repair_id::text || ';' || status
 FROM pgl_validate.apply_repair($driftRunId, 'local', 'target', 'target')
 "@
-    $repairParts = $repairResult.Split(';', 2)
-    if ($repairParts.Count -ne 2) {
-        throw "unexpected repair result: $repairResult"
+    $blockedRepairParts = $blockedRepairResult.Split(';', 2)
+    if ($blockedRepairParts.Count -ne 2) {
+        throw "unexpected blocked repair result: $blockedRepairResult"
     }
-    $repairId = $repairParts[0]
-    $repairStatus = $repairParts[1]
-    if ($repairStatus -ne 'revalidated') {
-        throw "unexpected repair status: $repairResult"
+    $blockedRepairId = $blockedRepairParts[0]
+    $blockedRepairStatus = $blockedRepairParts[1]
+    if ($blockedRepairStatus -ne 'failed') {
+        throw "local_only repair was not blocked by downstream forward_origins={all}: $blockedRepairResult"
     }
 
-    $repairAudit = Invoke-Sql -Database 'provider' -Sql @"
-SELECT COALESCE(string_agg(action || ':' || post_verdict, ',' ORDER BY action), '<none>')
-FROM pgl_validate.repair_result
-WHERE repair_id = $repairId
+    $blockedRepairError = Invoke-Sql -Database 'provider' -Sql @"
+SELECT COALESCE(error, '<null>')
+FROM pgl_validate.repair_run
+WHERE repair_id = $blockedRepairId
 "@
-    if ($repairAudit -ne 'update:match') {
-        throw "unexpected repair audit actions: $repairAudit"
+    if (-not $blockedRepairError.Contains('cascade:sub_from_target')) {
+        throw "blocked repair did not identify the forwarding cascade subscription: $blockedRepairError"
     }
 
-    $repairedVerdict = Invoke-Sql -Database 'provider' -Sql @"
-SELECT (pgl_validate.compare_table(
-    'public.accounts'::regclass,
-    ARRAY['target'],
-    jsonb_build_object(
-        'provider_dsn', $providerDsnSql,
-        'provider_node', 'provider',
-        'repsets', jsonb_build_array('default'),
-        'fence_timeout_ms', 30000,
-        'fence_poll_interval_ms', 100
-    )
-)).verdict
-"@
-    if ($repairedVerdict -ne 'match') {
-        throw "unexpected post-repair compare_table verdict: $repairedVerdict"
+    $targetStillDrifted = Invoke-Sql -Database 'target' -Sql "SELECT value FROM public.accounts WHERE id = 1"
+    if ($targetStillDrifted -ne 'target-drift') {
+        throw "blocked repair unexpectedly modified target row: $targetStillDrifted"
     }
 
-    Write-Output "pglogical fence, compare_table, divergence recheck, and audited repair tests passed on pg$PgMajor using slot $slotName"
+    Write-Output "pglogical fence, compare_table, divergence recheck, audited repair, and cascade repair guard tests passed on pg$PgMajor using slot $slotName"
 }
 catch {
     if (Test-Path -LiteralPath $log) {

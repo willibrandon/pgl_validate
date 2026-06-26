@@ -14,7 +14,7 @@
 > 4. **The barrier table is standalone, FK-free, and cascade-safe.** It carries a token with **no unique constraint** — under `forward_origins='{all}'` the same token can arrive twice at a target, and a unique key would cause an `insert_insert` conflict that `conflict_resolution = error` turns into an apply stall. It is a normal logged table (pglogical forbids UNLOGGED/TEMP in repsets); run/edge bookkeeping lives in a separate *non-replicated* coordinator table (§16, Appendix A).
 > 5. **`track_commit_timestamp` is consistently optional/advisory** (the §5 run-phase text is fixed to match §11.3).
 > 6. **Session-sensitive row filters are no longer overclaimed.** Only *immutable, context-free* filters are validated exactly (deparse). Stable-session-sensitive and volatile filters are `unsupported`/`approximate` on a **separate diagnostic path that is not G-SOUND** (§9.5).
-> 7. **Repair is tightened**: origin set **before** `BEGIN` and reset **after** `COMMIT` (mirroring `pglogical_sync.c:421/465`); subscription pause/enable is crash-recoverable run state; in-transaction target verification vs post-commit cross-node revalidation are distinguished; `setval` is called out as non-transactional (§18).
+> 7. **Repair is tightened**: origin set **before** `BEGIN` and reset **after** `COMMIT` (mirroring `pglogical_sync.c:421/465`); `local_only` repair refuses downstream `forward_origins = {all}` subscriptions because pausing apply workers does not discard retained slot WAL; in-transaction target verification vs post-commit cross-node revalidation are distinguished; `setval` is called out as non-transactional (§18).
 > 8. **`row_digest` is `STABLE`, not `IMMUTABLE`** (text fallback depends on pinned session GUCs); canonicalization decisions are pushed by the coordinator as explicit directives so they are uniform across mixed-version nodes (§10.4, §15.1).
 > 9. **Verdict states extended** to `indeterminate | partial | approximate | degraded` (§16).
 > 10. **Edge identity normalized** (provider/target node, subscription, slot, origin name, repsets, backend), `paranoid_confirm` given a spill bound, and `on_fence_timeout` default changed to `abort_run` (§16, §19).
@@ -652,19 +652,19 @@ Repair is **opt-in, single-target, transactional, locked, FK-ordered, and explic
 The repair tags its writes with a dedicated origin, and — mirroring pglogical's own sync path, which sets the origin **before** `BEGIN` and resets it **after** `COMMIT` (`pglogical_sync.c:421, 465`) — the exact ordering is mandatory: `pg_replication_origin_create('pgl_validate_repair')` (once, idempotent); then **outside/before** the repair transaction `pg_replication_origin_session_setup('pgl_validate_repair')`; then `BEGIN … COMMIT`; then `pg_replication_origin_session_reset()` after commit (to avoid races on the origin with other backends). Whether those writes leave the target is **fully determined by the target's outbound subscriptions' `forward_origins`** — there is no per-write routing knob. `apply_repair` takes an explicit `propagation` mode and validates it against the topology:
 
 - **`local_only` (default).** The repair must not propagate off `target`.
-  - If every outbound subscription from `target` uses `forward_origins = {}` (the bidirectional norm): an origin-tagged write is treated as "received from elsewhere" and is **not re-forwarded** — loop prevention by exactly the mechanism pglogical already uses.
-  - If any outbound subscription uses `forward_origins = {all}` (cascade): origin tagging cannot stop propagation, so `pgl_validate` **pauses those subscriptions** (`pglogical.alter_subscription_disable(…, immediate := true)`) around the repair. **This pause/enable is operational state outside the DML transaction, so it is durable run state, not a transaction effect**: the set of paused subscriptions is committed to `repair_run.paused_subs` *before* disabling, and a crash-recovery step (run at launcher startup and on `resume`) re-enables any subscriptions still disabled for a repair whose `repair_run.status ∉ {applied, revalidated}`. A repair that cannot guarantee re-enable (e.g. target unreachable) is left `failed` with the paused set recorded for manual recovery.
+  - If every downstream subscription from `target` uses `forward_origins = {}` (the bidirectional norm): an origin-tagged write is treated as "received from elsewhere" and is **not re-forwarded** — loop prevention by exactly the mechanism pglogical already uses.
+  - If any registered downstream subscription uses `forward_origins = {all}` (cascade): origin tagging cannot stop propagation, and merely disabling/re-enabling the subscription is **not** a sound fix because the subscription's slot retains the repair WAL and can decode it after re-enable. Therefore `local_only` is refused before applying DML, with the forwarding subscriptions recorded in the repair error. `pgl_validate` never pauses, disables, or rewrites pglogical subscription state to force the repair through; the operator must change the topology outside the repair run (for example by recreating the downstream subscription with `forward_origins = {}` where pglogical requires that) or choose `replicate` with an explicit conflict-policy acknowledgement.
 - **`replicate`.** Written as a **local-origin** change (no origin setup), allowed to flow downstream; conflicts at peers are resolved by each peer's `pglogical.conflict_resolution` (converges to the authoritative value only if peers do not keep local). Refused unless `acknowledge_conflict_policy := true`; effective per-peer resolution is recorded.
 
 ### 18.3 What is and isn't transactional (stated honestly)
 
 `apply_repair(run_id, authoritative, target, confirm, propagation, …)` is guarded by a type-to-confirm token equal to the target node name, and is transactional **for the row DML**, with explicit non-transactional steps called out:
 
-1. **Establish propagation mode** per §18.2 (origin session setup before `BEGIN`; or durable subscription pause recorded first).
+1. **Establish propagation mode** per §18.2 (origin session setup before `BEGIN`; or preflight refusal when downstream `forward_origins = {all}` would forward a `local_only` repair).
 2. `BEGIN`. **Lock** the divergent keys on `target` (`SELECT … FOR UPDATE`).
 3. **FK-ordered DML.** `INSERT`s parent→child, `DELETE`s child→parent (topological sort over `pg_constraint`); `UPDATE`s for `differs`.
 4. **In-transaction verification.** Before commit, re-read the repaired keys *on the target* and assert they now equal the authoritative values — this is what the lock protects, and it either holds or the transaction **rolls back** (atomic for the row DML).
-5. `COMMIT`; then `pg_replication_origin_session_reset()`; then restore any paused subscriptions. **The locks release at commit**, so the subsequent **cross-node** revalidation (a focused mini-run against all peers) runs *without* holding locks and is recorded as the authoritative post-repair verdict — it is explicitly a *post*-commit check, not part of the atomic unit.
+5. `COMMIT`; then `pg_replication_origin_session_reset()`. **The locks release at commit**, so the subsequent **cross-node** revalidation (a focused mini-run against all peers) runs *without* holding locks and is recorded as the authoritative post-repair verdict — it is explicitly a *post*-commit check, not part of the atomic unit.
 6. **Sequences are non-transactional.** `setval` is **not** rolled back by a transaction abort, so sequence reconciliation is performed as a **separate, clearly-labeled non-transactional step** (after the row DML commits) and recorded as such in `repair_result(action = 'setval')`. The "transactional" guarantee covers the row DML in steps 2–5, not `setval`.
 
 ### 18.4 Bidirectional caveat
@@ -784,7 +784,7 @@ Per repository policy, **every feature ships with complete regression tests exer
 | Native logical replication (row filter + pubactions) | Contract honored as for pglogical |
 | Physical standby participant | Full-equality contract; replay-LSN fence; coordinator on primary |
 | Repair: origin set-before-BEGIN / reset-after-COMMIT; multi-table FK ordering; `replicate` vs `local_only` | Post-repair `match`; no replication loop; FK order correct |
-| Repair crash recovery | Coordinator killed mid-repair after pausing `{all}`-cascade subs → recovery re-enables them from `repair_run.paused_subs` |
+| Repair with downstream `{all}` cascade subscription | `local_only` is refused before DML; no target mutation occurs; operator must reconfigure or choose `replicate` |
 | Sequence repair is non-transactional | `setval` reconciliation recorded separately; row-DML rollback does not un-`setval` |
 | Resume after coordinator kill mid-run | Resumes from frontier; final verdict identical |
 | Throttle / lag-pause | Pauses above threshold; resumes |
@@ -1145,7 +1145,7 @@ CREATE TABLE pgl_validate.repair_run (
     authoritative  text NOT NULL,
     target         text NOT NULL,
     propagation    text NOT NULL CHECK (propagation IN ('local_only','replicate')),
-    paused_subs    text[],                 -- subscriptions disabled for a {all}-cascade local_only repair
+    paused_subs    text[],                 -- reserved for future orchestrated topology operations
     origin_name    text,                   -- e.g. 'pgl_validate_repair' (NULL for replicate mode)
     status         text NOT NULL DEFAULT 'running'
                    CHECK (status IN ('running','applied','revalidated','failed','rolled_back')),
@@ -1221,8 +1221,8 @@ SELECT pgl_validate.plan_chunk_sql('public.orders', ARRAY['id'],
 
 ```sql
 SELECT pgl_validate.generate_repair(4217, authoritative => 'node_alpha');   -- review first
--- Default local_only: relies on forward_origins={} not re-forwarding the tagged origin,
--- or auto-pauses {all}-cascade subscriptions for the txn (§18.2).
+-- Default local_only: relies on downstream forward_origins={} not re-forwarding the tagged
+-- origin; downstream {all} subscriptions are refused before DML (§18.2).
 SELECT pgl_validate.apply_repair(4217, authoritative => 'node_alpha',
                                  target => 'node_beta', confirm => 'node_beta',
                                  propagation => 'local_only');

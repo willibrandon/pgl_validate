@@ -108,6 +108,13 @@ pub(crate) struct SubscriptionStatus {
     pub(crate) forward_origins_json: String,
 }
 
+/// pglogical subscription that would forward an origin-tagged repair.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) struct ForwardingSubscription {
+    /// Subscription name on the downstream subscriber.
+    pub(crate) subscription_name: String,
+}
+
 struct Connection {
     raw: *mut PGconn,
 }
@@ -418,6 +425,45 @@ pub(crate) fn fetch_subscription_status(
         replication_sets_json: result.value(0, 4)?,
         forward_origins_json: result.value(0, 5)?,
     })
+}
+
+/// Fetch enabled pglogical subscriptions that forward all origins for a provider.
+pub(crate) fn fetch_forwarding_subscriptions(
+    dsn: &str,
+    provider_node: &str,
+    connect_timeout_seconds: i32,
+    statement_timeout_ms: i32,
+    lock_timeout_ms: i32,
+) -> Result<Vec<ForwardingSubscription>, String> {
+    let conn = Connection::connect_with_timeout(dsn, connect_timeout_seconds)?;
+    conn.set_query_timeouts(statement_timeout_ms, lock_timeout_ms)?;
+
+    let provider_node = sql_literal(provider_node);
+    let result = conn.exec(&format!(
+        "SELECT s.sub_name::text \
+         FROM pglogical.subscription AS s \
+         JOIN pglogical.node AS provider \
+           ON provider.node_id = s.sub_origin \
+         WHERE s.sub_enabled \
+           AND provider.node_name::text = {provider_node} \
+           AND 'all' = ANY (s.sub_forward_origins) \
+         ORDER BY s.sub_name::text"
+    ))?;
+    result.require_status(PGRES_TUPLES_OK)?;
+    if result.nfields() != 1 {
+        return Err(format!(
+            "expected one pglogical forwarding-subscription column, got {}",
+            result.nfields()
+        ));
+    }
+
+    let mut subscriptions = Vec::with_capacity(result.ntuples() as usize);
+    for row in 0..result.ntuples() {
+        subscriptions.push(ForwardingSubscription {
+            subscription_name: result.value(row, 0)?,
+        });
+    }
+    Ok(subscriptions)
 }
 
 /// Run generated checksum SQL on a remote participant and return its digest.

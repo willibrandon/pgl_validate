@@ -460,6 +460,31 @@ AS 'MODULE_PATHNAME', 'remote_pglogical_subscription_status_wrapper';
         ))
     }
 
+    /// Fetch enabled downstream subscriptions that would forward all origins.
+    #[pg_extern(volatile, parallel_unsafe)]
+    fn remote_pglogical_forwarding_subscriptions(
+        dsn: &str,
+        provider_node: &str,
+        connect_timeout_seconds: default!(i32, 10),
+        statement_timeout_ms: default!(i32, 600000),
+        lock_timeout_ms: default!(i32, 30000),
+    ) -> TableIterator<'static, (name!(subscription_name, String),)> {
+        let subscriptions = transport::libpq::fetch_forwarding_subscriptions(
+            dsn,
+            provider_node,
+            connect_timeout_seconds,
+            statement_timeout_ms,
+            lock_timeout_ms,
+        )
+        .unwrap_or_else(|err| pgrx::error!("{err}"));
+
+        TableIterator::new(
+            subscriptions
+                .into_iter()
+                .map(|subscription| (subscription.subscription_name,)),
+        )
+    }
+
     #[pg_aggregate]
     impl Aggregate<lthash_state> for lthash_state {
         type State = PgVarlena<Self>;
