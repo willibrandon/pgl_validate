@@ -3611,7 +3611,7 @@ mod tests {
     }
 
     #[pg_test]
-    fn compare_table_records_keyless_contract_without_repair_rows() {
+    fn compare_table_records_duplicate_sensitive_keyless_contract_without_repair_rows() {
         let backend_pid = Spi::get_one::<i32>("SELECT pg_backend_pid()")
             .unwrap()
             .unwrap();
@@ -3675,9 +3675,14 @@ mod tests {
         crate::transport::libpq::execute_command(
             &remote_dsn,
             &format!(
-                "UPDATE public.{table_name}
-                 SET value = 'remote-drift'
-                 WHERE id = 2"
+                "DELETE FROM public.{table_name}
+                 WHERE ctid = (
+                     SELECT ctid
+                     FROM public.{table_name}
+                     WHERE id = 1 AND value = 'same'
+                     LIMIT 1
+                 );
+                 INSERT INTO public.{table_name} VALUES (2, 'same');"
             ),
         )
         .unwrap();
@@ -3691,6 +3696,13 @@ mod tests {
                    (SELECT count(*)::text
                     FROM pgl_validate.divergence d
                     WHERE d.run_id = tr.run_id) || ';' ||
+                   (SELECT (count(DISTINCT tnr.n_rows) = 1
+                            AND min(tnr.n_rows) = 3)::text
+                    FROM pgl_validate.table_node_result tnr
+                    WHERE tnr.run_id = tr.run_id) || ';' ||
+                   (SELECT (count(DISTINCT tnr.lthash) = 2)::text
+                    FROM pgl_validate.table_node_result tnr
+                    WHERE tnr.run_id = tr.run_id) || ';' ||
                    (SELECT count(*)::text
                     FROM pgl_validate.generate_repair(tr.run_id, 'local'))
             FROM pgl_validate.table_result tr
@@ -3700,7 +3712,7 @@ mod tests {
         ))
         .unwrap()
         .unwrap();
-        assert_eq!(differ_contract, "differ;keyless;true;0;0");
+        assert_eq!(differ_contract, "differ;keyless;true;0;true;true;0");
 
         let _ = crate::transport::libpq::execute_command(
             &local_dsn,
