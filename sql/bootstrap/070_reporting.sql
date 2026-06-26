@@ -55,6 +55,151 @@ BEGIN
 END
 $$;
 
+CREATE FUNCTION pgl_validate.put_schedule(
+    p_name text,
+    p_cron text,
+    p_tables text[] DEFAULT NULL,
+    p_repset text DEFAULT NULL,
+    p_peers text[] DEFAULT NULL,
+    p_options jsonb DEFAULT '{}'::jsonb,
+    p_enabled boolean DEFAULT true
+)
+RETURNS pgl_validate.schedule
+LANGUAGE plpgsql
+VOLATILE
+AS $$
+DECLARE
+    schedule_row pgl_validate.schedule;
+BEGIN
+    IF p_name IS NULL OR btrim(p_name) = '' THEN
+        RAISE EXCEPTION 'schedule name is required'
+            USING ERRCODE = '22023';
+    END IF;
+    IF p_cron IS NULL OR btrim(p_cron) = '' THEN
+        RAISE EXCEPTION 'schedule cron expression is required'
+            USING ERRCODE = '22023';
+    END IF;
+    IF p_options IS NULL OR jsonb_typeof(p_options) <> 'object' THEN
+        RAISE EXCEPTION 'schedule options must be a JSON object'
+            USING ERRCODE = '22023';
+    END IF;
+
+    INSERT INTO pgl_validate.schedule(
+        name, cron, tables, repset, peers, options, enabled
+    )
+    VALUES (
+        p_name,
+        p_cron,
+        p_tables,
+        NULLIF(p_repset, ''),
+        p_peers,
+        p_options,
+        COALESCE(p_enabled, true)
+    )
+    ON CONFLICT (name) DO UPDATE
+    SET cron = EXCLUDED.cron,
+        tables = EXCLUDED.tables,
+        repset = EXCLUDED.repset,
+        peers = EXCLUDED.peers,
+        options = EXCLUDED.options,
+        enabled = EXCLUDED.enabled
+    RETURNING * INTO schedule_row;
+
+    RETURN schedule_row;
+END
+$$;
+
+CREATE FUNCTION pgl_validate.set_schedule_enabled(p_name text, p_enabled boolean DEFAULT true)
+RETURNS boolean
+LANGUAGE plpgsql
+VOLATILE
+AS $$
+DECLARE
+    changed boolean;
+BEGIN
+    UPDATE pgl_validate.schedule s
+    SET enabled = COALESCE(p_enabled, true)
+    WHERE s.name = p_name
+    RETURNING true INTO changed;
+
+    RETURN COALESCE(changed, false);
+END
+$$;
+
+CREATE FUNCTION pgl_validate.delete_schedule(p_name text)
+RETURNS boolean
+LANGUAGE plpgsql
+VOLATILE
+AS $$
+DECLARE
+    changed boolean;
+BEGIN
+    DELETE FROM pgl_validate.schedule s
+    WHERE s.name = p_name
+    RETURNING true INTO changed;
+
+    RETURN COALESCE(changed, false);
+END
+$$;
+
+CREATE FUNCTION pgl_validate.run_schedule(p_name text, p_force boolean DEFAULT false)
+RETURNS bigint
+LANGUAGE plpgsql
+VOLATILE
+AS $$
+DECLARE
+    schedule_row pgl_validate.schedule;
+    table_oids regclass[];
+    missing_table text;
+    v_run_id bigint;
+BEGIN
+    SELECT *
+    INTO schedule_row
+    FROM pgl_validate.schedule s
+    WHERE s.name = p_name
+    FOR UPDATE;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'schedule % does not exist', p_name
+            USING ERRCODE = '02000';
+    END IF;
+
+    IF NOT schedule_row.enabled AND NOT COALESCE(p_force, false) THEN
+        RETURN NULL;
+    END IF;
+
+    IF schedule_row.tables IS NOT NULL THEN
+        SELECT min(table_name)
+        INTO missing_table
+        FROM unnest(schedule_row.tables) AS t(table_name)
+        WHERE to_regclass(t.table_name) IS NULL;
+
+        IF missing_table IS NOT NULL THEN
+            RAISE EXCEPTION 'scheduled table % does not exist', missing_table
+                USING ERRCODE = '42P01';
+        END IF;
+
+        SELECT array_agg(to_regclass(t.table_name)::regclass ORDER BY t.ordinality)
+        INTO table_oids
+        FROM unnest(schedule_row.tables) WITH ORDINALITY AS t(table_name, ordinality);
+    END IF;
+
+    v_run_id := pgl_validate.compare_async(
+        table_oids,
+        schedule_row.repset,
+        schedule_row.peers,
+        NULL,
+        schedule_row.options || jsonb_build_object('schedule', schedule_row.name)
+    );
+
+    UPDATE pgl_validate.schedule s
+    SET last_run_id = v_run_id
+    WHERE s.name = schedule_row.name;
+
+    RETURN v_run_id;
+END
+$$;
+
 CREATE FUNCTION pgl_validate.compare_async(
     tables regclass[] DEFAULT NULL,
     repset text DEFAULT NULL,

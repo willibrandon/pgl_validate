@@ -119,6 +119,14 @@ COMMENT ON FUNCTION pgl_validate.pause(bigint) IS
     'Move an active validation run into paused state for later resume.';
 COMMENT ON FUNCTION pgl_validate.resume(bigint) IS
     'Move a paused validation run back into running state and clear transient completion/error fields.';
+COMMENT ON FUNCTION pgl_validate.put_schedule(text, text, text[], text, text[], jsonb, boolean) IS
+    'Create or replace a durable validation schedule definition without launching it.';
+COMMENT ON FUNCTION pgl_validate.set_schedule_enabled(text, boolean) IS
+    'Enable or disable a durable validation schedule definition.';
+COMMENT ON FUNCTION pgl_validate.delete_schedule(text) IS
+    'Delete a durable validation schedule definition and leave any historical runs intact.';
+COMMENT ON FUNCTION pgl_validate.run_schedule(text, boolean) IS
+    'Dispatch a durable validation schedule through compare_async, record the launched run id, and return it.';
 COMMENT ON FUNCTION pgl_validate.compare_async(regclass[], text, text[], text, jsonb) IS
     'Create a durable validation run, enqueue a compare task, launch a dynamic background worker, and return the run id immediately.';
 COMMENT ON FUNCTION pgl_validate._claim_worker_task(integer) IS

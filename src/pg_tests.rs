@@ -2831,6 +2831,79 @@ mod tests {
     }
 
     #[pg_test]
+    fn schedule_management_validates_and_dispatches_disabled_schedules_safely() {
+        let backend_pid = Spi::get_one::<i32>("SELECT pg_backend_pid()")
+            .unwrap()
+            .unwrap();
+        let table_name = identifier(&format!("pgl_validate_schedule_target_{backend_pid}"));
+
+        Spi::run(&format!(
+            "
+            CREATE TABLE public.{table_name}(id int PRIMARY KEY, value text);
+            INSERT INTO public.{table_name} VALUES (1, 'same');
+            "
+        ))
+        .unwrap();
+
+        let schedule = Spi::get_one::<String>(&format!(
+            "
+            SELECT name || ';' ||
+                   cron || ';' ||
+                   tables[1] || ';' ||
+                   COALESCE(repset, '<null>') || ';' ||
+                   peers[1] || ';' ||
+                   (options->>'chunk_target_rows') || ';' ||
+                   enabled::text
+            FROM pgl_validate.put_schedule(
+                'nightly',
+                '0 2 * * *',
+                ARRAY['public.{table_name}'],
+                NULL,
+                ARRAY['local'],
+                '{{\"chunk_target_rows\":5}}'::jsonb,
+                true
+            )
+            "
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            schedule,
+            format!("nightly;0 2 * * *;public.{table_name};<null>;local;5;true")
+        );
+
+        let run_count_before = Spi::get_one::<i64>("SELECT count(*) FROM pgl_validate.run")
+            .unwrap()
+            .unwrap();
+        let changed = Spi::get_one::<String>(
+            "
+            SELECT pgl_validate.set_schedule_enabled('nightly', false)::text || ';' ||
+                   (pgl_validate.run_schedule('nightly') IS NULL)::text
+            ",
+        )
+        .unwrap()
+        .unwrap();
+        let run_count_after = Spi::get_one::<i64>("SELECT count(*) FROM pgl_validate.run")
+            .unwrap()
+            .unwrap();
+        assert_eq!(changed, "true;true");
+        assert_eq!(run_count_after, run_count_before);
+
+        let removed =
+            Spi::get_one::<bool>("SELECT pgl_validate.delete_schedule('nightly')")
+                .unwrap()
+                .unwrap();
+        let exists = Spi::get_one::<bool>(
+            "SELECT EXISTS (SELECT 1 FROM pgl_validate.schedule WHERE name = 'nightly')",
+        )
+        .unwrap()
+        .unwrap();
+
+        assert!(removed);
+        assert!(!exists);
+    }
+
+    #[pg_test]
     fn worker_task_claim_and_run_executes_parent_compare() {
         let backend_pid = Spi::get_one::<i32>("SELECT pg_backend_pid()")
             .unwrap()

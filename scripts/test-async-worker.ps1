@@ -294,6 +294,32 @@ INSERT INTO public.async_target VALUES (1, 'same');
     Write-Step "Waiting for async run $runId to complete"
     $state = Wait-AsyncRunComplete -RunId $runId -TimeoutSeconds $TimeoutSeconds
     Write-Output "async worker validation passed on pg${PgMajor}: run_id=$runId state=$state"
+
+    Write-Step 'Launching scheduled async validation through run_schedule'
+    Invoke-Sql -Quiet -Sql @"
+SELECT (pgl_validate.put_schedule(
+    'async_worker_smoke',
+    '* * * * *',
+    ARRAY['public.async_target'],
+    NULL,
+    NULL,
+    '{}'::jsonb,
+    true
+)).name;
+"@ | Out-Null
+    $scheduledRunId = Invoke-Sql -Quiet -Sql "SELECT pgl_validate.run_schedule('async_worker_smoke')::text;"
+    if (-not $scheduledRunId) {
+        throw 'run_schedule did not return a run id.'
+    }
+
+    Write-Step "Waiting for scheduled async run $scheduledRunId to complete"
+    $scheduledState = Wait-AsyncRunComplete -RunId $scheduledRunId -TimeoutSeconds $TimeoutSeconds
+    $lastScheduleRun = Invoke-Sql -Quiet -Sql "SELECT last_run_id::text FROM pgl_validate.schedule WHERE name = 'async_worker_smoke';"
+    if ($lastScheduleRun -ne $scheduledRunId) {
+        throw "schedule last_run_id was $lastScheduleRun, expected $scheduledRunId."
+    }
+
+    Write-Output "scheduled async validation passed on pg${PgMajor}: run_id=$scheduledRunId state=$scheduledState"
 }
 finally {
     Stop-TestCluster -Data $data -PgCtl $script:PgCtl
