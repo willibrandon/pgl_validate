@@ -1458,6 +1458,104 @@ mod tests {
     }
 
     #[pg_test]
+    fn compare_table_records_keyless_contract_without_repair_rows() {
+        let backend_pid = Spi::get_one::<i32>("SELECT pg_backend_pid()")
+            .unwrap()
+            .unwrap();
+        let peer_db = identifier(&format!("pgl_validate_keyless_peer_{backend_pid}"));
+        let table_name = identifier(&format!("remote_keyless_target_{backend_pid}"));
+        let peer_name = identifier(&format!("remote_keyless_{backend_pid}"));
+        let local_dsn = local_dsn();
+        let remote_dsn = peer_dsn(&peer_db);
+
+        let _ = crate::transport::libpq::execute_command(
+            &local_dsn,
+            &format!("DROP DATABASE IF EXISTS {peer_db} WITH (FORCE)"),
+        );
+        crate::transport::libpq::execute_command(&local_dsn, &format!("CREATE DATABASE {peer_db}"))
+            .unwrap();
+        crate::transport::libpq::execute_command(
+            &remote_dsn,
+            &format!(
+                "CREATE EXTENSION pgl_validate;
+                 CREATE TABLE public.{table_name}(id int, value text);
+                 INSERT INTO public.{table_name} VALUES
+                     (1, 'same'),
+                     (1, 'same'),
+                     (2, 'same');"
+            ),
+        )
+        .unwrap();
+
+        Spi::run(&format!(
+            "CREATE TABLE public.{table_name}(id int, value text);
+             INSERT INTO public.{table_name} VALUES
+                 (1, 'same'),
+                 (1, 'same'),
+                 (2, 'same');
+             INSERT INTO pgl_validate.peer(name, dsn, backend)
+             VALUES ({peer_name}, {remote_dsn}, 'native');",
+            peer_name = sql_literal(&peer_name),
+            remote_dsn = sql_literal(&remote_dsn)
+        ))
+        .unwrap();
+
+        let run_sql = format!(
+            "SELECT (pgl_validate.compare_table({}::regclass)).run_id",
+            sql_literal(&format!("public.{table_name}"))
+        );
+        let match_run_id = Spi::get_one::<i64>(&run_sql).unwrap().unwrap();
+        let match_contract = Spi::get_one::<String>(&format!(
+            "
+            SELECT tr.verdict || ';' ||
+                   tp.validated_property || ';' ||
+                   (tr.reason LIKE '%validated_property=keyless%')::text
+            FROM pgl_validate.table_result tr
+            JOIN pgl_validate.table_plan tp USING (run_id, schema_name, table_name)
+            WHERE tr.run_id = {match_run_id}
+            "
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(match_contract, "match;keyless;true");
+
+        crate::transport::libpq::execute_command(
+            &remote_dsn,
+            &format!(
+                "UPDATE public.{table_name}
+                 SET value = 'remote-drift'
+                 WHERE id = 2"
+            ),
+        )
+        .unwrap();
+
+        let differ_run_id = Spi::get_one::<i64>(&run_sql).unwrap().unwrap();
+        let differ_contract = Spi::get_one::<String>(&format!(
+            "
+            SELECT tr.verdict || ';' ||
+                   tp.validated_property || ';' ||
+                   (tr.reason LIKE '%whole-relation checksum/count differ%')::text || ';' ||
+                   (SELECT count(*)::text
+                    FROM pgl_validate.divergence d
+                    WHERE d.run_id = tr.run_id) || ';' ||
+                   (SELECT count(*)::text
+                    FROM pgl_validate.generate_repair(tr.run_id, 'local'))
+            FROM pgl_validate.table_result tr
+            JOIN pgl_validate.table_plan tp USING (run_id, schema_name, table_name)
+            WHERE tr.run_id = {differ_run_id}
+            "
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(differ_contract, "differ;keyless;true;0;0");
+
+        let _ = crate::transport::libpq::execute_command(
+            &local_dsn,
+            &format!("DROP DATABASE IF EXISTS {peer_db} WITH (FORCE)"),
+        );
+    }
+
+    #[pg_test]
     fn apply_repair_orders_inserts_by_foreign_key() {
         let backend_pid = Spi::get_one::<i32>("SELECT pg_backend_pid()")
             .unwrap()

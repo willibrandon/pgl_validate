@@ -1361,6 +1361,14 @@ BEGIN
         contract_reason := contract_rec.reason;
     END IF;
 
+    IF exact_comparable
+       AND validated_property = 'full'
+       AND (key_cols IS NULL OR cardinality(key_cols) = 0) THEN
+        validated_property := 'keyless';
+        contract_reason :=
+            contract_reason || '; no comparison key found, using whole-relation keyless checksum contract';
+    END IF;
+
     IF parent_run_id IS NULL THEN
         INSERT INTO pgl_validate.run(status, options, tables_total)
         VALUES ('running', options, 1)
@@ -1971,9 +1979,10 @@ BEGIN
     ELSIF key_cols IS NULL OR cardinality(key_cols) = 0 THEN
         verdict := 'differ';
         result_reason := format(
-            '%s of %s remote peer(s) differ from local; row-level localization unavailable without a key',
+            '%s of %s remote peer(s) differ from local; whole-relation checksum/count differ; row-level localization unavailable without a key; validated_property=%s',
             differ_count,
-            participant_count - 1
+            participant_count - 1,
+            validated_property
         );
     ELSIF confirmed_count > 0 THEN
         verdict := 'differ';
