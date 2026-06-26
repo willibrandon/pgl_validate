@@ -46,7 +46,8 @@ For extension validation, use pgrx:
 
 `scripts\test-pgrx.ps1` always stops repo-local pgrx test clusters in
 `target\test-pgdata`, `target\pglogical-test-pgdata`, and
-`target\diag-pgdata`, even when a pg_test fails.
+`target\native-test-pgdata`, and `target\diag-pgdata`, even when a pg_test
+fails.
 
 pglogical is a required part of the test environment. Install the packaged
 release into the target pgrx PostgreSQL; do not build from a local pglogical
@@ -54,6 +55,13 @@ checkout:
 
 ```powershell
 .\scripts\install-pglogical-release.ps1 -PgMajor 18
+```
+
+Native logical replication coverage uses PostgreSQL's built-in publication and
+subscription machinery:
+
+```powershell
+.\scripts\test-native-logical-fence.ps1 -PgMajor 18
 ```
 
 If `cargo check` is launched by an editor, start that editor from a Visual
@@ -93,5 +101,5 @@ physical-standby replay fence plumbing, sequence-window validation, keyless
 whole-relation validation, multi-table and replication-set compare
 orchestration, structured JSON reports, reviewable repair generation, audited
 repair application, conflict-history evidence correlation, run-control and
-retention APIs, and fenced paths exercised against a real pglogical
-subscription.
+retention APIs, and fenced paths exercised against real pglogical and native
+logical subscriptions.

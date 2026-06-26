@@ -1,0 +1,584 @@
+param(
+    [ValidateSet(15, 16, 17, 18)]
+    [int] $PgMajor = 18,
+
+    [switch] $KeepData,
+
+    [ValidateRange(1, 86400)]
+    [int] $TimeoutSeconds = 180
+)
+
+$ErrorActionPreference = 'Stop'
+
+$root = Split-Path -Parent $PSScriptRoot
+$data = Join-Path $root 'target\native-test-pgdata'
+$log = Join-Path $root 'target\native-test.log'
+$runner = Join-Path $PSScriptRoot 'pgrx-vs.ps1'
+
+function Write-Step {
+    param([string] $Message)
+
+    Write-Output "[$(Get-Date -Format o)] $Message"
+}
+
+function Assert-UnderRoot {
+    param(
+        [string] $Path,
+        [string] $Root
+    )
+
+    $resolvedRoot = (Resolve-Path -LiteralPath $Root).Path
+    $resolvedPath = (Resolve-Path -LiteralPath $Path).Path
+    if (-not $resolvedPath.StartsWith($resolvedRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "Refusing to operate on path outside workspace: $resolvedPath"
+    }
+}
+
+function Stop-ProcessTree {
+    param([int] $ProcessId)
+
+    $children = Get-CimInstance Win32_Process | Where-Object { $_.ParentProcessId -eq $ProcessId }
+    foreach ($child in $children) {
+        Stop-ProcessTree -ProcessId $child.ProcessId
+    }
+
+    Stop-Process -Id $ProcessId -Force -ErrorAction SilentlyContinue
+}
+
+function Invoke-CheckedProcess {
+    param(
+        [string] $FilePath,
+        [string[]] $Arguments,
+        [int] $TimeoutSeconds = 60,
+        [switch] $AllowFailure
+    )
+
+    $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $FilePath
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    foreach ($argument in $Arguments) {
+        [void] $startInfo.ArgumentList.Add($argument)
+    }
+
+    $process = [System.Diagnostics.Process]::Start($startInfo)
+    if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
+        Stop-ProcessTree -ProcessId $process.Id
+        throw "$FilePath timed out after ${TimeoutSeconds}s."
+    }
+
+    $process.Refresh()
+    if ($process.ExitCode -ne 0 -and -not $AllowFailure) {
+        throw "$FilePath exited with code $($process.ExitCode)."
+    }
+
+    return $process.ExitCode
+}
+
+function ConvertTo-EncodedCommand {
+    param([string] $Script)
+
+    $bytes = [System.Text.Encoding]::Unicode.GetBytes($Script)
+    return [Convert]::ToBase64String($bytes)
+}
+
+function Get-PgrxPgConfig {
+    param([int] $PgMajor)
+
+    $configPath = Join-Path $env:USERPROFILE '.pgrx\config.toml'
+    if (-not (Test-Path -LiteralPath $configPath)) {
+        throw "pgrx config was not found at $configPath. Run cargo pgrx init for pg$PgMajor."
+    }
+
+    $configText = Get-Content -LiteralPath $configPath -Raw
+    $label = "pg$PgMajor"
+    $pattern = "(?m)^\s*$label\s*=\s*['""]([^'""]+)['""]\s*$"
+    $match = [regex]::Match($configText, $pattern)
+    if (-not $match.Success) {
+        throw "pgrx config does not define $label in $configPath."
+    }
+
+    $pgConfig = $match.Groups[1].Value
+    if (-not (Test-Path -LiteralPath $pgConfig)) {
+        throw "Configured pg_config for $label does not exist: $pgConfig"
+    }
+
+    return $pgConfig
+}
+
+function Get-ExtensionSqlPath {
+    param([string] $PgConfig)
+
+    $control = Get-ChildItem -LiteralPath $root -Filter '*.control' | Select-Object -First 1
+    if (-not $control) {
+        throw "No extension control file was found under $root."
+    }
+
+    $controlText = Get-Content -LiteralPath $control.FullName -Raw
+    $versionMatch = [regex]::Match($controlText, "(?m)^\s*default_version\s*=\s*'([^']+)'\s*$")
+    if (-not $versionMatch.Success) {
+        throw "Could not read default_version from $($control.FullName)."
+    }
+
+    $shareDir = & $PgConfig --sharedir
+    if ($LASTEXITCODE -ne 0 -or -not $shareDir) {
+        throw "pg_config failed to report --sharedir for $PgConfig."
+    }
+
+    $extensionDir = Join-Path $shareDir 'extension'
+    New-Item -ItemType Directory -Force -Path $extensionDir | Out-Null
+    return Join-Path $extensionDir "$($control.BaseName)--$($versionMatch.Groups[1].Value).sql"
+}
+
+function Stop-TestCluster {
+    param(
+        [string] $Data,
+        [string] $PgCtl
+    )
+
+    if (Test-Path -LiteralPath $Data) {
+        try {
+            Invoke-CheckedProcess `
+                -FilePath $PgCtl `
+                -Arguments @('stop', '-D', $Data, '-m', 'fast', '-w', '-t', '30') `
+                -TimeoutSeconds 40 `
+                -AllowFailure | Out-Null
+        }
+        catch {
+            Write-Warning "pg_ctl stop failed; falling back to process cleanup: $_"
+        }
+    }
+
+    & (Join-Path $PSScriptRoot 'stop-pgrx-test-clusters.ps1') -Root $root
+
+    Start-Sleep -Milliseconds 500
+}
+
+function Remove-TestData {
+    param([string] $Data)
+
+    if (Test-Path -LiteralPath $Data) {
+        Assert-UnderRoot -Path $Data -Root $root
+        for ($attempt = 1; $attempt -le 20; $attempt++) {
+            try {
+                Remove-Item -LiteralPath $Data -Recurse -Force
+                return
+            }
+            catch {
+                if ($attempt -eq 20) {
+                    throw
+                }
+
+                Start-Sleep -Milliseconds 500
+            }
+        }
+    }
+}
+
+function Start-CleanupWatchdog {
+    param(
+        [int] $ParentPid,
+        [switch] $RemoveData
+    )
+
+    $powershell = (Get-Command pwsh.exe -ErrorAction SilentlyContinue).Source
+    if (-not $powershell) {
+        $powershell = (Get-Command powershell.exe -ErrorAction Stop).Source
+    }
+
+    $cleanupScript = Join-Path $PSScriptRoot 'stop-pgrx-test-clusters.ps1'
+    $removeFlag = if ($RemoveData) { '$true' } else { '$false' }
+    $watchdogScript = @"
+`$ErrorActionPreference = 'SilentlyContinue'
+`$parentPid = $ParentPid
+`$root = '$($root.Replace("'", "''"))'
+`$cleanupScript = '$($cleanupScript.Replace("'", "''"))'
+`$removeData = $removeFlag
+while (Get-Process -Id `$parentPid -ErrorAction SilentlyContinue) {
+    Start-Sleep -Seconds 2
+}
+if (`$removeData) {
+    & `$cleanupScript -Root `$root -RemoveData
+}
+else {
+    & `$cleanupScript -Root `$root
+}
+"@
+
+    $encoded = ConvertTo-EncodedCommand -Script $watchdogScript
+    return Start-Process -FilePath $powershell `
+        -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', $encoded) `
+        -WindowStyle Hidden `
+        -PassThru
+}
+
+function New-FreePort {
+    $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
+    $listener.Start()
+    try {
+        return ([System.Net.IPEndPoint] $listener.LocalEndpoint).Port
+    }
+    finally {
+        $listener.Stop()
+    }
+}
+
+function Sql-Literal {
+    param([string] $Value)
+    return "'" + $Value.Replace("'", "''") + "'"
+}
+
+function Invoke-Sql {
+    param(
+        [string] $Database,
+        [string] $Sql
+    )
+
+    $output = & $script:Psql -X -w -h localhost -p $script:Port -U postgres -d $Database `
+        -v ON_ERROR_STOP=1 -Atq -c $Sql 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        throw "psql failed on database ${Database}: $($output -join [Environment]::NewLine)"
+    }
+
+    return ($output -join "`n").Trim()
+}
+
+function Wait-NativeSubscriptionReady {
+    param(
+        [string] $SubscriberDatabase,
+        [string] $SubscriptionName,
+        [string] $ProviderDatabase,
+        [int] $MinReadyRelations,
+        [int] $TimeoutSeconds
+    )
+
+    $deadline = [DateTimeOffset]::Now.AddSeconds($TimeoutSeconds)
+    $last = ''
+
+    while ([DateTimeOffset]::Now -lt $deadline) {
+        $status = Invoke-Sql -Database $SubscriberDatabase -Sql @"
+SELECT COALESCE((
+    SELECT subenabled::text || '|' || COALESCE(subslotname::text, '') || '|' || oid::text
+    FROM pg_subscription
+    WHERE subname = $(Sql-Literal $SubscriptionName)::name
+), '<missing>||')
+"@
+        $parts = $status.Split('|', 3)
+        $enabled = $parts[0]
+        $slotName = if ($parts.Count -gt 1) { $parts[1] } else { '' }
+        $subid = if ($parts.Count -gt 2) { $parts[2] } else { '' }
+        $sync = Invoke-Sql -Database $SubscriberDatabase -Sql @"
+SELECT count(*)::text || ':' ||
+       COALESCE(bool_and(sr.srsubstate = 'r')::text, 'false')
+FROM pg_subscription s
+JOIN pg_subscription_rel sr ON sr.srsubid = s.oid
+WHERE s.subname = $(Sql-Literal $SubscriptionName)::name
+"@
+        $slotStatus = '<no-slot>'
+        if ($slotName) {
+            $slotStatus = Invoke-Sql -Database $ProviderDatabase -Sql @"
+SELECT COALESCE((
+    SELECT active::text || ':' || confirmed_flush_lsn::text
+    FROM pg_replication_slots
+    WHERE slot_name = $(Sql-Literal $slotName)
+), '<missing>')
+"@
+        }
+
+        $last = "enabled=$enabled subid=$subid slot=$slotName sync=$sync provider_slot=$slotStatus"
+        $syncParts = $sync.Split(':', 2)
+        $readyCount = [int] $syncParts[0]
+        $allReady = $syncParts.Count -gt 1 -and $syncParts[1] -eq 'true'
+        if ($enabled -eq 'true' -and $slotName -and $readyCount -ge $MinReadyRelations -and $allReady -and $slotStatus.StartsWith('true:')) {
+            return @{
+                SlotName = $slotName
+                OriginName = "pg_$subid"
+            }
+        }
+
+        Start-Sleep -Milliseconds 250
+    }
+
+    throw "timed out waiting for native subscription $SubscriptionName readiness on ${SubscriberDatabase}: $last"
+}
+
+function Wait-SqlEquals {
+    param(
+        [string] $Database,
+        [string] $Sql,
+        [string] $Expected,
+        [int] $TimeoutSeconds
+    )
+
+    $deadline = [DateTimeOffset]::Now.AddSeconds($TimeoutSeconds)
+    $last = ''
+
+    while ([DateTimeOffset]::Now -lt $deadline) {
+        $last = Invoke-Sql -Database $Database -Sql $Sql
+        if ($last -eq $Expected) {
+            return
+        }
+
+        Start-Sleep -Milliseconds 250
+    }
+
+    throw "timed out waiting for SQL result '$Expected' on ${Database}; last result: $last"
+}
+
+$pgConfig = Get-PgrxPgConfig -PgMajor $PgMajor
+$pgBin = Split-Path -Parent $pgConfig
+$script:InitDb = Join-Path $pgBin 'initdb.exe'
+$script:PgCtl = Join-Path $pgBin 'pg_ctl.exe'
+$script:Psql = Join-Path $pgBin 'psql.exe'
+$script:Port = New-FreePort
+$extensionSql = Get-ExtensionSqlPath -PgConfig $pgConfig
+$watchdog = Start-CleanupWatchdog -ParentPid $PID -RemoveData:(-not $KeepData)
+
+try {
+    Write-Step "Cleaning prior native logical test cluster"
+    Stop-TestCluster -Data $data -PgCtl $script:PgCtl
+    if (-not $KeepData) {
+        Remove-TestData -Data $data
+    }
+    if (Test-Path -LiteralPath $log) {
+        Remove-Item -LiteralPath $log -Force
+    }
+
+    Write-Step "Installing pgl_validate for pg$PgMajor"
+    & $runner cargo pgrx install --pg-config $pgConfig --no-default-features --features "pg$PgMajor"
+    if ($LASTEXITCODE -ne 0) {
+        throw "cargo pgrx install failed for pg$PgMajor."
+    }
+
+    Write-Step "Generating extension SQL at $extensionSql"
+    & $runner cargo pgrx schema --pg-config $pgConfig --no-default-features --features "pg$PgMajor" --out $extensionSql
+    if ($LASTEXITCODE -ne 0) {
+        throw "cargo pgrx schema failed while preparing $extensionSql."
+    }
+
+    Write-Step "Initializing test cluster at $data"
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $data) | Out-Null
+    Invoke-CheckedProcess `
+        -FilePath $script:InitDb `
+        -Arguments @('--locale=C', '--auth=trust', '--username=postgres', '-D', $data) `
+        -TimeoutSeconds 120 | Out-Null
+
+    Write-Step "Starting native-logical test cluster on port $script:Port"
+    $serverOptions = "-p $script:Port -h localhost -c wal_level=logical -c max_worker_processes=20 -c max_replication_slots=20 -c max_wal_senders=20"
+    Invoke-CheckedProcess `
+        -FilePath $script:PgCtl `
+        -Arguments @('start', '-D', $data, '-l', $log, '-o', $serverOptions, '-w', '-t', '30') `
+        -TimeoutSeconds 45 | Out-Null
+
+    Write-Step 'Creating provider and native subscriber databases'
+    Invoke-Sql -Database 'postgres' -Sql 'CREATE DATABASE provider' | Out-Null
+    Invoke-Sql -Database 'postgres' -Sql 'CREATE DATABASE target' | Out-Null
+
+    $providerDsn = "host=localhost port=$script:Port dbname=provider user=postgres connect_timeout=5 application_name=pgl_validate_native"
+    $targetDsn = "host=localhost port=$script:Port dbname=target user=postgres connect_timeout=5 application_name=pgl_validate_native"
+    $providerDsnSql = Sql-Literal $providerDsn
+    $targetDsnSql = Sql-Literal $targetDsn
+
+    Write-Step 'Creating native provider publications, including the barrier publication'
+    Invoke-Sql -Database 'provider' -Sql 'CREATE EXTENSION pgl_validate' | Out-Null
+    Invoke-Sql -Database 'provider' -Sql @"
+CREATE TABLE public.accounts(id int PRIMARY KEY, value text);
+SELECT pgl_validate.ensure_native_barrier_publication();
+CREATE PUBLICATION app_pub FOR TABLE public.accounts;
+"@ | Out-Null
+    Invoke-Sql -Database 'provider' -Sql "SELECT slot_name FROM pg_create_logical_replication_slot('native_sub', 'pgoutput')" | Out-Null
+
+    Write-Step 'Creating native target subscription'
+    Invoke-Sql -Database 'target' -Sql 'CREATE EXTENSION pgl_validate' | Out-Null
+    Invoke-Sql -Database 'target' -Sql 'CREATE TABLE public.accounts(id int PRIMARY KEY, value text)' | Out-Null
+    Invoke-Sql -Database 'target' -Sql @"
+CREATE SUBSCRIPTION native_sub
+CONNECTION $providerDsnSql
+PUBLICATION app_pub, pgl_validate_barrier
+WITH (copy_data = false, create_slot = false, slot_name = 'native_sub', enabled = true)
+"@ | Out-Null
+
+    Write-Step 'Waiting for native subscription readiness'
+    $subscription = Wait-NativeSubscriptionReady `
+        -SubscriberDatabase 'target' `
+        -SubscriptionName 'native_sub' `
+        -ProviderDatabase 'provider' `
+        -MinReadyRelations 2 `
+        -TimeoutSeconds $TimeoutSeconds
+    $slotName = $subscription.SlotName
+    $originName = $subscription.OriginName
+    $slotNameSql = Sql-Literal $slotName
+    $originNameSql = Sql-Literal $originName
+
+    Write-Step 'Replicating user table row for native compare_table validation'
+    Invoke-Sql -Database 'provider' -Sql "INSERT INTO public.accounts VALUES (1, 'same')" | Out-Null
+    Wait-SqlEquals `
+        -Database 'target' `
+        -Sql 'SELECT count(*)::text FROM public.accounts WHERE id = 1 AND value = ''same''' `
+        -Expected '1' `
+        -TimeoutSeconds $TimeoutSeconds
+
+    Write-Step "Fencing provider->target native edge through slot $slotName and origin $originName"
+    $observed = Invoke-Sql -Database 'provider' -Sql @"
+WITH r AS (
+    INSERT INTO pgl_validate.run(status)
+    VALUES ('fencing')
+    RETURNING run_id
+), a AS (
+    SELECT pgl_validate.fence_native_edge(
+        r.run_id,
+        1,
+        1,
+        'provider',
+        'target',
+        $providerDsnSql,
+        $targetDsnSql,
+        'native_sub',
+        $slotNameSql,
+        $originNameSql,
+        ARRAY['pgl_validate_barrier'],
+        10,
+        30000,
+        30000,
+        30000,
+        100
+    ) AS attempt
+    FROM r
+)
+SELECT (attempt).status || ';' ||
+       ((attempt).origin_progress_lsn >= (attempt).barrier_end_lsn)::text || ';' ||
+       (attempt).token_visible::text
+FROM a
+"@
+    if ($observed -ne 'converged;true;true') {
+        throw "unexpected native fence result: $observed"
+    }
+
+    $recorded = Invoke-Sql -Database 'provider' -Sql @"
+SELECT EXISTS (
+    SELECT 1
+    FROM pgl_validate.run_edge re
+    JOIN pgl_validate.fence_edge fe USING (run_id, edge_id)
+    JOIN pgl_validate.fence_attempt fa USING (run_id, epoch_seq, edge_id)
+    JOIN pgl_validate.fence_barrier_run br USING (run_id, epoch_seq, edge_id)
+    WHERE re.backend = 'native'
+      AND fe.fence_kind = 'barrier'
+      AND fa.status = 'converged'
+      AND br.origin_node = 'provider'
+)::text
+"@
+    if ($recorded -ne 'true') {
+        throw 'native fence catalog rows were not recorded'
+    }
+
+    Write-Step 'Running compare_table through real native logical fencing'
+    Invoke-Sql -Database 'provider' -Sql @"
+INSERT INTO pgl_validate.peer(name, dsn, backend, subscription_name, replication_sets)
+VALUES ('target', $targetDsnSql, 'native', 'native_sub', ARRAY['app_pub'])
+"@ | Out-Null
+    $compareVerdict = Invoke-Sql -Database 'provider' -Sql @"
+SELECT (pgl_validate.compare_table(
+    'public.accounts'::regclass,
+    ARRAY['target'],
+    jsonb_build_object(
+        'backend', 'native',
+        'provider_dsn', $providerDsnSql,
+        'provider_node', 'provider',
+        'publications', jsonb_build_array('app_pub'),
+        'fence_timeout_ms', 30000,
+        'fence_poll_interval_ms', 100
+    )
+)).verdict
+"@
+    if ($compareVerdict -ne 'match') {
+        throw "unexpected native compare_table verdict: $compareVerdict"
+    }
+
+    $compareFenceRecorded = Invoke-Sql -Database 'provider' -Sql @"
+SELECT EXISTS (
+    SELECT 1
+    FROM pgl_validate.table_result tr
+    JOIN pgl_validate.run_edge re USING (run_id)
+    JOIN pgl_validate.fence_attempt fa USING (run_id, edge_id)
+    WHERE tr.schema_name = 'public'
+      AND tr.table_name = 'accounts'
+      AND tr.verdict = 'match'
+      AND re.backend = 'native'
+      AND fa.status = 'converged'
+)::text
+"@
+    if ($compareFenceRecorded -ne 'true') {
+        throw 'compare_table did not record a native converged fence'
+    }
+
+    Write-Step 'Creating subscriber-side drift and confirming native recheck fencing'
+    Invoke-Sql -Database 'target' -Sql "UPDATE public.accounts SET value = 'target-drift' WHERE id = 1" | Out-Null
+    $driftResult = Invoke-Sql -Database 'provider' -Sql @"
+SELECT run_id::text || ';' || verdict
+FROM pgl_validate.compare_table(
+    'public.accounts'::regclass,
+    ARRAY['target'],
+    jsonb_build_object(
+        'backend', 'native',
+        'provider_dsn', $providerDsnSql,
+        'provider_node', 'provider',
+        'publications', jsonb_build_array('app_pub'),
+        'fence_timeout_ms', 30000,
+        'fence_poll_interval_ms', 100
+    )
+)
+"@
+    $driftParts = $driftResult.Split(';', 2)
+    if ($driftParts.Count -ne 2) {
+        throw "unexpected native drift compare_table result: $driftResult"
+    }
+    $driftRunId = $driftParts[0]
+    $driftVerdict = $driftParts[1]
+    if ($driftVerdict -ne 'differ') {
+        throw "unexpected native drift compare_table verdict: $driftVerdict"
+    }
+
+    $confirmedDrift = Invoke-Sql -Database 'provider' -Sql @"
+SELECT EXISTS (
+    SELECT 1
+    FROM pgl_validate.divergence d
+    JOIN pgl_validate.divergence_recheck dr USING (run_id, schema_name, table_name, key_bytes, node)
+    JOIN pgl_validate.run_edge re ON re.run_id = d.run_id AND re.target_node = d.node
+    JOIN pgl_validate.fence_attempt fa ON fa.run_id = re.run_id AND fa.edge_id = re.edge_id
+    WHERE d.run_id = $driftRunId
+      AND d.schema_name = 'public'
+      AND d.table_name = 'accounts'
+      AND d.node = 'target'
+      AND d.classification = 'differs'
+      AND d.status = 'confirmed'
+      AND dr.epoch_seq = 2
+      AND dr.outcome = 'still_differs'
+      AND re.backend = 'native'
+      AND fa.epoch_seq = 2
+      AND fa.status = 'converged'
+)::text
+"@
+    if ($confirmedDrift -ne 'true') {
+        throw 'native subscriber-side drift was not confirmed through a recheck fence'
+    }
+
+    Write-Output "native logical fence, compare_table, and divergence recheck tests passed on pg$PgMajor using slot $slotName"
+}
+catch {
+    if (Test-Path -LiteralPath $log) {
+        Write-Output '--- native logical test log tail ---'
+        Get-Content -LiteralPath $log -Tail 120
+    }
+    throw
+}
+finally {
+    Stop-TestCluster -Data $data -PgCtl $script:PgCtl
+    if (-not $KeepData) {
+        Remove-TestData -Data $data
+    }
+    if ($watchdog -and -not $watchdog.HasExited) {
+        Stop-ProcessTree -ProcessId $watchdog.Id
+    }
+}
+
+$global:LASTEXITCODE = 0

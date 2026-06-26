@@ -9,6 +9,7 @@ $workspace = (Resolve-Path -LiteralPath $Root).Path
 $configuredTargets = @(
     'target\test-pgdata',
     'target\pglogical-test-pgdata',
+    'target\native-test-pgdata',
     'target\diag-pgdata'
 ) | ForEach-Object { Join-Path $workspace $_ }
 
