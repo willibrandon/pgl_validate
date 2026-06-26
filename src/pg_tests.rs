@@ -679,6 +679,19 @@ mod tests {
         .unwrap();
         assert_eq!(wide_hash_widths, "local:64,remote_guc:64");
 
+        let wide_hash_progress = Spi::get_one::<String>(&format!(
+            "
+            SELECT (rp.bytes_scanned = rp.rows_scanned * 64)::text || ';' ||
+                   (r.options->>'hash_algorithm')
+            FROM pgl_validate.run_progress rp
+            JOIN pgl_validate.run r USING (run_id)
+            WHERE rp.run_id = {wide_hash_run_id}
+            "
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(wide_hash_progress, "true;blake3_512");
+
         let recheck_setting = Spi::get_one::<String>("SHOW pgl_validate.recheck_passes")
             .unwrap()
             .unwrap();

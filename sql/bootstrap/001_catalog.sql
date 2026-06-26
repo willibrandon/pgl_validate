@@ -385,18 +385,25 @@ WITH chunk_counts AS (
 chunk_scan AS (
     SELECT
         cnr.run_id,
-        COALESCE(sum(cnr.n_rows), 0)::bigint AS rows_scanned,
-        COALESCE(sum(cnr.n_rows), 0)::bigint * 32 AS bytes_scanned
+        COALESCE(sum(cnr.n_rows), 0)::bigint AS rows_scanned
     FROM pgl_validate.chunk_node_result cnr
     GROUP BY cnr.run_id
 ),
 table_progress AS (
     SELECT
         tnr.run_id,
-        COALESCE(sum(tnr.n_rows), 0)::bigint AS rows_scanned,
-        COALESCE(sum(tnr.n_rows), 0)::bigint * 32 AS bytes_scanned
+        COALESCE(sum(tnr.n_rows), 0)::bigint AS rows_scanned
     FROM pgl_validate.table_node_result tnr
     GROUP BY tnr.run_id
+),
+run_digest_width AS (
+    SELECT
+        r.run_id,
+        CASE COALESCE(r.options->>'hash_algorithm', 'blake3_256')
+            WHEN 'blake3_512' THEN 64
+            ELSE 32
+        END::bigint AS digest_width
+    FROM pgl_validate.run r
 ),
 epoch_progress AS (
     SELECT
@@ -433,7 +440,10 @@ SELECT
     COALESCE(cc.chunks_done, 0)::bigint AS chunks_done,
     COALESCE(cc.chunks_total, 0)::bigint AS chunks_total,
     (COALESCE(cs.rows_scanned, 0) + COALESCE(tp.rows_scanned, 0))::bigint AS rows_scanned,
-    (COALESCE(cs.bytes_scanned, 0) + COALESCE(tp.bytes_scanned, 0))::bigint AS bytes_scanned,
+    (
+        (COALESCE(cs.rows_scanned, 0) + COALESCE(tp.rows_scanned, 0))
+        * COALESCE(rdw.digest_width, 32)
+    )::bigint AS bytes_scanned,
     CASE
         WHEN r.status IN ('completed','failed','canceled')
           OR r.started_at IS NULL
@@ -452,6 +462,7 @@ FROM pgl_validate.run r
 LEFT JOIN chunk_counts cc USING (run_id)
 LEFT JOIN chunk_scan cs USING (run_id)
 LEFT JOIN table_progress tp USING (run_id)
+LEFT JOIN run_digest_width rdw USING (run_id)
 LEFT JOIN epoch_progress ep USING (run_id)
 LEFT JOIN fence_progress fp USING (run_id)
 LEFT JOIN divergence_progress dp USING (run_id);

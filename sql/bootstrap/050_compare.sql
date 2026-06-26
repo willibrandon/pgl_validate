@@ -486,6 +486,7 @@ DECLARE
         NULLIF(current_setting('pgl_validate.conflict_history_max_rows', true), '')::int,
         1000
     );
+    stored_options jsonb;
 BEGIN
     SELECT n.nspname, c.relname
     INTO v_schema_name, v_rel_name
@@ -556,6 +557,8 @@ BEGIN
             USING ERRCODE = '0A000';
     END IF;
     PERFORM set_config('pgl_validate.hash_algorithm', hash_algorithm, true);
+    stored_options := (COALESCE(options, '{}'::jsonb) - '_pgl_validate_parent_run_id')
+        || jsonb_build_object('hash_algorithm', hash_algorithm);
     IF chunk_target_rows <= 0 THEN
         RAISE EXCEPTION 'chunk_target_rows must be greater than zero';
     END IF;
@@ -757,7 +760,7 @@ BEGIN
 
     IF parent_run_id IS NULL THEN
         INSERT INTO pgl_validate.run(status, options, tables_total)
-        VALUES ('running', options, 1)
+        VALUES ('running', stored_options, 1)
         RETURNING pgl_validate.run.run_id INTO v_run_id;
     ELSE
         SELECT r.run_id
@@ -782,6 +785,11 @@ BEGIN
         INTO edge_seq
         FROM pgl_validate.run_edge re
         WHERE re.run_id = v_run_id;
+
+        UPDATE pgl_validate.run
+        SET options = pgl_validate.run.options
+            || jsonb_build_object('hash_algorithm', hash_algorithm)
+        WHERE pgl_validate.run.run_id = v_run_id;
     END IF;
 
     INSERT INTO pgl_validate.run_participant(run_id, node, role, backend, pg_version, status)
