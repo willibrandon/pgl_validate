@@ -92,7 +92,7 @@ COMMENT ON FUNCTION pgl_validate._repair_statements(bigint, text) IS
 COMMENT ON FUNCTION pgl_validate.generate_repair(bigint, text) IS
     'Generate reviewable node-labeled DML and sequence setval statements for confirmed divergences using the selected authoritative node.';
 COMMENT ON FUNCTION pgl_validate.apply_repair(bigint, text, text, text, text, boolean) IS
-    'Apply target-labeled generated repair statements after explicit target confirmation and record repair_run and repair_result audit rows.';
+    'Apply target-labeled generated repair statements after explicit target confirmation, then run focused revalidation and record repair_run and repair_result audit rows.';
 COMMENT ON FUNCTION pgl_validate.run_status(bigint) IS
     'Return the persisted state for a validation run.';
 COMMENT ON FUNCTION pgl_validate.divergences(bigint) IS

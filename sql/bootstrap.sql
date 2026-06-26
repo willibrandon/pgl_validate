@@ -2640,6 +2640,14 @@ DECLARE
     sequence_stmt record;
     statement_count int;
     repair_error text;
+    local_origin_setup boolean := false;
+    revalidation_options jsonb;
+    revalidation_peers text[];
+    revalidation_failed boolean := false;
+    revalidation_note text;
+    revalidation_table pgl_validate.table_result%ROWTYPE;
+    revalidation_sequence_match boolean;
+    repaired_object record;
 BEGIN
     IF authoritative IS NULL OR btrim(authoritative) = '' THEN
         RAISE EXCEPTION 'authoritative node is required'
@@ -2675,6 +2683,11 @@ BEGIN
         RAISE EXCEPTION 'validation run % does not exist', apply_repair.run_id
             USING ERRCODE = '02000';
     END IF;
+
+    SELECT COALESCE(r.options, '{}'::jsonb) - '_pgl_validate_parent_run_id'
+    INTO revalidation_options
+    FROM pgl_validate.run r
+    WHERE r.run_id = apply_repair.run_id;
 
     IF NOT EXISTS (
         SELECT 1
@@ -2789,6 +2802,24 @@ BEGIN
             WHERE repair_id = repair.repair_id
             RETURNING * INTO repair;
             RETURN repair;
+        END IF;
+
+        IF target = 'local' AND propagation = 'local_only' THEN
+            IF pg_replication_origin_session_is_setup() THEN
+                RAISE EXCEPTION 'cannot apply local_only repair while another replication origin is active'
+                    USING ERRCODE = '55000';
+            END IF;
+
+            IF NOT EXISTS (
+                SELECT 1
+                FROM pg_replication_origin
+                WHERE roname = origin_name
+            ) THEN
+                PERFORM pg_replication_origin_create(origin_name);
+            END IF;
+
+            PERFORM pg_replication_origin_session_setup(origin_name);
+            local_origin_setup := true;
         END IF;
 
         SELECT string_agg(
@@ -2965,6 +2996,11 @@ BEGIN
             END IF;
         END LOOP;
 
+        IF local_origin_setup THEN
+            PERFORM pg_replication_origin_session_reset();
+            local_origin_setup := false;
+        END IF;
+
         INSERT INTO pgl_validate.repair_result(
             repair_id, schema_name, table_name, key_bytes, action, statement, post_verdict
         )
@@ -2978,14 +3014,153 @@ BEGIN
         FROM pgl_validate_apply_statement s
         ON CONFLICT DO NOTHING;
 
+        IF target <> 'local' THEN
+            revalidation_peers := ARRAY[target];
+        ELSIF authoritative <> 'local' THEN
+            revalidation_peers := ARRAY[authoritative];
+        ELSE
+            revalidation_peers := ARRAY[]::text[];
+        END IF;
+
+        IF cardinality(revalidation_peers) > 0 THEN
+            FOR repaired_object IN
+                SELECT DISTINCT schema_name, table_name
+                FROM pgl_validate_apply_statement
+                WHERE action IN ('insert','update','delete')
+                ORDER BY schema_name, table_name
+            LOOP
+                BEGIN
+                    SELECT *
+                    INTO revalidation_table
+                    FROM pgl_validate.compare_table(
+                        format('%I.%I', repaired_object.schema_name, repaired_object.table_name)::regclass,
+                        revalidation_peers,
+                        revalidation_options
+                    );
+
+                    IF revalidation_table.verdict = 'match' THEN
+                        UPDATE pgl_validate.repair_result rr
+                        SET post_verdict = 'match'
+                        WHERE rr.repair_id = repair.repair_id
+                          AND rr.schema_name = repaired_object.schema_name
+                          AND rr.table_name = repaired_object.table_name
+                          AND rr.action IN ('insert','update','delete');
+                    ELSE
+                        revalidation_failed := true;
+                        revalidation_note := concat_ws(
+                            '; ',
+                            revalidation_note,
+                            format(
+                                'post-repair table revalidation %.% returned %s',
+                                repaired_object.schema_name,
+                                repaired_object.table_name,
+                                revalidation_table.verdict
+                            )
+                        );
+                        UPDATE pgl_validate.repair_result rr
+                        SET post_verdict = 'still_differs'
+                        WHERE rr.repair_id = repair.repair_id
+                          AND rr.schema_name = repaired_object.schema_name
+                          AND rr.table_name = repaired_object.table_name
+                          AND rr.action IN ('insert','update','delete');
+                    END IF;
+                EXCEPTION WHEN others THEN
+                    revalidation_failed := true;
+                    revalidation_note := concat_ws(
+                        '; ',
+                        revalidation_note,
+                        format(
+                            'post-repair table revalidation %.% failed: %s',
+                            repaired_object.schema_name,
+                            repaired_object.table_name,
+                            SQLERRM
+                        )
+                    );
+                    UPDATE pgl_validate.repair_result rr
+                    SET post_verdict = 'still_differs'
+                    WHERE rr.repair_id = repair.repair_id
+                      AND rr.schema_name = repaired_object.schema_name
+                      AND rr.table_name = repaired_object.table_name
+                      AND rr.action IN ('insert','update','delete');
+                END;
+            END LOOP;
+
+            FOR repaired_object IN
+                SELECT DISTINCT schema_name, table_name
+                FROM pgl_validate_apply_statement
+                WHERE action = 'setval'
+                ORDER BY schema_name, table_name
+            LOOP
+                BEGIN
+                    SELECT bool_and(sr.verdict = 'match' AND sr.within_contract)
+                    INTO revalidation_sequence_match
+                    FROM pgl_validate.compare_sequence(
+                        format('%I.%I', repaired_object.schema_name, repaired_object.table_name)::regclass,
+                        revalidation_peers,
+                        revalidation_options
+                    ) AS sr;
+
+                    IF COALESCE(revalidation_sequence_match, false) THEN
+                        UPDATE pgl_validate.repair_result rr
+                        SET post_verdict = 'match'
+                        WHERE rr.repair_id = repair.repair_id
+                          AND rr.schema_name = repaired_object.schema_name
+                          AND rr.table_name = repaired_object.table_name
+                          AND rr.action = 'setval';
+                    ELSE
+                        revalidation_failed := true;
+                        revalidation_note := concat_ws(
+                            '; ',
+                            revalidation_note,
+                            format(
+                                'post-repair sequence revalidation %.% did not match',
+                                repaired_object.schema_name,
+                                repaired_object.table_name
+                            )
+                        );
+                        UPDATE pgl_validate.repair_result rr
+                        SET post_verdict = 'still_differs'
+                        WHERE rr.repair_id = repair.repair_id
+                          AND rr.schema_name = repaired_object.schema_name
+                          AND rr.table_name = repaired_object.table_name
+                          AND rr.action = 'setval';
+                    END IF;
+                EXCEPTION WHEN others THEN
+                    revalidation_failed := true;
+                    revalidation_note := concat_ws(
+                        '; ',
+                        revalidation_note,
+                        format(
+                            'post-repair sequence revalidation %.% failed: %s',
+                            repaired_object.schema_name,
+                            repaired_object.table_name,
+                            SQLERRM
+                        )
+                    );
+                    UPDATE pgl_validate.repair_result rr
+                    SET post_verdict = 'still_differs'
+                    WHERE rr.repair_id = repair.repair_id
+                      AND rr.schema_name = repaired_object.schema_name
+                      AND rr.table_name = repaired_object.table_name
+                      AND rr.action = 'setval';
+                END;
+            END LOOP;
+        END IF;
+
         UPDATE pgl_validate.repair_run
-        SET status = 'applied',
-            finished_at = clock_timestamp()
+        SET status = CASE WHEN revalidation_failed THEN 'applied' ELSE 'revalidated' END,
+            finished_at = clock_timestamp(),
+            error = revalidation_note
         WHERE repair_id = repair.repair_id
         RETURNING * INTO repair;
 
         RETURN repair;
     EXCEPTION WHEN others THEN
+        IF local_origin_setup THEN
+            PERFORM pg_replication_origin_session_reset();
+            local_origin_setup := false;
+        END IF;
+
         GET STACKED DIAGNOSTICS repair_error = MESSAGE_TEXT;
         UPDATE pgl_validate.repair_run
         SET status = 'failed',

@@ -1232,7 +1232,7 @@ mod tests {
         let (repair_id, repair_status) = repair_status
             .split_once(';')
             .expect("repair status should include id");
-        assert_eq!(repair_status, "applied");
+        assert_eq!(repair_status, "revalidated");
 
         let repair_actions = Spi::get_one::<String>(&format!(
             "
@@ -1253,6 +1253,74 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(repaired_verdict, "match");
+
+        crate::transport::libpq::execute_command(
+            &remote_dsn,
+            &format!("INSERT INTO public.{table_name} VALUES (5, 'remote-added')"),
+        )
+        .unwrap();
+
+        Spi::run(&format!(
+            "
+            UPDATE public.{table_name}
+            SET value = 'local-stale'
+            WHERE id = 1;
+            INSERT INTO public.{table_name}
+            VALUES (4, 'local-extra');
+            "
+        ))
+        .unwrap();
+
+        let local_drift_run_id = Spi::get_one::<i64>(&run_sql).unwrap().unwrap();
+        let local_drift_verdict = Spi::get_one::<String>(&format!(
+            "SELECT verdict FROM pgl_validate.table_result WHERE run_id = {local_drift_run_id}"
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(local_drift_verdict, "differ");
+
+        let local_repair_status = Spi::get_one::<String>(&format!(
+            "
+            SELECT repair_id::text || ';' || status
+            FROM pgl_validate.apply_repair(
+                {local_drift_run_id},
+                'remote_diff',
+                'local',
+                'local'
+            )
+            "
+        ))
+        .unwrap()
+        .unwrap();
+        let (local_repair_id, local_repair_status) = local_repair_status
+            .split_once(';')
+            .expect("local repair status should include id");
+        assert_eq!(local_repair_status, "revalidated");
+
+        let local_repair_actions = Spi::get_one::<String>(&format!(
+            "
+            SELECT string_agg(action || ':' || post_verdict, ',' ORDER BY action)
+            FROM pgl_validate.repair_result
+            WHERE repair_id = {local_repair_id}
+            "
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            local_repair_actions,
+            "delete:match,insert:match,update:match"
+        );
+
+        let origin_reset =
+            Spi::get_one::<bool>("SELECT NOT pg_replication_origin_session_is_setup()")
+                .unwrap()
+                .unwrap();
+        assert!(origin_reset);
+
+        let local_repaired_verdict = Spi::get_one::<String>(&repaired_verdict_sql)
+            .unwrap()
+            .unwrap();
+        assert_eq!(local_repaired_verdict, "match");
 
         let _ = crate::transport::libpq::execute_command(
             &local_dsn,
@@ -1333,7 +1401,7 @@ mod tests {
         let (repair_id, repair_status) = repair_status
             .split_once(';')
             .expect("FK repair status should include id");
-        assert_eq!(repair_status, "applied");
+        assert_eq!(repair_status, "revalidated");
 
         let repair_audit = Spi::get_one::<String>(&format!(
             "
@@ -2296,18 +2364,18 @@ mod tests {
         let (repair_id, repair_status) = repair_status
             .split_once(';')
             .expect("sequence repair status should include id");
-        assert_eq!(repair_status, "applied");
+        assert_eq!(repair_status, "revalidated");
 
         let sequence_repair_action = Spi::get_one::<String>(&format!(
             "
-            SELECT action
+            SELECT action || ':' || post_verdict
             FROM pgl_validate.repair_result
             WHERE repair_id = {repair_id}
             "
         ))
         .unwrap()
         .unwrap();
-        assert_eq!(sequence_repair_action, "setval");
+        assert_eq!(sequence_repair_action, "setval:match");
 
         let repaired_sequence = Spi::get_one::<String>(&compare_sql).unwrap().unwrap();
         assert_eq!(repaired_sequence, "match;true");

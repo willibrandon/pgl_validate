@@ -689,16 +689,16 @@ FROM pgl_validate.apply_repair($driftRunId, 'local', 'target', 'target')
     }
     $repairId = $repairParts[0]
     $repairStatus = $repairParts[1]
-    if ($repairStatus -ne 'applied') {
+    if ($repairStatus -ne 'revalidated') {
         throw "unexpected repair status: $repairResult"
     }
 
     $repairAudit = Invoke-Sql -Database 'provider' -Sql @"
-SELECT COALESCE(string_agg(action, ',' ORDER BY action), '<none>')
+SELECT COALESCE(string_agg(action || ':' || post_verdict, ',' ORDER BY action), '<none>')
 FROM pgl_validate.repair_result
 WHERE repair_id = $repairId
 "@
-    if ($repairAudit -ne 'update') {
+    if ($repairAudit -ne 'update:match') {
         throw "unexpected repair audit actions: $repairAudit"
     }
 
