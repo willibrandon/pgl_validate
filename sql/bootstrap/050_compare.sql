@@ -25,6 +25,8 @@ DECLARE
     error_detail text;
     error_cols text[];
     error_key_cols text[];
+    parent_run_id bigint := NULLIF(effective_options->>'_pgl_validate_parent_run_id', '')::bigint;
+    stored_options jsonb;
 BEGIN
     IF jsonb_typeof(effective_options) <> 'object' THEN
         RAISE EXCEPTION 'options must be a JSON object'
@@ -95,10 +97,36 @@ BEGIN
     IF reference IS NOT NULL THEN
         effective_options := effective_options || jsonb_build_object('provider_node', reference);
     END IF;
+    stored_options := effective_options - '_pgl_validate_parent_run_id';
 
-    INSERT INTO pgl_validate.run(status, options, reference_node, tables_total)
-    VALUES ('planning', effective_options, reference, table_count)
-    RETURNING pgl_validate.run.run_id INTO v_run_id;
+    IF parent_run_id IS NULL THEN
+        INSERT INTO pgl_validate.run(status, options, reference_node, tables_total)
+        VALUES ('planning', stored_options, reference, table_count)
+        RETURNING pgl_validate.run.run_id INTO v_run_id;
+    ELSE
+        SELECT r.run_id
+        INTO v_run_id
+        FROM pgl_validate.run r
+        WHERE r.run_id = parent_run_id
+          AND r.status IN ('planning','fencing','running','rechecking','paused')
+        FOR UPDATE;
+
+        IF v_run_id IS NULL THEN
+            RAISE EXCEPTION 'parent validation run % does not exist or is not appendable', parent_run_id
+                USING ERRCODE = '55000';
+        END IF;
+
+        UPDATE pgl_validate.run
+        SET status = 'planning',
+            options = stored_options,
+            reference_node = reference,
+            tables_total = table_count,
+            tables_matched = NULL,
+            tables_differ = NULL,
+            finished_at = NULL,
+            error = NULL
+        WHERE pgl_validate.run.run_id = v_run_id;
+    END IF;
 
     BEGIN
         IF table_count > 0 THEN

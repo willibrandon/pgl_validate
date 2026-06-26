@@ -121,5 +121,6 @@ physical-standby replay fence plumbing, sequence-window validation, keyless
 whole-relation validation, multi-table and replication-set compare
 orchestration, structured JSON reports, reviewable repair generation, audited
 repair application, conflict-history evidence correlation, run-control and
-retention APIs, and fenced paths exercised against real pglogical, native
-logical, and physical standby replication.
+retention APIs, dynamic-worker async run orchestration, and fenced paths
+exercised against real pglogical, native logical, and physical standby
+replication.

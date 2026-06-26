@@ -55,6 +55,225 @@ BEGIN
 END
 $$;
 
+CREATE FUNCTION pgl_validate.compare_async(
+    tables regclass[] DEFAULT NULL,
+    repset text DEFAULT NULL,
+    peers text[] DEFAULT NULL,
+    reference text DEFAULT NULL,
+    options jsonb DEFAULT '{}'::jsonb
+)
+RETURNS bigint
+LANGUAGE plpgsql
+VOLATILE
+AS $$
+DECLARE
+    effective_options jsonb := COALESCE(options, '{}'::jsonb);
+    v_run_id bigint;
+    v_task_id integer;
+    v_worker_pid integer;
+BEGIN
+    IF jsonb_typeof(effective_options) <> 'object' THEN
+        RAISE EXCEPTION 'options must be a JSON object'
+            USING ERRCODE = '22023';
+    END IF;
+
+    INSERT INTO pgl_validate.run(status, options, reference_node, tables_total)
+    VALUES (
+        'planning',
+        effective_options || jsonb_build_object('async', true),
+        reference,
+        CASE WHEN tables IS NULL THEN NULL ELSE cardinality(tables) END
+    )
+    RETURNING pgl_validate.run.run_id INTO v_run_id;
+
+    INSERT INTO pgl_validate.worker_task(
+        run_id, task_kind, request, status, database_name
+    )
+    VALUES (
+        v_run_id,
+        'compare',
+        jsonb_build_object(
+            'tables',
+                CASE
+                    WHEN tables IS NULL THEN NULL::jsonb
+                    ELSE (
+                        SELECT jsonb_agg(t.table_oid::text ORDER BY t.ordinality)
+                        FROM unnest(tables) WITH ORDINALITY AS t(table_oid, ordinality)
+                    )
+                END,
+            'repset', repset,
+            'peers', to_jsonb(peers),
+            'reference', reference,
+            'options', effective_options
+        ),
+        'queued',
+        current_database()
+    )
+    RETURNING task_id INTO v_task_id;
+
+    BEGIN
+        v_worker_pid := pgl_validate.launch_worker_task(v_task_id);
+        UPDATE pgl_validate.worker_task
+        SET worker_pid = v_worker_pid
+        WHERE task_id = v_task_id;
+    EXCEPTION WHEN others THEN
+        UPDATE pgl_validate.worker_task
+        SET status = 'failed',
+            finished_at = clock_timestamp(),
+            error = SQLERRM
+        WHERE task_id = v_task_id;
+
+        UPDATE pgl_validate.run
+        SET status = 'failed',
+            finished_at = clock_timestamp(),
+            error = SQLERRM
+        WHERE run_id = v_run_id;
+
+        RAISE;
+    END;
+
+    RETURN v_run_id;
+END
+$$;
+
+CREATE FUNCTION pgl_validate._claim_worker_task(task_id integer)
+RETURNS boolean
+LANGUAGE plpgsql
+VOLATILE
+AS $$
+DECLARE
+    task pgl_validate.worker_task;
+BEGIN
+    SELECT *
+    INTO task
+    FROM pgl_validate.worker_task wt
+    WHERE wt.task_id = _claim_worker_task.task_id
+    FOR UPDATE;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'worker task % does not exist', task_id
+            USING ERRCODE = '02000';
+    END IF;
+
+    IF task.status = 'canceled' THEN
+        UPDATE pgl_validate.run
+        SET status = 'canceled',
+            finished_at = COALESCE(finished_at, clock_timestamp())
+        WHERE run_id = task.run_id
+          AND status IN ('planning','fencing','running','paused','rechecking');
+        RETURN false;
+    END IF;
+
+    IF task.status NOT IN ('queued','starting','running') THEN
+        RETURN false;
+    END IF;
+
+    UPDATE pgl_validate.worker_task
+    SET status = 'running',
+        started_at = COALESCE(started_at, clock_timestamp()),
+        worker_pid = pg_backend_pid()
+    WHERE pgl_validate.worker_task.task_id = task.task_id;
+
+    RETURN true;
+END
+$$;
+
+CREATE FUNCTION pgl_validate._run_worker_task(task_id integer)
+RETURNS void
+LANGUAGE plpgsql
+VOLATILE
+AS $$
+DECLARE
+    task pgl_validate.worker_task;
+    table_list regclass[];
+    peer_list text[];
+    request_options jsonb;
+    request_repset text;
+    request_reference text;
+BEGIN
+    SELECT *
+    INTO task
+    FROM pgl_validate.worker_task wt
+    WHERE wt.task_id = _run_worker_task.task_id
+    FOR UPDATE;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'worker task % does not exist', task_id
+            USING ERRCODE = '02000';
+    END IF;
+
+    IF task.status = 'canceled' THEN
+        UPDATE pgl_validate.run
+        SET status = 'canceled',
+            finished_at = COALESCE(finished_at, clock_timestamp())
+        WHERE run_id = task.run_id
+          AND status IN ('planning','fencing','running','paused','rechecking');
+        RETURN;
+    END IF;
+
+    IF task.status <> 'running' THEN
+        RAISE EXCEPTION 'worker task % is %, expected running', task.task_id, task.status
+            USING ERRCODE = '55000';
+    END IF;
+
+    IF task.task_kind <> 'compare' THEN
+        RAISE EXCEPTION 'unsupported worker task kind %', task.task_kind
+            USING ERRCODE = '0A000';
+    END IF;
+
+    SELECT array_agg(t.table_name::regclass ORDER BY t.ordinality)
+    INTO table_list
+    FROM jsonb_array_elements_text(
+        CASE
+            WHEN jsonb_typeof(task.request->'tables') = 'array' THEN task.request->'tables'
+            ELSE '[]'::jsonb
+        END
+    ) WITH ORDINALITY AS t(table_name, ordinality);
+
+    SELECT array_agg(p.peer_name ORDER BY p.ordinality)
+    INTO peer_list
+    FROM jsonb_array_elements_text(
+        CASE
+            WHEN jsonb_typeof(task.request->'peers') = 'array' THEN task.request->'peers'
+            ELSE '[]'::jsonb
+        END
+    ) WITH ORDINALITY AS p(peer_name, ordinality);
+
+    request_options := COALESCE(task.request->'options', '{}'::jsonb);
+    request_repset := NULLIF(task.request->>'repset', '');
+    request_reference := NULLIF(task.request->>'reference', '');
+
+    BEGIN
+        PERFORM pgl_validate.compare(
+            table_list,
+            request_repset,
+            peer_list,
+            request_reference,
+            request_options || jsonb_build_object('_pgl_validate_parent_run_id', task.run_id)
+        );
+
+        UPDATE pgl_validate.worker_task
+        SET status = 'completed',
+            finished_at = clock_timestamp(),
+            error = NULL
+        WHERE pgl_validate.worker_task.task_id = task.task_id;
+    EXCEPTION WHEN others THEN
+        UPDATE pgl_validate.worker_task
+        SET status = 'failed',
+            finished_at = clock_timestamp(),
+            error = SQLERRM
+        WHERE pgl_validate.worker_task.task_id = task.task_id;
+
+        UPDATE pgl_validate.run
+        SET status = 'failed',
+            finished_at = clock_timestamp(),
+            error = SQLERRM
+        WHERE run_id = task.run_id
+          AND status <> 'canceled';
+    END;
+END
+$$;
+
 CREATE FUNCTION pgl_validate.purge(before timestamptz)
 RETURNS bigint
 LANGUAGE plpgsql

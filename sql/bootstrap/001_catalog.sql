@@ -306,6 +306,25 @@ CREATE TABLE pgl_validate.schedule (
     last_run_id bigint REFERENCES pgl_validate.run(run_id) ON DELETE SET NULL
 );
 
+CREATE TABLE pgl_validate.worker_task (
+    task_id       integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    run_id        bigint NOT NULL REFERENCES pgl_validate.run(run_id) ON DELETE CASCADE,
+    task_kind     text NOT NULL CHECK (task_kind IN ('compare')),
+    request       jsonb NOT NULL,
+    status        text NOT NULL DEFAULT 'queued'
+                  CHECK (status IN ('queued','starting','running','completed','failed','canceled')),
+    launched_by   name NOT NULL DEFAULT current_user,
+    database_name name NOT NULL DEFAULT current_database(),
+    worker_pid    integer,
+    enqueued_at   timestamptz NOT NULL DEFAULT now(),
+    started_at    timestamptz,
+    finished_at   timestamptz,
+    error         text
+);
+CREATE INDEX worker_task_run_idx ON pgl_validate.worker_task (run_id);
+CREATE INDEX worker_task_active_idx ON pgl_validate.worker_task (status, enqueued_at)
+WHERE status IN ('queued','starting','running');
+
 CREATE TABLE pgl_validate.repair_run (
     repair_id      bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     run_id         bigint NOT NULL REFERENCES pgl_validate.run(run_id) ON DELETE CASCADE,
@@ -350,6 +369,9 @@ SELECT * FROM pgl_validate.sequence_result;
 
 CREATE OR REPLACE VIEW pgl_validate.schema_issues AS
 SELECT * FROM pgl_validate.schema_issue;
+
+CREATE OR REPLACE VIEW pgl_validate.worker_tasks AS
+SELECT * FROM pgl_validate.worker_task;
 
 CREATE OR REPLACE VIEW pgl_validate.run_progress AS
 WITH chunk_counts AS (

@@ -43,6 +43,8 @@ COMMENT ON TABLE pgl_validate.schema_issue IS
     'Schema, privilege, or contract issues discovered during planning.';
 COMMENT ON TABLE pgl_validate.schedule IS
     'Persisted validation schedule definitions.';
+COMMENT ON TABLE pgl_validate.worker_task IS
+    'Durable background-worker task queue for asynchronous validation orchestration.';
 COMMENT ON TABLE pgl_validate.repair_run IS
     'Audited repair execution state.';
 COMMENT ON TABLE pgl_validate.repair_result IS
@@ -62,6 +64,8 @@ COMMENT ON VIEW pgl_validate.sequence_results IS
     'Reporting view over sequence validation results.';
 COMMENT ON VIEW pgl_validate.schema_issues IS
     'Reporting view over planning and schema issues.';
+COMMENT ON VIEW pgl_validate.worker_tasks IS
+    'Reporting view over asynchronous validation worker tasks.';
 
 COMMENT ON FUNCTION pgl_validate.column_encoding_mode(oid) IS
     'Select the coordinator-pushed row_digest encoding mode for a column type.';
@@ -115,6 +119,12 @@ COMMENT ON FUNCTION pgl_validate.pause(bigint) IS
     'Move an active validation run into paused state for later resume.';
 COMMENT ON FUNCTION pgl_validate.resume(bigint) IS
     'Move a paused validation run back into running state and clear transient completion/error fields.';
+COMMENT ON FUNCTION pgl_validate.compare_async(regclass[], text, text[], text, jsonb) IS
+    'Create a durable validation run, enqueue a compare task, launch a dynamic background worker, and return the run id immediately.';
+COMMENT ON FUNCTION pgl_validate._claim_worker_task(integer) IS
+    'Atomically mark a queued worker task running before the background worker executes it.';
+COMMENT ON FUNCTION pgl_validate._run_worker_task(integer) IS
+    'Execute one claimed worker task and persist completed or failed state without hiding the run id from callers.';
 COMMENT ON FUNCTION pgl_validate.purge(timestamptz) IS
     'Delete terminal validation runs older than the cutoff and clean unprotected local barrier tokens.';
 COMMENT ON FUNCTION pgl_validate._repair_statements(bigint, text) IS
@@ -164,6 +174,8 @@ COMMENT ON FUNCTION pgl_validate.remote_sequence_value(text, text, integer, inte
     'Execute generated sequence SQL on a named peer DSN via libpq with bounded connect, statement, and lock timeouts.';
 COMMENT ON FUNCTION pgl_validate.remote_execute(text, text, integer, integer, integer) IS
     'Execute a generated SQL command batch on a named peer DSN via libpq with bounded connect, statement, and lock timeouts.';
+COMMENT ON FUNCTION pgl_validate.launch_worker_task(integer) IS
+    'Launch a queued validation task in a PostgreSQL dynamic background worker and return its backend pid.';
 COMMENT ON FUNCTION pgl_validate.remote_inject_barrier(text, integer, integer, integer) IS
     'Insert a barrier token on a remote origin over libpq and return the exact barrier commit end LSN.';
 COMMENT ON FUNCTION pgl_validate.remote_wait_slot_confirm_lsn(text, text, pg_lsn, integer, integer, integer) IS

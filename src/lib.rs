@@ -10,6 +10,7 @@ use pgrx::{GucContext, GucFlags, GucRegistry, GucSetting};
 mod digest;
 mod sql_api;
 mod transport;
+mod worker;
 
 pgrx::pg_module_magic!(name, version);
 

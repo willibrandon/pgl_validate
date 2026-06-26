@@ -2831,6 +2831,88 @@ mod tests {
     }
 
     #[pg_test]
+    fn worker_task_claim_and_run_executes_parent_compare() {
+        let backend_pid = Spi::get_one::<i32>("SELECT pg_backend_pid()")
+            .unwrap()
+            .unwrap();
+        let table_name = identifier(&format!("pgl_validate_worker_target_{backend_pid}"));
+
+        Spi::run(&format!(
+            "
+            CREATE TABLE public.{table_name}(id int PRIMARY KEY, value text);
+            INSERT INTO public.{table_name} VALUES (1, 'same');
+            "
+        ))
+        .unwrap();
+
+        let task = Spi::get_one::<String>(&format!(
+            "
+            WITH run AS (
+                INSERT INTO pgl_validate.run(status, options)
+                VALUES ('planning', '{{\"async\": true}}'::jsonb)
+                RETURNING run_id
+            ),
+            task AS (
+                INSERT INTO pgl_validate.worker_task(
+                    run_id, task_kind, request, status, database_name
+                )
+                SELECT
+                    run_id,
+                    'compare',
+                    jsonb_build_object(
+                        'tables', jsonb_build_array('public.{table_name}'),
+                        'repset', NULL,
+                        'peers', NULL,
+                        'reference', NULL,
+                        'options', '{{}}'::jsonb
+                    ),
+                    'queued',
+                    current_database()
+                FROM run
+                RETURNING run_id, task_id
+            )
+            SELECT run_id::text || ';' || task_id::text
+            FROM task
+            "
+        ))
+        .unwrap()
+        .unwrap();
+        let (run_id, task_id) = task
+            .split_once(';')
+            .expect("worker task result should contain run and task ids");
+
+        let claimed = Spi::get_one::<bool>(&format!(
+            "SELECT pgl_validate._claim_worker_task({task_id}::integer)"
+        ))
+        .unwrap()
+        .unwrap();
+        assert!(claimed);
+
+        Spi::run(&format!(
+            "SELECT pgl_validate._run_worker_task({task_id}::integer)"
+        ))
+        .unwrap();
+
+        let state = Spi::get_one::<String>(&format!(
+            "
+            SELECT r.status || ';' ||
+                   wt.status || ';' ||
+                   tr.verdict || ';' ||
+                   (wt.worker_pid = pg_backend_pid())::text || ';' ||
+                   (wt.finished_at IS NOT NULL)::text
+            FROM pgl_validate.run r
+            JOIN pgl_validate.worker_tasks wt USING (run_id)
+            JOIN pgl_validate.table_result tr USING (run_id)
+            WHERE r.run_id = {run_id}
+            "
+        ))
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(state, "completed;completed;match;true;true");
+    }
+
+    #[pg_test]
     fn purge_removes_terminal_runs_and_unprotected_barriers() {
         let active_run = Spi::get_one::<i64>(
             "INSERT INTO pgl_validate.run(status, started_at)

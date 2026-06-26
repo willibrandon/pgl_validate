@@ -2,6 +2,7 @@
 
 use crate::digest;
 use crate::transport;
+use crate::worker;
 use pgrx::prelude::*;
 
 /// Compute the canonical BLAKE3 row digest for a heterogeneous tuple.
@@ -46,6 +47,7 @@ fn last_commit_lsn() -> i64 {
 mod pgl_validate {
     use super::digest;
     use super::transport;
+    use super::worker;
     use pgrx::StringInfo;
     use pgrx::aggregate::*;
     use pgrx::prelude::*;
@@ -267,6 +269,12 @@ mod pgl_validate {
             lock_timeout_ms,
         )
         .unwrap_or_else(|err| pgrx::error!("{err}"));
+    }
+
+    /// Launch one queued validation worker task in a dynamic background worker.
+    #[pg_extern(volatile, parallel_unsafe)]
+    fn launch_worker_task(task_id: i32) -> i32 {
+        worker::launch_worker_task(task_id)
     }
 
     /// Insert a barrier token on a remote origin and return its exact end LSN.
