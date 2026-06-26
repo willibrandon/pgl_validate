@@ -123,6 +123,14 @@ SET pgl_validate.conflict_history_max_rows = 1000;
 For bidirectional pglogical validation, set `pgl_validate.peer.reverse_subscription_name`
 to the local subscription that replicates from that peer back to the coordinator.
 
+## Security
+
+The extension installs four NOLOGIN tier roles: `pgl_validate_validate`,
+`pgl_validate_discover`, `pgl_validate_orchestrate`, and `pgl_validate_repair`.
+Default PUBLIC access is revoked. Grant the narrowest role to the operators or
+service accounts that need it; ordinary table privileges are still required
+because validation functions run as invoker.
+
 ## Status
 
 The repository is being built from the design outward. The current slice covers

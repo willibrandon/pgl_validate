@@ -234,3 +234,126 @@ COMMENT ON FUNCTION pgl_validate.lthash_state_lthash_state_combine(pgl_validate.
     'Parallel combine function for the pgl_validate.lthash aggregate.';
 COMMENT ON AGGREGATE pgl_validate.lthash(bytea) IS
     'Order-independent, duplicate-sensitive LtHash aggregate over row digests.';
+
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'pgl_validate_validate') THEN
+        CREATE ROLE pgl_validate_validate NOLOGIN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'pgl_validate_discover') THEN
+        CREATE ROLE pgl_validate_discover NOLOGIN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'pgl_validate_orchestrate') THEN
+        CREATE ROLE pgl_validate_orchestrate NOLOGIN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'pgl_validate_repair') THEN
+        CREATE ROLE pgl_validate_repair NOLOGIN;
+    END IF;
+END
+$$;
+
+COMMENT ON ROLE pgl_validate_validate IS
+    'pgl_validate T1 role: run node-local digest and set-hash primitives against tables the caller can already read.';
+COMMENT ON ROLE pgl_validate_discover IS
+    'pgl_validate T2 role: inspect replication contracts and topology metadata; pglogical deployments still require pglogical-appropriate elevated privileges.';
+COMMENT ON ROLE pgl_validate_orchestrate IS
+    'pgl_validate T3 role: write validation catalogs, fence peers, launch workers, and read stored peer DSNs.';
+COMMENT ON ROLE pgl_validate_repair IS
+    'pgl_validate T4 role: generate and apply audited repairs using replication-origin and target-table privileges.';
+
+GRANT pgl_validate_validate TO pgl_validate_discover;
+GRANT pgl_validate_discover TO pgl_validate_orchestrate;
+GRANT pgl_validate_orchestrate TO pgl_validate_repair;
+
+REVOKE ALL ON SCHEMA pgl_validate FROM PUBLIC;
+REVOKE ALL ON ALL TABLES IN SCHEMA pgl_validate FROM PUBLIC;
+REVOKE ALL ON ALL SEQUENCES IN SCHEMA pgl_validate FROM PUBLIC;
+REVOKE EXECUTE ON ALL FUNCTIONS IN SCHEMA pgl_validate FROM PUBLIC;
+REVOKE EXECUTE ON ALL ROUTINES IN SCHEMA pgl_validate FROM PUBLIC;
+ALTER DEFAULT PRIVILEGES IN SCHEMA pgl_validate
+    REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC;
+
+GRANT USAGE ON SCHEMA pgl_validate
+    TO pgl_validate_validate,
+       pgl_validate_discover,
+       pgl_validate_orchestrate,
+       pgl_validate_repair;
+
+GRANT USAGE ON TYPE pgl_validate.lthash_state
+    TO pgl_validate_validate,
+       pgl_validate_discover,
+       pgl_validate_orchestrate,
+       pgl_validate_repair;
+
+GRANT EXECUTE ON FUNCTION pgl_validate.row_digest(integer[], "any")
+    TO pgl_validate_validate;
+GRANT EXECUTE ON FUNCTION pgl_validate.hash_digest_array(bytea[])
+    TO pgl_validate_validate;
+GRANT EXECUTE ON FUNCTION pgl_validate.lthash(bytea)
+    TO pgl_validate_validate;
+GRANT EXECUTE ON FUNCTION pgl_validate.lthash_combine(
+    pgl_validate.lthash_state,
+    pgl_validate.lthash_state
+) TO pgl_validate_validate;
+GRANT EXECUTE ON FUNCTION pgl_validate.lthash_bytes(pgl_validate.lthash_state)
+    TO pgl_validate_validate;
+
+GRANT EXECUTE ON FUNCTION pgl_validate.column_encoding_mode(oid)
+    TO pgl_validate_discover;
+GRANT EXECUTE ON FUNCTION pgl_validate.comparison_key_cols(regclass)
+    TO pgl_validate_discover;
+GRANT EXECUTE ON FUNCTION pgl_validate.pglogical_table_contract(regclass, text[], name)
+    TO pgl_validate_discover;
+GRANT EXECUTE ON FUNCTION pgl_validate.native_table_contract(regclass, text[], name)
+    TO pgl_validate_discover;
+GRANT EXECUTE ON FUNCTION pgl_validate.row_filter_tree_is_immutable(text)
+    TO pgl_validate_discover;
+
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA pgl_validate
+    TO pgl_validate_orchestrate;
+GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA pgl_validate
+    TO pgl_validate_orchestrate;
+GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA pgl_validate
+    TO pgl_validate_orchestrate;
+GRANT EXECUTE ON ALL ROUTINES IN SCHEMA pgl_validate
+    TO pgl_validate_orchestrate;
+
+REVOKE EXECUTE ON FUNCTION pgl_validate._repair_statements(bigint, text)
+    FROM pgl_validate_orchestrate;
+REVOKE EXECUTE ON FUNCTION pgl_validate.generate_repair(bigint, text)
+    FROM pgl_validate_orchestrate;
+REVOKE EXECUTE ON FUNCTION pgl_validate.apply_repair(
+    bigint,
+    text,
+    text,
+    text,
+    text,
+    boolean
+) FROM pgl_validate_orchestrate;
+REVOKE EXECUTE ON FUNCTION pgl_validate.remote_execute(
+    text,
+    text,
+    integer,
+    integer,
+    integer
+) FROM pgl_validate_orchestrate;
+
+GRANT EXECUTE ON FUNCTION pgl_validate._repair_statements(bigint, text)
+    TO pgl_validate_repair;
+GRANT EXECUTE ON FUNCTION pgl_validate.generate_repair(bigint, text)
+    TO pgl_validate_repair;
+GRANT EXECUTE ON FUNCTION pgl_validate.apply_repair(
+    bigint,
+    text,
+    text,
+    text,
+    text,
+    boolean
+) TO pgl_validate_repair;
+GRANT EXECUTE ON FUNCTION pgl_validate.remote_execute(
+    text,
+    text,
+    integer,
+    integer,
+    integer
+) TO pgl_validate_repair;

@@ -431,6 +431,74 @@ mod tests {
     }
 
     #[pg_test]
+    fn security_tier_roles_gate_extension_surface() {
+        Spi::run(
+            r#"
+            DROP ROLE IF EXISTS pgl_validate_security_unprivileged;
+            DROP ROLE IF EXISTS pgl_validate_security_orchestrator;
+            DROP ROLE IF EXISTS pgl_validate_security_repair;
+            CREATE ROLE pgl_validate_security_unprivileged;
+            CREATE ROLE pgl_validate_security_orchestrator;
+            CREATE ROLE pgl_validate_security_repair;
+            GRANT pgl_validate_orchestrate TO pgl_validate_security_orchestrator;
+            GRANT pgl_validate_repair TO pgl_validate_security_repair;
+            "#,
+        )
+        .unwrap();
+
+        let privilege_shape = Spi::get_one::<String>(
+            r#"
+            SELECT
+                has_schema_privilege('pgl_validate_security_unprivileged', 'pgl_validate', 'USAGE')::text || ';' ||
+                has_function_privilege('pgl_validate_security_unprivileged', 'pgl_validate.compare_table(regclass,text[],jsonb)', 'EXECUTE')::text || ';' ||
+                has_table_privilege('pgl_validate_security_unprivileged', 'pgl_validate.peer', 'SELECT')::text || ';' ||
+                has_function_privilege('pgl_validate_validate', 'pgl_validate.row_digest(integer[], "any")', 'EXECUTE')::text || ';' ||
+                has_function_privilege('pgl_validate_validate', 'pgl_validate.compare_table(regclass,text[],jsonb)', 'EXECUTE')::text || ';' ||
+                has_function_privilege('pgl_validate_security_orchestrator', 'pgl_validate.compare_table(regclass,text[],jsonb)', 'EXECUTE')::text || ';' ||
+                has_table_privilege('pgl_validate_security_orchestrator', 'pgl_validate.run', 'INSERT')::text || ';' ||
+                has_function_privilege('pgl_validate_security_orchestrator', 'pgl_validate.apply_repair(bigint,text,text,text,text,boolean)', 'EXECUTE')::text || ';' ||
+                has_function_privilege('pgl_validate_security_repair', 'pgl_validate.apply_repair(bigint,text,text,text,text,boolean)', 'EXECUTE')::text || ';' ||
+                has_function_privilege('pgl_validate_security_repair', 'pgl_validate.remote_execute(text,text,integer,integer,integer)', 'EXECUTE')::text
+            "#,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            privilege_shape,
+            "false;false;false;true;false;true;true;false;true;true"
+        );
+
+        Spi::run(
+            r#"
+            CREATE TABLE public.security_tier_target(
+                id int PRIMARY KEY,
+                value text
+            );
+            INSERT INTO public.security_tier_target VALUES (1, 'same');
+            GRANT SELECT ON public.security_tier_target TO pgl_validate_security_orchestrator;
+            "#,
+        )
+        .unwrap();
+
+        Spi::run("SET ROLE pgl_validate_security_orchestrator").unwrap();
+        let verdict = Spi::get_one::<String>(
+            "SELECT (pgl_validate.compare_table('public.security_tier_target'::regclass)).verdict",
+        );
+        Spi::run("RESET ROLE").unwrap();
+        assert_eq!(verdict.unwrap().unwrap(), "match");
+
+        Spi::run(
+            r#"
+            DROP TABLE public.security_tier_target;
+            DROP ROLE pgl_validate_security_repair;
+            DROP ROLE pgl_validate_security_orchestrator;
+            DROP ROLE pgl_validate_security_unprivileged;
+            "#,
+        )
+        .unwrap();
+    }
+
+    #[pg_test]
     fn compare_table_records_commit_timestamp_advisory_when_disabled() {
         Spi::run(
             "
