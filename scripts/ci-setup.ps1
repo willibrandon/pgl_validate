@@ -369,6 +369,31 @@ function Remove-UntrustedHomebrewTaps {
     }
 }
 
+<#
+.SYNOPSIS
+Unlinks installed versioned PostgreSQL formulae so CI uses explicit pg_config paths instead of Homebrew's global links.
+#>
+function Disconnect-HomebrewPostgresLinks {
+    $brew = Get-PglCommandSource -Name 'brew'
+    if (-not $brew) {
+        return
+    }
+
+    foreach ($major in @(15, 16, 17, 18)) {
+        $formula = "postgresql@$major"
+        $null = & $brew --prefix $formula 2>$null
+        if ($LASTEXITCODE -ne 0) {
+            continue
+        }
+
+        Write-Host "+ brew unlink $formula"
+        & $brew unlink $formula
+        if ($LASTEXITCODE -ne 0) {
+            Write-Warning "Could not unlink $formula; continuing because pgrx uses the explicit pg_config path."
+        }
+    }
+}
+
 function Initialize-LinuxPostgres {
     $packages = @(
         'build-essential',
@@ -422,6 +447,7 @@ function Initialize-LinuxPostgres {
 
 function Initialize-MacPostgres {
     Remove-UntrustedHomebrewTaps
+    Disconnect-HomebrewPostgresLinks
     Invoke-Logged -FilePath 'brew' -Arguments @('install', 'llvm', 'pkg-config', "postgresql@$PgMajor")
 
     $llvmPrefix = (& brew --prefix llvm).Trim()
@@ -434,6 +460,7 @@ function Initialize-MacPostgres {
     $pgConfig = Join-Path (Join-Path $pgPrefix 'bin') 'pg_config'
     Invoke-Logged -FilePath 'cargo' -Arguments @('pgrx', 'init', "--pg$PgMajor", $pgConfig)
     Enable-PostgresInstallWrites -PgConfig $pgConfig
+    Disconnect-HomebrewPostgresLinks
 }
 
 function Initialize-WindowsPostgres {
