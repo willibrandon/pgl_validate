@@ -4,6 +4,12 @@
 /test-pgdata/
 /tmp/
 /log/
+/tests/pg_regress/results/
+/tests/pg_regress/tmp_check/
+/tests/pg_regress/log/
+/tests/pg_regress/regression.diffs
+/tests/pg_regress/regression.*.diffs
+/tests/pg_regress/regression.out
 *.log
 *.pdb
 *.ilk

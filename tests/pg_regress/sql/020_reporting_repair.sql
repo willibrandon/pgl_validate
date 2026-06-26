@@ -1,0 +1,133 @@
+\set ON_ERROR_STOP on
+\pset null '<null>'
+
+DROP TABLE IF EXISTS public.pgl_validate_regress_repair;
+DROP SEQUENCE IF EXISTS public.pgl_validate_regress_seq;
+
+CREATE TABLE public.pgl_validate_regress_repair(
+    id int PRIMARY KEY,
+    value text
+);
+CREATE SEQUENCE public.pgl_validate_regress_seq CACHE 5;
+
+CREATE TEMP TABLE pgl_validate_regress_seed AS
+WITH run AS (
+    INSERT INTO pgl_validate.run(
+        status, started_at, finished_at, tables_total, tables_matched, tables_differ
+    )
+    VALUES (
+        'completed',
+        '2026-01-01 00:00:00+00',
+        '2026-01-01 00:00:01+00',
+        1,
+        0,
+        1
+    )
+    RETURNING run_id
+),
+participant AS (
+    INSERT INTO pgl_validate.run_participant(run_id, node, role, backend, pg_version, status)
+    SELECT run_id, 'local', 'reference', 'native', current_setting('server_version_num')::int, 'done'
+    FROM run
+    UNION ALL
+    SELECT run_id, 'target', 'participant', 'native', current_setting('server_version_num')::int, 'done'
+    FROM run
+),
+epoch AS (
+    INSERT INTO pgl_validate.fence_epoch(run_id, epoch_seq)
+    SELECT run_id, 1
+    FROM run
+),
+plan AS (
+    INSERT INTO pgl_validate.table_plan(
+        run_id, schema_name, table_name, key_cols, att_list, validated_property
+    )
+    SELECT run_id,
+           'public',
+           'pgl_validate_regress_repair',
+           ARRAY['id'],
+           ARRAY['id','value'],
+           'full'
+    FROM run
+),
+result AS (
+    INSERT INTO pgl_validate.table_result(run_id, schema_name, table_name, verdict, reason, finished_at)
+    SELECT run_id,
+           'public',
+           'pgl_validate_regress_repair',
+           'differ',
+           'fixture divergence',
+           '2026-01-01 00:00:01+00'
+    FROM run
+),
+divergence AS (
+    INSERT INTO pgl_validate.divergence(
+        run_id, schema_name, table_name, key_text, key_bytes,
+        classification, node, status, detected_epoch, tuple, detected_at
+    )
+    SELECT run_id,
+           'public',
+           'pgl_validate_regress_repair',
+           '{"id": 1}',
+           convert_to('{"id":1}', 'UTF8'),
+           'differs',
+           'target',
+           'confirmed',
+           1,
+           '{"local":{"id":1,"value":"local"},"peer":{"id":1,"value":"remote"}}'::jsonb,
+           '2026-01-01 00:00:01+00'
+    FROM run
+),
+issue AS (
+    INSERT INTO pgl_validate.schema_issue(run_id, node, schema_name, table_name, issue_code, detail)
+    SELECT run_id,
+           'target',
+           'public',
+           'pgl_validate_regress_repair',
+           'TABLE_COMPARE_FAILED',
+           'fixture detail'
+    FROM run
+),
+sequence AS (
+    INSERT INTO pgl_validate.sequence_result(
+        run_id, schema_name, seq_name, provider_node, provider_last_value,
+        subscriber_node, subscriber_last_value, cache_size, within_contract, verdict
+    )
+    SELECT run_id,
+           'public',
+           'pgl_validate_regress_seq',
+           'local',
+           42,
+           'target',
+           1,
+           5,
+           false,
+           'behind'
+    FROM run
+)
+SELECT run_id
+FROM run;
+
+SELECT status, tables_total, tables_matched, tables_differ
+FROM pgl_validate.run_status((SELECT run_id FROM pgl_validate_regress_seed));
+
+SELECT node, issue_code, detail
+FROM pgl_validate.schema_issues
+WHERE run_id = (SELECT run_id FROM pgl_validate_regress_seed)
+ORDER BY node, issue_code;
+
+SELECT regexp_replace(stmt, '\s+', ' ', 'g') AS repair_statement
+FROM pgl_validate.generate_repair(
+    (SELECT run_id FROM pgl_validate_regress_seed),
+    'local'
+) AS stmt
+ORDER BY stmt;
+
+SELECT report.doc->'run'->>'status' AS run_status,
+       jsonb_array_length(report.doc->'tables') AS table_count,
+       jsonb_array_length(report.doc->'schema_issues') AS issue_count,
+       jsonb_array_length(report.doc->'sequences') AS sequence_count,
+       report.doc->'tables'->0->'result'->>'verdict' AS table_verdict
+FROM (
+    SELECT pgl_validate.report((SELECT run_id FROM pgl_validate_regress_seed)) AS doc
+) report;

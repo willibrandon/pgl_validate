@@ -109,6 +109,11 @@ jobs:
           PGL_VALIDATE_MSVC_ARCH: ${{ matrix.target.msvc_arch }}
         run: ./scripts/pgrx-vs.ps1 pwsh -NoProfile -ExecutionPolicy Bypass -File ./scripts/test-pgrx.ps1 -PgMajor ${{ matrix.pg }} -TimeoutSeconds 600
 
+      - name: Run pgrx regress suite
+        env:
+          PGL_VALIDATE_MSVC_ARCH: ${{ matrix.target.msvc_arch }}
+        run: ./scripts/pgrx-vs.ps1 pwsh -NoProfile -ExecutionPolicy Bypass -File ./scripts/test-pgrx-regress.ps1 -PgMajor ${{ matrix.pg }} -TimeoutSeconds 300
+
       - name: Run async worker smoke harness
         env:
           PGL_VALIDATE_MSVC_ARCH: ${{ matrix.target.msvc_arch }}

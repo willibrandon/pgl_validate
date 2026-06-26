@@ -1,0 +1,87 @@
+\set ON_ERROR_STOP on
+\pset null '<null>'
+DROP TABLE IF EXISTS public.pgl_validate_regress_plan;
+DROP TABLE IF EXISTS public.pgl_validate_regress_composite;
+CREATE TABLE public.pgl_validate_regress_plan(
+    status text,
+    id int PRIMARY KEY,
+    amount numeric
+);
+INSERT INTO public.pgl_validate_regress_plan(status, id, amount)
+VALUES
+    ('before', 1, 9.50),
+    ('inside-low', 2, 10.25),
+    ('inside-high', 9, 11.50),
+    ('after', 10, 12.00);
+SELECT pgl_validate.plan_chunk_sql(
+    'public.pgl_validate_regress_plan'::regclass,
+    ARRAY['id'],
+    convert_to('{"id":2}', 'UTF8'),
+    convert_to('{"id":10}', 'UTF8'),
+    ARRAY['status','id','amount'],
+    NULL,
+    'id >= 1',
+    true,
+    'blake3_512'
+) AS checksum_sql;
+                                                                                                                                                                                                                                                                                                                                          checksum_sql                                                                                                                                                                                                                                                                                                                                           
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ WITH pgl_validate_settings AS MATERIALIZED (SELECT set_config('pgl_validate.hash_algorithm', 'blake3_512', true) AS hash_algorithm), digests AS MATERIALIZED (SELECT pgl_validate.row_digest('{2,1,1}'::int[], t.amount, t.id, t.status) AS rd FROM pgl_validate_settings, public.pgl_validate_regress_plan t WHERE (id >= 1) AND t.id >= '2'::integer AND t.id < '10'::integer), aggregate AS (SELECT count(*)::bigint AS n_rows, pgl_validate.lthash_bytes(pgl_validate.lthash(rd)) AS lthash FROM digests) SELECT aggregate.n_rows, aggregate.lthash, (SELECT pgl_validate.hash_digest_array(COALESCE(array_agg(rd ORDER BY rd), ARRAY[]::bytea[])) FROM digests) AS set_hash FROM aggregate
+(1 row)
+
+SELECT string_agg(
+           chunk_id::text || ':' ||
+           COALESCE(convert_from(lo, 'UTF8')::jsonb->>'id', '<null>') || ':' ||
+           COALESCE(convert_from(hi, 'UTF8')::jsonb->>'id', '<null>') || ':' ||
+           n_rows::text,
+           ',' ORDER BY chunk_id
+       ) AS planned_ranges
+FROM pgl_validate.plan_key_ranges(
+    'public.pgl_validate_regress_plan'::regclass,
+    ARRAY['id'],
+    NULL,
+    NULL,
+    2
+);
+      planned_ranges       
+---------------------------
+ 1:<null>:9:2,2:9:<null>:2
+(1 row)
+
+CREATE TABLE public.pgl_validate_regress_composite(
+    part int NOT NULL,
+    code text NOT NULL,
+    amount int,
+    PRIMARY KEY (part, code)
+);
+INSERT INTO public.pgl_validate_regress_composite(part, code, amount)
+VALUES
+    (1, 'a', 10),
+    (1, 'b', 20),
+    (2, 'a', 30),
+    (2, 'b', 40);
+SELECT pgl_validate.plan_key_range_predicate(
+    'public.pgl_validate_regress_composite'::regclass,
+    ARRAY['part','code'],
+    convert_to('{"part":1,"code":"b"}', 'UTF8'),
+    convert_to('{"part":2,"code":"b"}', 'UTF8')
+) AS composite_predicate;
+                                      composite_predicate                                       
+------------------------------------------------------------------------------------------------
+ (t.part, t.code) >= ('1'::integer, 'b'::text) AND (t.part, t.code) < ('2'::integer, 'b'::text)
+(1 row)
+
+SELECT pgl_validate.plan_localize_sql(
+    'public.pgl_validate_regress_composite'::regclass,
+    ARRAY['part','code'],
+    convert_to('{"part":1,"code":"b"}', 'UTF8'),
+    convert_to('{"part":2,"code":"b"}', 'UTF8'),
+    ARRAY['part','code','amount'],
+    NULL,
+    'blake3_256'
+) AS localize_sql;
+                                                                                                                                                                                                                                                                                               localize_sql                                                                                                                                                                                                                                                                                               
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ WITH pgl_validate_settings AS MATERIALIZED (SELECT set_config('pgl_validate.hash_algorithm', 'blake3_256', true) AS hash_algorithm) SELECT jsonb_build_object('part', t.part, 'code', t.code)::text AS key_text, pgl_validate.row_digest('{1,1}'::int[], t.part, t.code) AS key_bytes, pgl_validate.row_digest('{1,1,1}'::int[], t.amount, t.code, t.part) AS row_digest, to_jsonb(t)::text AS row_json FROM pgl_validate_settings, public.pgl_validate_regress_composite t WHERE (t.part, t.code) >= ('1'::integer, 'b'::text) AND (t.part, t.code) < ('2'::integer, 'b'::text) ORDER BY t.part, t.code
+(1 row)
+
