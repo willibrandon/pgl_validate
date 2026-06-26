@@ -130,6 +130,53 @@ FROM pgl_validate.generate_repair(
 ) AS stmt
 ORDER BY stmt;
 
+CREATE TEMP TABLE pgl_validate_regress_repair_check(
+    check_name text PRIMARY KEY,
+    ok boolean NOT NULL
+);
+
+DO $$
+DECLARE
+    before_count bigint;
+    after_count bigint;
+    caught_error text;
+BEGIN
+    SELECT count(*) INTO before_count
+    FROM pgl_validate.repair_run;
+
+    PERFORM set_config('session_replication_role', 'replica', true);
+    BEGIN
+        PERFORM pgl_validate.apply_repair(
+            (SELECT run_id FROM pgl_validate_regress_seed),
+            'target',
+            'local',
+            'local'
+        );
+        PERFORM set_config('session_replication_role', 'origin', true);
+        INSERT INTO pgl_validate_regress_repair_check
+        VALUES ('session_replication_role_rejected', false);
+    EXCEPTION WHEN object_not_in_prerequisite_state THEN
+        caught_error := SQLERRM;
+        PERFORM set_config('session_replication_role', 'origin', true);
+        SELECT count(*) INTO after_count
+        FROM pgl_validate.repair_run;
+        INSERT INTO pgl_validate_regress_repair_check
+        VALUES (
+            'session_replication_role_rejected',
+            caught_error = 'pgl_validate repair requires session_replication_role = origin'
+            AND before_count = after_count
+        );
+    WHEN others THEN
+        PERFORM set_config('session_replication_role', 'origin', true);
+        RAISE;
+    END;
+END
+$$;
+
+SELECT check_name, ok
+FROM pgl_validate_regress_repair_check
+ORDER BY check_name;
+
 CREATE TEMP TABLE pgl_validate_regress_action_case(
     label text PRIMARY KEY,
     validated_property text NOT NULL,

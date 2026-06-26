@@ -523,6 +523,7 @@ DECLARE
     row_batch text;
     verify_batch text;
     remote_batch text;
+    session_role_check text := 'DO $pgl_validate_role$ BEGIN IF current_setting(''session_replication_role'') <> ''origin'' THEN RAISE EXCEPTION ''pgl_validate repair requires session_replication_role = origin'' USING ERRCODE = ''55000''; END IF; END $pgl_validate_role$;';
     sequence_stmt record;
     statement_count int;
     repair_error text;
@@ -568,6 +569,11 @@ BEGIN
     IF authoritative = target THEN
         RAISE EXCEPTION 'authoritative node and repair target must differ'
             USING ERRCODE = '22023';
+    END IF;
+
+    IF current_setting('session_replication_role') <> 'origin' THEN
+        RAISE EXCEPTION 'pgl_validate repair requires session_replication_role = origin'
+            USING ERRCODE = '55000';
     END IF;
 
     IF NOT EXISTS (SELECT 1 FROM pgl_validate.run r WHERE r.run_id = apply_repair.run_id) THEN
@@ -623,6 +629,11 @@ BEGIN
     RETURNING * INTO repair;
 
     BEGIN
+        IF current_setting('session_replication_role') <> 'origin' THEN
+            RAISE EXCEPTION 'pgl_validate repair requires session_replication_role = origin'
+                USING ERRCODE = '55000';
+        END IF;
+
         CREATE TEMP TABLE IF NOT EXISTS pgl_validate_apply_statement (
             ord int NOT NULL,
             target_node text NOT NULL,
@@ -894,7 +905,8 @@ BEGIN
                 END LOOP;
             ELSE
                 IF propagation = 'local_only' THEN
-                    remote_batch := format(
+                    remote_batch := session_role_check ||
+                        E'\n' || format(
                         'DO $pgl_validate_origin$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_replication_origin WHERE roname = %L) THEN PERFORM pg_replication_origin_create(%L); END IF; END $pgl_validate_origin$;' ||
                         E'\nDO $pgl_validate_origin$ BEGIN PERFORM pg_replication_origin_session_setup(%L); END $pgl_validate_origin$;' ||
                         E'\nBEGIN;' ||
@@ -911,7 +923,8 @@ BEGIN
                         COALESCE(verify_batch, '')
                     );
                 ELSE
-                    remote_batch := E'BEGIN;' ||
+                    remote_batch := session_role_check ||
+                                    E'\nBEGIN;' ||
                                     E'\n' || COALESCE(lock_batch, '') ||
                                     E'\n' || row_batch ||
                                     E'\n' || COALESCE(verify_batch, '') ||
