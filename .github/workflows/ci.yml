@@ -16,6 +16,9 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_HTTP_MULTIPLEXING: "false"
+  CARGO_HTTP_TIMEOUT: "120"
+  CARGO_NET_RETRY: "10"
   PGL_VALIDATE_PGLOGICAL_VERSION: "2.5.3"
   RUST_BACKTRACE: "1"
 
@@ -60,8 +63,10 @@ jobs:
           }
           rustup @installArgs
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          rustup default $toolchain
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $env:RUSTUP_TOOLCHAIN = $toolchain
+          if ($env:GITHUB_ENV) {
+            "RUSTUP_TOOLCHAIN=$toolchain" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          }
           rustc --version
           cargo --version
 
@@ -71,6 +76,9 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
+            ~/.cargo/bin/cargo-pgrx*
+            ~/.cargo/.crates.toml
+            ~/.cargo/.crates2.json
             target
           key: cargo-pgrx-pg${{ matrix.pg }}-${{ matrix.target.platform }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
@@ -140,8 +148,10 @@ jobs:
           }
           rustup @installArgs
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          rustup default $toolchain
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $env:RUSTUP_TOOLCHAIN = $toolchain
+          if ($env:GITHUB_ENV) {
+            "RUSTUP_TOOLCHAIN=$toolchain" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          }
           rustc --version
           cargo --version
 
@@ -151,6 +161,9 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
+            ~/.cargo/bin/cargo-pgrx*
+            ~/.cargo/.crates.toml
+            ~/.cargo/.crates2.json
             target
           key: cargo-pglogical-pg${{ matrix.pg }}-${{ matrix.target.platform }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
@@ -216,8 +229,10 @@ jobs:
           }
           rustup @installArgs
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          rustup default $toolchain
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $env:RUSTUP_TOOLCHAIN = $toolchain
+          if ($env:GITHUB_ENV) {
+            "RUSTUP_TOOLCHAIN=$toolchain" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          }
           rustc --version
           cargo --version
 
@@ -227,6 +242,9 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
+            ~/.cargo/bin/cargo-pgrx*
+            ~/.cargo/.crates.toml
+            ~/.cargo/.crates2.json
             target
           key: cargo-${{ matrix.backend }}-pg${{ matrix.pg }}-${{ matrix.target.platform }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |

@@ -59,8 +59,58 @@ function Get-PostgresSourceVersion {
     }
 }
 
+<#
+.SYNOPSIS
+Returns true when the requested cargo-pgrx version is already installed.
+#>
+function Test-CargoPgrxVersion {
+    param([string] $Version)
+
+    $cargoPgrx = Get-PglCommandSource -Name 'cargo-pgrx'
+    if (-not $cargoPgrx) {
+        return $false
+    }
+
+    $reported = & $cargoPgrx --version 2>$null
+    return ($LASTEXITCODE -eq 0 -and $reported -match "\b$([regex]::Escape($Version))\b")
+}
+
+<#
+.SYNOPSIS
+Installs cargo-pgrx with retries for transient registry transport failures.
+#>
 function Install-CargoPgrx {
-    Invoke-Logged -FilePath 'cargo' -Arguments @('install', '--locked', 'cargo-pgrx', '--version', $CargoPgrxVersion)
+    if (Test-CargoPgrxVersion -Version $CargoPgrxVersion) {
+        Write-Host "cargo-pgrx $CargoPgrxVersion is already installed"
+        return
+    }
+
+    if (-not $env:CARGO_NET_RETRY) {
+        $env:CARGO_NET_RETRY = '10'
+    }
+    if (-not $env:CARGO_HTTP_MULTIPLEXING) {
+        $env:CARGO_HTTP_MULTIPLEXING = 'false'
+    }
+    if (-not $env:CARGO_HTTP_TIMEOUT) {
+        $env:CARGO_HTTP_TIMEOUT = '120'
+    }
+
+    $maxAttempts = 3
+    for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+        try {
+            Invoke-Logged -FilePath 'cargo' -Arguments @('install', '--locked', 'cargo-pgrx', '--version', $CargoPgrxVersion)
+            return
+        }
+        catch {
+            if ($attempt -eq $maxAttempts) {
+                throw
+            }
+
+            $delaySeconds = 15 * $attempt
+            Write-Warning "cargo-pgrx install attempt $attempt failed: $($_.Exception.Message). Retrying in $delaySeconds seconds."
+            Start-Sleep -Seconds $delaySeconds
+        }
+    }
 }
 
 function Ensure-ChocolateyPackage {
