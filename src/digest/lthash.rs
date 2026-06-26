@@ -1,3 +1,5 @@
+use super::algorithm::HashAlgorithm;
+
 /// Number of 16-bit lanes in the LtHash accumulator.
 pub const LANES: usize = 1024;
 const LANE_BYTES: usize = 2;
@@ -46,12 +48,12 @@ pub fn combine(left: LtHashCore, right: LtHashCore) -> LtHashCore {
 }
 
 /// Hash caller-sorted row digests into a cryptographic confirmation digest.
-pub fn hash_digest_array(sorted_row_digests: &[&[u8]]) -> [u8; 32] {
+pub(crate) fn hash_digest_array(sorted_row_digests: &[&[u8]], algorithm: HashAlgorithm) -> Vec<u8> {
     let mut hasher = blake3::Hasher::new();
     for digest in sorted_row_digests {
         hasher.update(digest);
     }
-    *hasher.finalize().as_bytes()
+    algorithm.finalize_blake3(hasher)
 }
 
 impl LtHashCore {
@@ -181,8 +183,8 @@ mod tests {
     fn hash_digest_array_uses_caller_order() {
         let a = blake3::hash(b"a");
         let b = blake3::hash(b"b");
-        let first = hash_digest_array(&[a.as_bytes(), b.as_bytes()]);
-        let second = hash_digest_array(&[b.as_bytes(), a.as_bytes()]);
+        let first = hash_digest_array(&[a.as_bytes(), b.as_bytes()], HashAlgorithm::Blake3_256);
+        let second = hash_digest_array(&[b.as_bytes(), a.as_bytes()], HashAlgorithm::Blake3_256);
         assert_ne!(first, second);
     }
 }

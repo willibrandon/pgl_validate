@@ -372,13 +372,13 @@ where `buffer_tolerance = sequence_buffer_multiplier * cache_size` (default mult
 
 ### 10.1 Canonical row digest (G-DETERMINISTIC)
 
-`row_digest(enc int[], VARIADIC "any") → bytea` produces a 256-bit digest over the contract's replicated columns (the generated SQL supplies the columns name-sorted and the aligned `enc[]`):
+`row_digest(enc int[], VARIADIC "any") → bytea` produces a digest over the contract's replicated columns, 256-bit by default and 512-bit when `hash_algorithm = 'blake3_512'` (the generated SQL supplies the columns name-sorted and the aligned `enc[]`):
 
 1. **Columns** = the effective replicated column set as reported by `pglogical.show_repset_table_info()` (§9.3), **emitted by the generated SQL sorted by column name** (robust to differing physical `attnum` across nodes). `row_digest` itself hashes its args positionally; the name-sort happens in `sqlgen`.
 2. For each column in canonical order:
    - 1-byte null tag (`0x00` NULL / `0x01` present);
    - if present: canonical value bytes (Section 10.3), `uint32`-length-framed to prevent cross-column aliasing.
-3. `digest = BLAKE3(framed bytes)[0..32]` (256-bit; truncatable to 128 via GUC).
+3. `digest = BLAKE3(framed bytes)[0..N]`, where `N` is selected by `hash_algorithm` (`32` bytes for `blake3_256`, `64` bytes for `blake3_512`).
 
 The digest is a pure function of logical content — independent of physical order, ctid, page layout, vacuum, locale, and GUCs.
 
@@ -513,7 +513,7 @@ Topology, edges, contract, sync state, sequences as in Section 9. Origins for th
 
 ### 14.2 Connectivity and wire payloads
 
-libpq, non-blocking, one `WaitEventSet` polling N peers, so a chunk fan-out costs ≈ 1× latency. DSNs resolve from explicit args, `pglogical.node_interface.if_dsn`, or `pgl_validate.peer`. Across the wire: `(count, lthash)` per chunk (~2 KB), `(key, 32-byte digest)` only for small divergent ranges, and (optional, capped) full tuples for confirmed `differs` keys. **Table data is never shipped for comparison.**
+libpq, non-blocking, one `WaitEventSet` polling N peers, so a chunk fan-out costs ≈ 1× latency. DSNs resolve from explicit args, `pglogical.node_interface.if_dsn`, or `pgl_validate.peer`. Across the wire: `(count, lthash)` per chunk (~2 KB), `(key, row digest)` only for small divergent ranges (32 bytes with `blake3_256`, 64 with `blake3_512`), and (optional, capped) full tuples for confirmed `differs` keys. **Table data is never shipped for comparison.**
 
 ### 14.3 Parallelism
 
@@ -680,7 +680,7 @@ In active-active, repairing a conflicted key requires designating an authority. 
 
 | GUC | Default | Purpose |
 |---|---|---|
-| `hash_algorithm` | `blake3_256` | row digest width / algo (`blake3_256`\|`blake3_128`\|`sha256_*`) |
+| `hash_algorithm` | `blake3_256` | row and set digest width / algo (`blake3_256`\|`blake3_512`) |
 | `lthash_lanes` / `lthash_lane_bits` | `1024` / `16` | set-hash collision bound vs state size |
 | `paranoid_confirm` | `off` | run the cryptographic `hash_digest_array` confirm on **every** clean chunk. Bounded by `paranoid_confirm_max_rows` (default = `localize_threshold`): a clean chunk larger than this is **subdivided** so `array_agg(ORDER BY)` never materializes an unbounded array; an external/streaming sorted-hash path is used above the in-memory cap |
 | `paranoid_confirm_max_rows` | `1000` | per-statement row cap for the sorted-set confirm; larger chunks are split or stream-sorted (memory/spill bound) |
@@ -1282,14 +1282,14 @@ fn encode(col_type, value, opts) -> bytes:
 
 # Row digest (256-bit). Args arrive ALREADY name-sorted from the generated SQL, positionally
 # aligned with enc[]; row_digest hashes in arg order (it does NOT sort -- raw fcinfo cannot).
-fn row_digest(enc: int[], cols: any[]) -> [u8;32]:   # cols is the VARIADIC "any" tail
+fn row_digest(enc: int[], cols: any[]) -> [u8;N]:    # cols is the VARIADIC "any" tail
     h := blake3()
     for i, c in enumerate(cols):                      # in the order received
         if c.value IS NULL: h.update([0x00])
         else:
             b := encode(c.type, c.value, mode = enc[i])
             h.update([0x01]); h.update(u32_le(len(b))); h.update(b)
-    return h.finalize()[0..32]
+    return h.finalize()[0..N]                         # blake3_256 => N=32; blake3_512 => N=64
 
 # Chunk accumulator (LtHash; additive, parallel-safe, collision-resistant):
 fn lthash_add(state[n], rd) :                     # n lanes of b bits, default n=1024,b=16
@@ -1300,7 +1300,7 @@ fn lthash_combine(a,b): for i in 0..n: a[i] := (a[i]+b[i]) mod 2^b
 
 # Cryptographic confirmation for a localized (small) chunk.
 # In SQL: pgl_validate.hash_digest_array(array_agg(rd ORDER BY rd))  -- ordering by the caller.
-fn hash_digest_array(sorted_row_digests: bytea[]) -> [u8;32]:        # plain function, NOT an aggregate
+fn hash_digest_array(sorted_row_digests: bytea[]) -> [u8;N]:         # plain function, NOT an aggregate
     return blake3(concat(sorted_row_digests))    # equal IFF multisets equal, except w.p. ~= 2^-128
                                                  #   (256-bit hash => ~128-bit birthday bound;
                                                  #    blake3_512 => ~2^-256)

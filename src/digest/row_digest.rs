@@ -31,6 +31,7 @@ pub unsafe fn row_digest_fcinfo(fcinfo: pg_sys::FunctionCallInfo) -> Vec<u8> {
         );
     }
 
+    let algorithm = crate::current_hash_algorithm();
     let mut hasher = blake3::Hasher::new();
     for idx in 0..value_count {
         let argno = idx + 1;
@@ -48,5 +49,5 @@ pub unsafe fn row_digest_fcinfo(fcinfo: pg_sys::FunctionCallInfo) -> Vec<u8> {
         frame_value(&mut hasher, Some(&encoded));
     }
 
-    hasher.finalize().as_bytes().to_vec()
+    algorithm.finalize_blake3(hasher)
 }

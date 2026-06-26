@@ -88,6 +88,18 @@ static SEQUENCE_BUFFER_MULTIPLIER: GucSetting<i32> = GucSetting::<i32>::new(2);
 static CORRELATE_CONFLICT_HISTORY: GucSetting<bool> = GucSetting::<bool>::new(true);
 static CONFLICT_HISTORY_MAX_ROWS: GucSetting<i32> = GucSetting::<i32>::new(1000);
 
+/// Return the active row/set digest algorithm.
+pub(crate) fn current_hash_algorithm() -> digest::algorithm::HashAlgorithm {
+    let algorithm = HASH_ALGORITHM
+        .get()
+        .unwrap_or_else(|| CString::new("blake3_256").expect("static string is valid CString"));
+    let name = algorithm
+        .to_str()
+        .unwrap_or_else(|_| pgrx::error!("pgl_validate.hash_algorithm must be valid UTF-8"));
+
+    digest::algorithm::HashAlgorithm::parse(name).unwrap_or_else(|err| pgrx::error!("{err}"))
+}
+
 /// Register `pgl_validate.*` settings with PostgreSQL.
 #[pg_guard]
 pub extern "C-unwind" fn _PG_init() {
@@ -134,7 +146,7 @@ pub extern "C-unwind" fn _PG_init() {
     GucRegistry::define_string_guc(
         c"pgl_validate.hash_algorithm",
         c"Row digest hash algorithm.",
-        c"Algorithm contract for row digests. Currently blake3_256 is implemented; other design algorithms are rejected until implemented.",
+        c"Algorithm contract for row and set digests. Supported values are blake3_256 and blake3_512.",
         &HASH_ALGORITHM,
         GucContext::Userset,
         flags,

@@ -551,10 +551,11 @@ BEGIN
     IF max_reported_divergences <= 0 THEN
         RAISE EXCEPTION 'max_reported_divergences must be greater than zero';
     END IF;
-    IF hash_algorithm <> 'blake3_256' THEN
-        RAISE EXCEPTION 'hash_algorithm % is not implemented; only blake3_256 is currently available', hash_algorithm
+    IF hash_algorithm NOT IN ('blake3_256','blake3_512') THEN
+        RAISE EXCEPTION 'hash_algorithm % is not implemented; supported values are blake3_256, blake3_512', hash_algorithm
             USING ERRCODE = '0A000';
     END IF;
+    PERFORM set_config('pgl_validate.hash_algorithm', hash_algorithm, true);
     IF chunk_target_rows <= 0 THEN
         RAISE EXCEPTION 'chunk_target_rows must be greater than zero';
     END IF;

@@ -29,6 +29,14 @@ function Get-PglogicalPackageAsset {
     )
 
     $architecture = [Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
+    if ((Test-PglWindows) -and $env:PGL_VALIDATE_MSVC_ARCH) {
+        $architecture = switch ($env:PGL_VALIDATE_MSVC_ARCH.ToLowerInvariant()) {
+            'x64' { 'X64' }
+            'arm64' { 'Arm64' }
+            default { $architecture }
+        }
+    }
+
     if ((Test-PglWindows) -and $architecture -eq 'X64') {
         return "pglogical-$Version-pg$Major-windows-x64.zip"
     }

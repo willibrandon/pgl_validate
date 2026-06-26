@@ -36,9 +36,9 @@ jobs:
             platform: windows-x64
             msvc_arch: x64
           - os: windows-11-vs2026-arm
-            platform: windows-arm64
-            msvc_arch: arm64
-            rust_toolchain: stable-aarch64-pc-windows-msvc
+            platform: windows-arm64-hosted-x64
+            msvc_arch: x64
+            rust_toolchain: stable-x86_64-pc-windows-msvc
           - os: macos-15-intel
             platform: macos-x64
           - os: macos-15
@@ -103,9 +103,9 @@ jobs:
             platform: windows-x64
             msvc_arch: x64
           - os: windows-11-vs2026-arm
-            platform: windows-arm64
-            msvc_arch: arm64
-            rust_toolchain: stable-aarch64-pc-windows-msvc
+            platform: windows-arm64-hosted-x64
+            msvc_arch: x64
+            rust_toolchain: stable-x86_64-pc-windows-msvc
           - os: macos-15-intel
             platform: macos-x64
           - os: macos-15
@@ -171,9 +171,9 @@ jobs:
             platform: windows-x64
             msvc_arch: x64
           - os: windows-11-vs2026-arm
-            platform: windows-arm64
-            msvc_arch: arm64
-            rust_toolchain: stable-aarch64-pc-windows-msvc
+            platform: windows-arm64-hosted-x64
+            msvc_arch: x64
+            rust_toolchain: stable-x86_64-pc-windows-msvc
           - os: macos-15-intel
             platform: macos-x64
           - os: macos-15

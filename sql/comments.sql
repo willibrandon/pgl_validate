@@ -97,13 +97,13 @@ COMMENT ON FUNCTION pgl_validate.schema_signature(text, text, text[], text[]) IS
     'Build a deterministic JSON signature for the compared relation columns, key columns, type identity, and collation metadata.';
 COMMENT ON FUNCTION pgl_validate.plan_schema_signature_sql(text, text, text[], text[]) IS
     'Generate remote SQL that returns a relation contract schema_signature without failing on a missing remote relation.';
-COMMENT ON FUNCTION pgl_validate.plan_chunk_sql(regclass, text[], bytea, bytea, text[], text[], text, boolean) IS
+COMMENT ON FUNCTION pgl_validate.plan_chunk_sql(regclass, text[], bytea, bytea, text[], text[], text, boolean, text) IS
     'Generate planner-visible SQL for a table chunk checksum and optional cryptographic set confirmation.';
-COMMENT ON FUNCTION pgl_validate.plan_pglogical_filtered_sql(regclass, text[], text[], boolean) IS
+COMMENT ON FUNCTION pgl_validate.plan_pglogical_filtered_sql(regclass, text[], text[], boolean, text) IS
     'Generate diagnostic-only checksum SQL using pglogical.table_data_filtered for session-sensitive row filters.';
-COMMENT ON FUNCTION pgl_validate.plan_localize_sql(regclass, text[], bytea, bytea, text[], text) IS
+COMMENT ON FUNCTION pgl_validate.plan_localize_sql(regclass, text[], bytea, bytea, text[], text, text) IS
     'Generate planner-visible SQL for key and row-digest enumeration within a bounded divergent range.';
-COMMENT ON FUNCTION pgl_validate.plan_localize_sql(regclass, text[], text[], text) IS
+COMMENT ON FUNCTION pgl_validate.plan_localize_sql(regclass, text[], text[], text, text) IS
     'Generate planner-visible SQL for unbounded key and row-digest enumeration during divergence localization.';
 COMMENT ON FUNCTION pgl_validate.plan_sequence_sql(regclass) IS
     'Generate planner-visible SQL for reading a sequence last_value on a participant.';
@@ -167,11 +167,11 @@ COMMENT ON FUNCTION pgl_validate.cleanup_fence_barriers(interval, uuid[]) IS
     'Delete unprotected expired barrier tokens from the local node.';
 
 COMMENT ON FUNCTION pgl_validate.row_digest(integer[], "any") IS
-    'Compute a canonical row digest from coordinator-selected encodings and VARIADIC values.';
+    'Compute a canonical row digest from coordinator-selected encodings, VARIADIC values, and the active pgl_validate.hash_algorithm.';
 COMMENT ON FUNCTION pgl_validate.last_commit_lsn() IS
     'Return the backend exact last commit end LSN for barrier fencing.';
 COMMENT ON FUNCTION pgl_validate.hash_digest_array(bytea[]) IS
-    'Hash a caller-sorted array of row digests for cryptographic set confirmation.';
+    'Hash a caller-sorted array of row digests for cryptographic set confirmation using the active pgl_validate.hash_algorithm.';
 COMMENT ON FUNCTION pgl_validate.row_filter_tree_is_immutable(text) IS
     'Return whether a serialized PostgreSQL row-filter expression tree contains only immutable functions.';
 COMMENT ON FUNCTION pgl_validate.remote_checksum(text, text, integer, integer, integer) IS

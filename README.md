@@ -68,8 +68,8 @@ when one exists. If a package is not published for the host architecture, it
 builds the source release against the selected `pg_config`.
 
 CI runs PostgreSQL 15, 16, 17, and 18 across Linux x64/arm64, Windows x64,
-Windows ARM64-hosted, and macOS x64/arm64 runners. The pglogical job installs
-the fork release package or source release for each target.
+Windows ARM64-hosted x64, and macOS x64/arm64 runners. The pglogical job
+installs the fork release package or source release for each target.
 
 Native logical replication coverage uses PostgreSQL's built-in publication and
 subscription machinery:
@@ -107,7 +107,7 @@ SET pgl_validate.paranoid_confirm = off;
 SET pgl_validate.paranoid_confirm_max_rows = 1000;
 SET pgl_validate.max_reported_tuple_bytes = 8192;
 SET pgl_validate.max_reported_divergences = 1000;
-SET pgl_validate.hash_algorithm = 'blake3_256';
+SET pgl_validate.hash_algorithm = 'blake3_256'; -- or blake3_512
 SET pgl_validate.chunk_max_duration = '2s';
 SET pgl_validate.max_parallel_chunks = 4;
 SET pgl_validate.max_snapshot_age = '5min';

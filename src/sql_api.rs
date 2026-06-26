@@ -108,7 +108,7 @@ mod pgl_validate {
             .iter()
             .filter_map(|digest| digest)
             .collect::<Vec<&[u8]>>();
-        digest::lthash::hash_digest_array(&refs).to_vec()
+        digest::lthash::hash_digest_array(&refs, crate::current_hash_algorithm())
     }
 
     /// Return true when a serialized PostgreSQL expression tree contains only

@@ -59,6 +59,35 @@ mod tests {
     }
 
     #[pg_test]
+    fn row_and_set_digests_honor_blake3_512_setting() {
+        Spi::run("SET LOCAL pgl_validate.hash_algorithm = 'blake3_256'").unwrap();
+        let digest_lengths = Spi::get_one::<String>(
+            r#"
+            SELECT octet_length(pgl_validate.row_digest(ARRAY[1], 1::int4))::text || ';' ||
+                   octet_length(pgl_validate.hash_digest_array(ARRAY[
+                       pgl_validate.row_digest(ARRAY[1], 1::int4)
+                   ]))::text
+            "#,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(digest_lengths, "32;32");
+
+        Spi::run("SET LOCAL pgl_validate.hash_algorithm = 'blake3_512'").unwrap();
+        let wide_digest_lengths = Spi::get_one::<String>(
+            r#"
+            SELECT octet_length(pgl_validate.row_digest(ARRAY[1], 1::int4))::text || ';' ||
+                   octet_length(pgl_validate.hash_digest_array(ARRAY[
+                       pgl_validate.row_digest(ARRAY[1], 1::int4)
+                   ]))::text
+            "#,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(wide_digest_lengths, "64;64");
+    }
+
+    #[pg_test]
     fn row_digest_distinguishes_null_from_empty_text() {
         let null_digest =
             Spi::get_one::<Vec<u8>>("SELECT pgl_validate.row_digest(ARRAY[2], NULL::text)")
@@ -184,6 +213,33 @@ mod tests {
 
         assert!(confirm_sql.contains("pgl_validate.hash_digest_array"));
         assert!(confirm_sql.contains("array_agg(rd ORDER BY rd)"));
+
+        Spi::run("SET LOCAL pgl_validate.hash_algorithm = 'blake3_512'").unwrap();
+        let wide_sql = Spi::get_one::<String>(
+            r#"
+            SELECT pgl_validate.plan_chunk_sql(
+                'plan_target'::regclass,
+                ARRAY['id'],
+                NULL,
+                NULL,
+                ARRAY['status','id','amount'],
+                NULL,
+                NULL,
+                true
+            )
+            "#,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(wide_sql.contains(
+            "set_config('pgl_validate.hash_algorithm', 'blake3_512', true)"
+        ));
+        let wide_set_hash_bytes =
+            Spi::get_one::<i32>(&format!("SELECT octet_length(set_hash) FROM ({wide_sql}) AS q"))
+                .unwrap()
+                .unwrap();
+        assert_eq!(wide_set_hash_bytes, 64);
+        Spi::run("SET LOCAL pgl_validate.hash_algorithm = 'blake3_256'").unwrap();
 
         let bounded_sql = Spi::get_one::<String>(
             r#"
@@ -599,6 +655,30 @@ mod tests {
         .unwrap();
         assert_eq!(override_chunks, 1);
 
+        let wide_hash_run_id = Spi::get_one::<i64>(&format!(
+            "
+            SELECT (pgl_validate.compare_table(
+                'public.{table_name}'::regclass,
+                ARRAY['remote_guc'],
+                '{{\"hash_algorithm\":\"blake3_512\",\"paranoid_confirm\":true}}'::jsonb
+            )).run_id
+            "
+        ))
+        .unwrap()
+        .unwrap();
+        let wide_hash_widths = Spi::get_one::<String>(&format!(
+            "
+            SELECT string_agg(node || ':' || octet_length(set_hash)::text, ',' ORDER BY node)
+            FROM pgl_validate.table_node_result
+            WHERE run_id = {wide_hash_run_id}
+              AND table_name = {table_name}
+            ",
+            table_name = sql_literal(&table_name)
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(wide_hash_widths, "local:64,remote_guc:64");
+
         let recheck_setting = Spi::get_one::<String>("SHOW pgl_validate.recheck_passes")
             .unwrap()
             .unwrap();
@@ -693,7 +773,8 @@ mod tests {
                         '{{"hash_algorithm":"sha256_256"}}'::jsonb
                     );
                 EXCEPTION WHEN others THEN
-                    IF SQLERRM LIKE 'hash_algorithm sha256_256 is not implemented%' THEN
+                    IF SQLERRM =
+                       'hash_algorithm sha256_256 is not implemented; supported values are blake3_256, blake3_512' THEN
                         rejected := true;
                     ELSE
                         RAISE;

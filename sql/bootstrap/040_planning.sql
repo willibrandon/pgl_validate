@@ -431,7 +431,8 @@ CREATE FUNCTION pgl_validate.plan_chunk_sql(
     cols text[],
     repsets text[] DEFAULT NULL,
     row_filter_sql text DEFAULT NULL,
-    include_set_hash boolean DEFAULT false
+    include_set_hash boolean DEFAULT false,
+    hash_algorithm text DEFAULT NULL
 )
 RETURNS text
 LANGUAGE plpgsql
@@ -446,6 +447,8 @@ DECLARE
     filter_sql text;
     range_sql text;
     where_sql text;
+    effective_hash_algorithm text;
+    settings_cte text;
 BEGIN
     SELECT format('%I.%I', n.nspname, c.relname)
     INTO rel_sql
@@ -498,6 +501,20 @@ BEGIN
         enc_modes::text,
         digest_args
     );
+    effective_hash_algorithm := COALESCE(
+        NULLIF(hash_algorithm, ''),
+        NULLIF(current_setting('pgl_validate.hash_algorithm', true), ''),
+        'blake3_256'
+    );
+    IF effective_hash_algorithm NOT IN ('blake3_256','blake3_512') THEN
+        RAISE EXCEPTION 'hash_algorithm % is not implemented; supported values are blake3_256, blake3_512',
+            effective_hash_algorithm
+            USING ERRCODE = '0A000';
+    END IF;
+    settings_cte := format(
+        'pgl_validate_settings AS MATERIALIZED (SELECT set_config(''pgl_validate.hash_algorithm'', %L, true) AS hash_algorithm)',
+        effective_hash_algorithm
+    );
     filter_sql := CASE
         WHEN row_filter_sql IS NULL OR btrim(row_filter_sql) = '' THEN 'true'
         ELSE format('(%s)', row_filter_sql)
@@ -517,7 +534,8 @@ BEGIN
 
     IF include_set_hash THEN
         RETURN format(
-            'WITH digests AS MATERIALIZED (SELECT %s AS rd FROM %s t WHERE %s), aggregate AS (SELECT count(*)::bigint AS n_rows, pgl_validate.lthash_bytes(pgl_validate.lthash(rd)) AS lthash FROM digests) SELECT aggregate.n_rows, aggregate.lthash, (SELECT pgl_validate.hash_digest_array(COALESCE(array_agg(rd ORDER BY rd), ARRAY[]::bytea[])) FROM digests) AS set_hash FROM aggregate',
+            'WITH %s, digests AS MATERIALIZED (SELECT %s AS rd FROM pgl_validate_settings, %s t WHERE %s), aggregate AS (SELECT count(*)::bigint AS n_rows, pgl_validate.lthash_bytes(pgl_validate.lthash(rd)) AS lthash FROM digests) SELECT aggregate.n_rows, aggregate.lthash, (SELECT pgl_validate.hash_digest_array(COALESCE(array_agg(rd ORDER BY rd), ARRAY[]::bytea[])) FROM digests) AS set_hash FROM aggregate',
+            settings_cte,
             row_digest_expr,
             rel_sql,
             where_sql
@@ -525,7 +543,8 @@ BEGIN
     END IF;
 
     RETURN format(
-        'SELECT count(*)::bigint AS n_rows, pgl_validate.lthash_bytes(pgl_validate.lthash(%s)) AS lthash, NULL::bytea AS set_hash FROM %s t WHERE %s',
+        'WITH %s SELECT count(*)::bigint AS n_rows, pgl_validate.lthash_bytes(pgl_validate.lthash(%s)) AS lthash, NULL::bytea AS set_hash FROM pgl_validate_settings, %s t WHERE %s',
+        settings_cte,
         row_digest_expr,
         rel_sql,
         where_sql
@@ -541,7 +560,8 @@ CREATE FUNCTION pgl_validate.plan_pglogical_filtered_sql(
     rel regclass,
     cols text[],
     repsets text[],
-    include_set_hash boolean DEFAULT false
+    include_set_hash boolean DEFAULT false,
+    hash_algorithm text DEFAULT NULL
 )
 RETURNS text
 LANGUAGE plpgsql
@@ -554,6 +574,8 @@ DECLARE
     row_digest_expr text;
     selected_cols text[];
     source_sql text;
+    effective_hash_algorithm text;
+    settings_cte text;
 BEGIN
     IF to_regprocedure('pglogical.table_data_filtered(anyelement,regclass,text[])') IS NULL THEN
         RAISE EXCEPTION 'pglogical.table_data_filtered(anyelement,regclass,text[]) is not available'
@@ -615,6 +637,20 @@ BEGIN
         enc_modes::text,
         digest_args
     );
+    effective_hash_algorithm := COALESCE(
+        NULLIF(hash_algorithm, ''),
+        NULLIF(current_setting('pgl_validate.hash_algorithm', true), ''),
+        'blake3_256'
+    );
+    IF effective_hash_algorithm NOT IN ('blake3_256','blake3_512') THEN
+        RAISE EXCEPTION 'hash_algorithm % is not implemented; supported values are blake3_256, blake3_512',
+            effective_hash_algorithm
+            USING ERRCODE = '0A000';
+    END IF;
+    settings_cte := format(
+        'pgl_validate_settings AS MATERIALIZED (SELECT set_config(''pgl_validate.hash_algorithm'', %L, true) AS hash_algorithm)',
+        effective_hash_algorithm
+    );
     source_sql := format(
         'pglogical.table_data_filtered(NULL::%s, %L::regclass, %L::text[]) AS t',
         rel_sql,
@@ -624,14 +660,16 @@ BEGIN
 
     IF include_set_hash THEN
         RETURN format(
-            'WITH digests AS MATERIALIZED (SELECT %s AS rd FROM %s), aggregate AS (SELECT count(*)::bigint AS n_rows, pgl_validate.lthash_bytes(pgl_validate.lthash(rd)) AS lthash FROM digests) SELECT aggregate.n_rows, aggregate.lthash, (SELECT pgl_validate.hash_digest_array(COALESCE(array_agg(rd ORDER BY rd), ARRAY[]::bytea[])) FROM digests) AS set_hash FROM aggregate',
+            'WITH %s, digests AS MATERIALIZED (SELECT %s AS rd FROM pgl_validate_settings, %s), aggregate AS (SELECT count(*)::bigint AS n_rows, pgl_validate.lthash_bytes(pgl_validate.lthash(rd)) AS lthash FROM digests) SELECT aggregate.n_rows, aggregate.lthash, (SELECT pgl_validate.hash_digest_array(COALESCE(array_agg(rd ORDER BY rd), ARRAY[]::bytea[])) FROM digests) AS set_hash FROM aggregate',
+            settings_cte,
             row_digest_expr,
             source_sql
         );
     END IF;
 
     RETURN format(
-        'SELECT count(*)::bigint AS n_rows, pgl_validate.lthash_bytes(pgl_validate.lthash(%s)) AS lthash, NULL::bytea AS set_hash FROM %s',
+        'WITH %s SELECT count(*)::bigint AS n_rows, pgl_validate.lthash_bytes(pgl_validate.lthash(%s)) AS lthash, NULL::bytea AS set_hash FROM pgl_validate_settings, %s',
+        settings_cte,
         row_digest_expr,
         source_sql
     );
@@ -646,7 +684,8 @@ CREATE FUNCTION pgl_validate.plan_localize_sql(
     lo bytea,
     hi bytea,
     cols text[],
-    row_filter_sql text DEFAULT NULL
+    row_filter_sql text DEFAULT NULL,
+    hash_algorithm text DEFAULT NULL
 )
 RETURNS text
 LANGUAGE plpgsql
@@ -665,6 +704,8 @@ DECLARE
     filter_sql text;
     range_sql text;
     where_sql text;
+    effective_hash_algorithm text;
+    settings_cte text;
 BEGIN
     IF key_cols IS NULL OR cardinality(key_cols) = 0 THEN
         RAISE EXCEPTION 'row-level localization requires a comparison key';
@@ -733,6 +774,20 @@ BEGIN
         WHEN row_filter_sql IS NULL OR btrim(row_filter_sql) = '' THEN 'true'
         ELSE format('(%s)', row_filter_sql)
     END;
+    effective_hash_algorithm := COALESCE(
+        NULLIF(hash_algorithm, ''),
+        NULLIF(current_setting('pgl_validate.hash_algorithm', true), ''),
+        'blake3_256'
+    );
+    IF effective_hash_algorithm NOT IN ('blake3_256','blake3_512') THEN
+        RAISE EXCEPTION 'hash_algorithm % is not implemented; supported values are blake3_256, blake3_512',
+            effective_hash_algorithm
+            USING ERRCODE = '0A000';
+    END IF;
+    settings_cte := format(
+        'pgl_validate_settings AS MATERIALIZED (SELECT set_config(''pgl_validate.hash_algorithm'', %L, true) AS hash_algorithm)',
+        effective_hash_algorithm
+    );
     range_sql := pgl_validate.plan_key_range_predicate(rel, key_cols, lo, hi);
     where_sql := COALESCE(
         NULLIF(
@@ -747,7 +802,8 @@ BEGIN
     );
 
     RETURN format(
-        'SELECT jsonb_build_object(%s)::text AS key_text, pgl_validate.row_digest(%L::int[], %s) AS key_bytes, pgl_validate.row_digest(%L::int[], %s) AS row_digest, to_jsonb(t)::text AS row_json FROM %s t WHERE %s ORDER BY %s',
+        'WITH %s SELECT jsonb_build_object(%s)::text AS key_text, pgl_validate.row_digest(%L::int[], %s) AS key_bytes, pgl_validate.row_digest(%L::int[], %s) AS row_digest, to_jsonb(t)::text AS row_json FROM pgl_validate_settings, %s t WHERE %s ORDER BY %s',
+        settings_cte,
         key_text_args,
         key_enc_modes::text,
         key_digest_args,
@@ -765,13 +821,14 @@ CREATE FUNCTION pgl_validate.plan_localize_sql(
     rel regclass,
     key_cols text[],
     cols text[],
-    row_filter_sql text DEFAULT NULL
+    row_filter_sql text DEFAULT NULL,
+    hash_algorithm text DEFAULT NULL
 )
 RETURNS text
 LANGUAGE sql
 STABLE
 AS $$
-    SELECT pgl_validate.plan_localize_sql($1, $2, NULL, NULL, $3, $4)
+    SELECT pgl_validate.plan_localize_sql($1, $2, NULL, NULL, $3, $4, $5)
 $$;
 
 -- Generate the planner-visible SQL used to read a sequence last_value on each
