@@ -5,6 +5,7 @@
 #![deny(missing_docs)]
 
 use pgrx::prelude::*;
+use pgrx::{GucContext, GucFlags, GucRegistry, GucSetting};
 
 mod digest;
 mod transport;
@@ -13,6 +14,98 @@ pgrx::pg_module_magic!(name, version);
 
 extension_sql_file!("../sql/bootstrap.sql", name = "bootstrap", bootstrap);
 extension_sql_file!("../sql/comments.sql", name = "comments", finalize);
+
+static PARANOID_CONFIRM: GucSetting<bool> = GucSetting::<bool>::new(false);
+static CHUNK_TARGET_ROWS: GucSetting<i32> = GucSetting::<i32>::new(50000);
+static LOCALIZE_THRESHOLD: GucSetting<i32> = GucSetting::<i32>::new(1000);
+static FENCE_TIMEOUT_MS: GucSetting<i32> = GucSetting::<i32>::new(300000);
+static FENCE_POLL_INTERVAL_MS: GucSetting<i32> = GucSetting::<i32>::new(100);
+static SEQUENCE_BUFFER_MULTIPLIER: GucSetting<i32> = GucSetting::<i32>::new(2);
+static CORRELATE_CONFLICT_HISTORY: GucSetting<bool> = GucSetting::<bool>::new(true);
+static CONFLICT_HISTORY_MAX_ROWS: GucSetting<i32> = GucSetting::<i32>::new(1000);
+
+/// Register `pgl_validate.*` settings with PostgreSQL.
+#[pg_guard]
+pub extern "C-unwind" fn _PG_init() {
+    let flags = GucFlags::default();
+
+    GucRegistry::define_bool_guc(
+        c"pgl_validate.paranoid_confirm",
+        c"Confirm clean chunks cryptographically.",
+        c"Run hash_digest_array confirmation for clean chunks in addition to LtHash.",
+        &PARANOID_CONFIRM,
+        GucContext::Userset,
+        flags,
+    );
+    GucRegistry::define_int_guc(
+        c"pgl_validate.chunk_target_rows",
+        c"Target rows per checksum chunk.",
+        c"Controls planner-visible key-range chunk sizing for table validation.",
+        &CHUNK_TARGET_ROWS,
+        1,
+        i32::MAX,
+        GucContext::Userset,
+        flags,
+    );
+    GucRegistry::define_int_guc(
+        c"pgl_validate.localize_threshold",
+        c"Rows per range while localizing divergence.",
+        c"Controls the smaller chunk size used after a table-level checksum mismatch.",
+        &LOCALIZE_THRESHOLD,
+        1,
+        i32::MAX,
+        GucContext::Userset,
+        flags,
+    );
+    GucRegistry::define_int_guc(
+        c"pgl_validate.fence_timeout_ms",
+        c"Fence wait timeout in milliseconds.",
+        c"Maximum time to wait for pglogical origin progress or standby replay convergence.",
+        &FENCE_TIMEOUT_MS,
+        1,
+        i32::MAX,
+        GucContext::Userset,
+        flags,
+    );
+    GucRegistry::define_int_guc(
+        c"pgl_validate.fence_poll_interval_ms",
+        c"Fence polling interval in milliseconds.",
+        c"Interval between convergence checks while waiting for pglogical or standby fences.",
+        &FENCE_POLL_INTERVAL_MS,
+        1,
+        i32::MAX,
+        GucContext::Userset,
+        flags,
+    );
+    GucRegistry::define_int_guc(
+        c"pgl_validate.sequence_buffer_multiplier",
+        c"Sequence cache tolerance multiplier.",
+        c"Allowed sequence-ahead window expressed as cache_size multiplied by this value.",
+        &SEQUENCE_BUFFER_MULTIPLIER,
+        1,
+        i32::MAX,
+        GucContext::Userset,
+        flags,
+    );
+    GucRegistry::define_bool_guc(
+        c"pgl_validate.correlate_conflict_history",
+        c"Correlate pglogical conflict history.",
+        c"Attach pglogical conflict-history rows to confirmed divergences when available.",
+        &CORRELATE_CONFLICT_HISTORY,
+        GucContext::Userset,
+        flags,
+    );
+    GucRegistry::define_int_guc(
+        c"pgl_validate.conflict_history_max_rows",
+        c"Maximum conflict-history rows per divergence lookup.",
+        c"Bounds pglogical conflict-history correlation work per validation run.",
+        &CONFLICT_HISTORY_MAX_ROWS,
+        1,
+        i32::MAX,
+        GucContext::Userset,
+        flags,
+    );
+}
 
 /// Compute the canonical BLAKE3 row digest for a heterogeneous tuple.
 ///
@@ -1142,6 +1235,136 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(progress, "3/3");
+    }
+
+    #[pg_test]
+    fn compare_uses_guc_defaults_with_option_overrides() {
+        let backend_pid = Spi::get_one::<i32>("SELECT pg_backend_pid()")
+            .unwrap()
+            .unwrap();
+        let peer_db = identifier(&format!("pgl_validate_guc_peer_{backend_pid}"));
+        let table_name = identifier(&format!("pgl_validate_guc_target_{backend_pid}"));
+        let sequence_name = identifier(&format!("pgl_validate_guc_seq_{backend_pid}"));
+        let local_dsn = local_dsn();
+        let remote_dsn = peer_dsn(&peer_db);
+
+        let _ = crate::transport::libpq::execute_command(
+            &local_dsn,
+            &format!("DROP DATABASE IF EXISTS {peer_db} WITH (FORCE)"),
+        );
+        crate::transport::libpq::execute_command(&local_dsn, &format!("CREATE DATABASE {peer_db}"))
+            .unwrap();
+        crate::transport::libpq::execute_command(
+            &remote_dsn,
+            &format!(
+                "CREATE EXTENSION pgl_validate;
+                 CREATE TABLE public.{table_name}(id int PRIMARY KEY, value text);
+                 INSERT INTO public.{table_name}
+                 SELECT g, 'value-' || g::text
+                 FROM generate_series(1, 5) AS g;
+                 CREATE SEQUENCE public.{sequence_name} CACHE 5;
+                 DO $pgl_validate_guc$
+                 BEGIN
+                     PERFORM setval('public.{sequence_name}'::regclass, 17, true);
+                 END
+                 $pgl_validate_guc$;"
+            ),
+        )
+        .unwrap();
+
+        Spi::run(&format!(
+            "
+            SET LOCAL pgl_validate.chunk_target_rows = 2;
+            SET LOCAL pgl_validate.sequence_buffer_multiplier = 1;
+            DELETE FROM pgl_validate.peer;
+            CREATE TABLE public.{table_name}(id int PRIMARY KEY, value text);
+            INSERT INTO public.{table_name}
+            SELECT g, 'value-' || g::text
+            FROM generate_series(1, 5) AS g;
+            CREATE SEQUENCE public.{sequence_name} CACHE 5;
+            SELECT setval('public.{sequence_name}'::regclass, 10, true);
+            INSERT INTO pgl_validate.peer(name, dsn, backend)
+            VALUES ('remote_guc', {remote_dsn}, 'native');
+            ",
+            remote_dsn = sql_literal(&remote_dsn)
+        ))
+        .unwrap();
+
+        let guc_run_id = Spi::get_one::<i64>(&format!(
+            "SELECT (pgl_validate.compare_table('public.{table_name}'::regclass)).run_id"
+        ))
+        .unwrap()
+        .unwrap();
+        let guc_chunks = Spi::get_one::<i64>(&format!(
+            "
+            SELECT count(*)
+            FROM pgl_validate.chunk_result
+            WHERE run_id = {guc_run_id}
+              AND table_name = {table_name}
+              AND state <> 'split'
+            ",
+            table_name = sql_literal(&table_name)
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(guc_chunks, 3);
+
+        let override_run_id = Spi::get_one::<i64>(&format!(
+            "
+            SELECT (pgl_validate.compare_table(
+                'public.{table_name}'::regclass,
+                ARRAY['remote_guc'],
+                '{{\"chunk_target_rows\":10}}'::jsonb
+            )).run_id
+            "
+        ))
+        .unwrap()
+        .unwrap();
+        let override_chunks = Spi::get_one::<i64>(&format!(
+            "
+            SELECT count(*)
+            FROM pgl_validate.chunk_result
+            WHERE run_id = {override_run_id}
+              AND table_name = {table_name}
+              AND state <> 'split'
+            ",
+            table_name = sql_literal(&table_name)
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(override_chunks, 1);
+
+        let guc_sequence = Spi::get_one::<String>(&format!(
+            "
+            SELECT verdict || ';' || within_contract::text
+            FROM pgl_validate.compare_sequence(
+                'public.{sequence_name}'::regclass,
+                ARRAY['remote_guc']
+            )
+            "
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(guc_sequence, "ahead_of_window;false");
+
+        let override_sequence = Spi::get_one::<String>(&format!(
+            "
+            SELECT verdict || ';' || within_contract::text
+            FROM pgl_validate.compare_sequence(
+                'public.{sequence_name}'::regclass,
+                ARRAY['remote_guc'],
+                '{{\"sequence_buffer_multiplier\":2}}'::jsonb
+            )
+            "
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(override_sequence, "match;true");
+
+        let _ = crate::transport::libpq::execute_command(
+            &local_dsn,
+            &format!("DROP DATABASE IF EXISTS {peer_db} WITH (FORCE)"),
+        );
     }
 
     #[pg_test]

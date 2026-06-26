@@ -1951,12 +1951,32 @@ DECLARE
     verdict text;
     result_reason text;
     result_row pgl_validate.table_result;
-    paranoid_confirm boolean := COALESCE((options->>'paranoid_confirm')::boolean, false);
-    chunk_target_rows int := COALESCE((NULLIF(options->>'chunk_target_rows', ''))::int, 50000);
-    localize_threshold int := COALESCE((NULLIF(options->>'localize_threshold', ''))::int, 1000);
-    correlate_conflict_history boolean := COALESCE((options->>'correlate_conflict_history')::boolean, true);
+    paranoid_confirm boolean := COALESCE(
+        (NULLIF(options->>'paranoid_confirm', ''))::boolean,
+        NULLIF(current_setting('pgl_validate.paranoid_confirm', true), '')::boolean,
+        false
+    );
+    chunk_target_rows int := COALESCE(
+        (NULLIF(options->>'chunk_target_rows', ''))::int,
+        NULLIF(current_setting('pgl_validate.chunk_target_rows', true), '')::int,
+        50000
+    );
+    localize_threshold int := COALESCE(
+        (NULLIF(options->>'localize_threshold', ''))::int,
+        NULLIF(current_setting('pgl_validate.localize_threshold', true), '')::int,
+        1000
+    );
+    correlate_conflict_history boolean := COALESCE(
+        (NULLIF(options->>'correlate_conflict_history', ''))::boolean,
+        NULLIF(current_setting('pgl_validate.correlate_conflict_history', true), '')::boolean,
+        true
+    );
     conflict_history_lookback interval := COALESCE((NULLIF(options->>'conflict_history_lookback', ''))::interval, interval '24 hours');
-    conflict_history_max_rows int := COALESCE((NULLIF(options->>'conflict_history_max_rows', ''))::int, 1000);
+    conflict_history_max_rows int := COALESCE(
+        (NULLIF(options->>'conflict_history_max_rows', ''))::int,
+        NULLIF(current_setting('pgl_validate.conflict_history_max_rows', true), '')::int,
+        1000
+    );
 BEGIN
     SELECT n.nspname, c.relname
     INTO v_schema_name, v_rel_name
@@ -1985,8 +2005,16 @@ BEGIN
     END IF;
     provider_dsn := NULLIF(options->>'provider_dsn', '');
     provider_node := COALESCE(NULLIF(options->>'provider_node', ''), 'local');
-    fence_timeout_ms := COALESCE((NULLIF(options->>'fence_timeout_ms', ''))::int, 300000);
-    fence_poll_interval_ms := COALESCE((NULLIF(options->>'fence_poll_interval_ms', ''))::int, 100);
+    fence_timeout_ms := COALESCE(
+        (NULLIF(options->>'fence_timeout_ms', ''))::int,
+        NULLIF(current_setting('pgl_validate.fence_timeout_ms', true), '')::int,
+        300000
+    );
+    fence_poll_interval_ms := COALESCE(
+        (NULLIF(options->>'fence_poll_interval_ms', ''))::int,
+        NULLIF(current_setting('pgl_validate.fence_poll_interval_ms', true), '')::int,
+        100
+    );
     contract_subscription := NULLIF(options->>'subscription', '')::name;
     pglogical_available := to_regprocedure('pglogical.show_repset_table_info(regclass,text[])') IS NOT NULL;
 
@@ -3256,9 +3284,21 @@ DECLARE
     fence_rec pgl_validate.fence_attempt;
     provider_dsn text := NULLIF(options->>'provider_dsn', '');
     provider_node text := COALESCE(NULLIF(options->>'provider_node', ''), 'local');
-    fence_timeout_ms int := COALESCE((NULLIF(options->>'fence_timeout_ms', ''))::int, 300000);
-    fence_poll_interval_ms int := COALESCE((NULLIF(options->>'fence_poll_interval_ms', ''))::int, 100);
-    buffer_multiplier int := COALESCE((NULLIF(options->>'sequence_buffer_multiplier', ''))::int, 2);
+    fence_timeout_ms int := COALESCE(
+        (NULLIF(options->>'fence_timeout_ms', ''))::int,
+        NULLIF(current_setting('pgl_validate.fence_timeout_ms', true), '')::int,
+        300000
+    );
+    fence_poll_interval_ms int := COALESCE(
+        (NULLIF(options->>'fence_poll_interval_ms', ''))::int,
+        NULLIF(current_setting('pgl_validate.fence_poll_interval_ms', true), '')::int,
+        100
+    );
+    buffer_multiplier int := COALESCE(
+        (NULLIF(options->>'sequence_buffer_multiplier', ''))::int,
+        NULLIF(current_setting('pgl_validate.sequence_buffer_multiplier', true), '')::int,
+        2
+    );
     edge_seq int := 0;
     sequence_sql text;
     provider_last_value bigint;

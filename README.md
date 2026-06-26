@@ -62,6 +62,21 @@ route rust-analyzer flycheck through `scripts\pgrx-vs.ps1`, which loads the
 Visual Studio C++ environment before running `cargo check`. The `crtdefs.h`
 bindgen error means that environment is missing from the cargo process.
 
+## Configuration
+
+Per-run `options` override PostgreSQL settings. Implemented settings are:
+
+```sql
+SET pgl_validate.chunk_target_rows = 50000;
+SET pgl_validate.localize_threshold = 1000;
+SET pgl_validate.fence_timeout_ms = 300000;
+SET pgl_validate.fence_poll_interval_ms = 100;
+SET pgl_validate.sequence_buffer_multiplier = 2;
+SET pgl_validate.paranoid_confirm = off;
+SET pgl_validate.correlate_conflict_history = on;
+SET pgl_validate.conflict_history_max_rows = 1000;
+```
+
 ## Status
 
 The repository is being built from the design outward. The current slice covers
