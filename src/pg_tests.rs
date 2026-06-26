@@ -630,6 +630,20 @@ mod tests {
         .unwrap();
         assert_eq!(guc_chunks, 3);
 
+        let guc_run_options = Spi::get_one::<String>(&format!(
+            "
+            SELECT (options->>'chunk_target_rows') || ';' ||
+                   (options->>'recheck_passes') || ';' ||
+                   (options->>'throttle_max_lag') || ';' ||
+                   (options->>'hash_algorithm')
+            FROM pgl_validate.run
+            WHERE run_id = {guc_run_id}
+            "
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(guc_run_options, "2;2;off;blake3_256");
+
         let override_run_id = Spi::get_one::<i64>(&format!(
             "
             SELECT (pgl_validate.compare_table(

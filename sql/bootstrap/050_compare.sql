@@ -558,7 +558,30 @@ BEGIN
     END IF;
     PERFORM set_config('pgl_validate.hash_algorithm', hash_algorithm, true);
     stored_options := (COALESCE(options, '{}'::jsonb) - '_pgl_validate_parent_run_id')
-        || jsonb_build_object('hash_algorithm', hash_algorithm);
+        || jsonb_build_object(
+            'allow_approximate_filters', allow_approximate_filters,
+            'allow_degraded_fence', allow_degraded_fence,
+            'correlate_conflict_history', correlate_conflict_history,
+            'conflict_history_lookback', conflict_history_lookback,
+            'conflict_history_max_rows', conflict_history_max_rows,
+            'chunk_max_duration', chunk_max_duration,
+            'chunk_target_rows', chunk_target_rows,
+            'fence_poll_interval_ms', fence_poll_interval_ms,
+            'fence_timeout_ms', fence_timeout_ms,
+            'hash_algorithm', hash_algorithm,
+            'localize_threshold', localize_threshold,
+            'max_parallel_chunks', max_parallel_chunks,
+            'max_reported_divergences', max_reported_divergences,
+            'max_reported_tuple_bytes', max_reported_tuple_bytes,
+            'max_snapshot_age', max_snapshot_age,
+            'on_fence_timeout', on_fence_timeout,
+            'on_precondition_fail', on_precondition_fail,
+            'paranoid_confirm', paranoid_confirm,
+            'paranoid_confirm_max_rows', paranoid_confirm_max_rows,
+            'recheck_passes', recheck_passes,
+            'statement_timeout_per_chunk', statement_timeout_per_chunk,
+            'throttle_max_lag', throttle_max_lag_setting
+        );
     IF chunk_target_rows <= 0 THEN
         RAISE EXCEPTION 'chunk_target_rows must be greater than zero';
     END IF;
@@ -788,7 +811,7 @@ BEGIN
 
         UPDATE pgl_validate.run
         SET options = pgl_validate.run.options
-            || jsonb_build_object('hash_algorithm', hash_algorithm)
+            || stored_options
         WHERE pgl_validate.run.run_id = v_run_id;
     END IF;
 
