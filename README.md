@@ -122,5 +122,6 @@ whole-relation validation, multi-table and replication-set compare
 orchestration, structured JSON reports, reviewable repair generation, audited
 repair application, conflict-history evidence correlation, run-control and
 retention APIs, durable schedule definitions with explicit async dispatch,
-dynamic-worker async run orchestration, and fenced paths exercised against real
-pglogical, native logical, and physical standby replication.
+dynamic-worker async run orchestration with durable paused-task resume, and
+fenced paths exercised against real pglogical, native logical, and physical
+standby replication.

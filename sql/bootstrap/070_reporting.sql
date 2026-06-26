@@ -31,6 +31,14 @@ BEGIN
       AND r.status IN ('planning','fencing','running','rechecking')
     RETURNING true INTO changed;
 
+    IF COALESCE(changed, false) THEN
+        UPDATE pgl_validate.worker_task wt
+        SET status = 'paused',
+            worker_pid = NULL
+        WHERE wt.run_id = pause.run_id
+          AND wt.status IN ('queued','starting');
+    END IF;
+
     RETURN COALESCE(changed, false);
 END
 $$;
@@ -42,7 +50,76 @@ VOLATILE
 AS $$
 DECLARE
     changed boolean;
+    task pgl_validate.worker_task;
+    v_worker_pid integer;
 BEGIN
+    SELECT wt.*
+    INTO task
+    FROM pgl_validate.worker_task wt
+    JOIN pgl_validate.run r USING (run_id)
+    WHERE wt.run_id = resume.run_id
+      AND (
+          wt.status IN ('paused','failed')
+          OR (
+              wt.status IN ('starting','running')
+              AND wt.worker_pid IS NOT NULL
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM pg_stat_activity a
+                  WHERE a.pid = wt.worker_pid
+              )
+          )
+      )
+      AND r.status IN ('paused','failed','planning','fencing','running','rechecking')
+    ORDER BY wt.task_id DESC
+    LIMIT 1
+    FOR UPDATE OF wt;
+
+    IF FOUND THEN
+        UPDATE pgl_validate.run r
+        SET status = 'planning',
+            finished_at = NULL,
+            error = NULL
+        WHERE r.run_id = resume.run_id
+          AND r.status IN ('paused','failed','planning','fencing','running','rechecking')
+        RETURNING true INTO changed;
+
+        IF NOT COALESCE(changed, false) THEN
+            RETURN false;
+        END IF;
+
+        UPDATE pgl_validate.worker_task wt
+        SET status = 'queued',
+            worker_pid = NULL,
+            started_at = NULL,
+            finished_at = NULL,
+            error = NULL
+        WHERE wt.task_id = task.task_id;
+
+        BEGIN
+            v_worker_pid := pgl_validate.launch_worker_task(task.task_id);
+            UPDATE pgl_validate.worker_task wt
+            SET worker_pid = v_worker_pid
+            WHERE wt.task_id = task.task_id;
+        EXCEPTION WHEN others THEN
+            UPDATE pgl_validate.worker_task wt
+            SET status = 'failed',
+                finished_at = clock_timestamp(),
+                error = SQLERRM
+            WHERE wt.task_id = task.task_id;
+
+            UPDATE pgl_validate.run r
+            SET status = 'failed',
+                finished_at = clock_timestamp(),
+                error = SQLERRM
+            WHERE r.run_id = resume.run_id;
+
+            RAISE;
+        END;
+
+        RETURN true;
+    END IF;
+
     UPDATE pgl_validate.run r
     SET status = 'running',
         finished_at = NULL,

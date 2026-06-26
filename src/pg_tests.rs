@@ -2831,6 +2831,54 @@ mod tests {
     }
 
     #[pg_test]
+    fn pause_parks_queued_async_worker_tasks() {
+        let run_id = Spi::get_one::<i64>(
+            "
+            INSERT INTO pgl_validate.run(status, options)
+            VALUES ('running', '{\"async\": true}'::jsonb)
+            RETURNING run_id
+            ",
+        )
+        .unwrap()
+        .unwrap();
+
+        Spi::run(&format!(
+            "
+            INSERT INTO pgl_validate.worker_task(
+                run_id, task_kind, request, status, database_name
+            )
+            VALUES (
+                {run_id},
+                'compare',
+                '{{\"tables\": [], \"options\": {{}}}}'::jsonb,
+                'queued',
+                current_database()
+            )
+            "
+        ))
+        .unwrap();
+
+        let paused = Spi::get_one::<bool>(&format!("SELECT pgl_validate.pause({run_id})"))
+            .unwrap()
+            .unwrap();
+        let parked = Spi::get_one::<String>(&format!(
+            "
+            SELECT r.status || ';' ||
+                   wt.status || ';' ||
+                   (wt.worker_pid IS NULL)::text
+            FROM pgl_validate.run r
+            JOIN pgl_validate.worker_task wt USING (run_id)
+            WHERE r.run_id = {run_id}
+            "
+        ))
+        .unwrap()
+        .unwrap();
+
+        assert!(paused);
+        assert_eq!(parked, "paused;paused;true");
+    }
+
+    #[pg_test]
     fn schedule_management_validates_and_dispatches_disabled_schedules_safely() {
         let backend_pid = Spi::get_one::<i32>("SELECT pg_backend_pid()")
             .unwrap()

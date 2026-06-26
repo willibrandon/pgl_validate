@@ -118,7 +118,7 @@ COMMENT ON FUNCTION pgl_validate.cancel(bigint) IS
 COMMENT ON FUNCTION pgl_validate.pause(bigint) IS
     'Move an active validation run into paused state for later resume.';
 COMMENT ON FUNCTION pgl_validate.resume(bigint) IS
-    'Move a paused validation run back into running state and clear transient completion/error fields.';
+    'Resume a paused run; when a durable async worker task is paused, failed, or stale, requeue it and launch a replacement dynamic worker.';
 COMMENT ON FUNCTION pgl_validate.put_schedule(text, text, text[], text, text[], jsonb, boolean) IS
     'Create or replace a durable validation schedule definition without launching it.';
 COMMENT ON FUNCTION pgl_validate.set_schedule_enabled(text, boolean) IS

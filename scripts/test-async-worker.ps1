@@ -320,6 +320,50 @@ SELECT (pgl_validate.put_schedule(
     }
 
     Write-Output "scheduled async validation passed on pg${PgMajor}: run_id=$scheduledRunId state=$scheduledState"
+
+    Write-Step 'Creating paused async task and resuming it through a replacement worker'
+    $resumeSeed = Invoke-Sql -Quiet -Sql @"
+WITH run AS (
+    INSERT INTO pgl_validate.run(status, options, tables_total)
+    VALUES ('paused', '{"async": true, "resume_smoke": true}'::jsonb, 1)
+    RETURNING run_id
+),
+task AS (
+    INSERT INTO pgl_validate.worker_task(
+        run_id, task_kind, request, status, database_name
+    )
+    SELECT
+        run_id,
+        'compare',
+        jsonb_build_object(
+            'tables', jsonb_build_array('public.async_target'),
+            'repset', NULL,
+            'peers', NULL,
+            'reference', NULL,
+            'options', '{}'::jsonb
+        ),
+        'paused',
+        current_database()
+    FROM run
+    RETURNING run_id, task_id
+)
+SELECT run_id::text || ';' || task_id::text
+FROM task;
+"@
+    $resumeParts = $resumeSeed.Split(';', 2)
+    if ($resumeParts.Count -ne 2) {
+        throw "unexpected paused task seed result: $resumeSeed"
+    }
+    $resumeRunId = $resumeParts[0]
+
+    $resumed = Invoke-Sql -Quiet -Sql "SELECT pgl_validate.resume($resumeRunId::bigint)::text;"
+    if ($resumed -ne 'true') {
+        throw "resume returned $resumed for paused async run $resumeRunId."
+    }
+
+    Write-Step "Waiting for resumed async run $resumeRunId to complete"
+    $resumedState = Wait-AsyncRunComplete -RunId $resumeRunId -TimeoutSeconds $TimeoutSeconds
+    Write-Output "resumed async validation passed on pg${PgMajor}: run_id=$resumeRunId state=$resumedState"
 }
 finally {
     Stop-TestCluster -Data $data -PgCtl $script:PgCtl

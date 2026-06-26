@@ -312,7 +312,7 @@ CREATE TABLE pgl_validate.worker_task (
     task_kind     text NOT NULL CHECK (task_kind IN ('compare')),
     request       jsonb NOT NULL,
     status        text NOT NULL DEFAULT 'queued'
-                  CHECK (status IN ('queued','starting','running','completed','failed','canceled')),
+                  CHECK (status IN ('queued','starting','running','paused','completed','failed','canceled')),
     launched_by   name NOT NULL DEFAULT current_user,
     database_name name NOT NULL DEFAULT current_database(),
     worker_pid    integer,
