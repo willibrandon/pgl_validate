@@ -352,14 +352,85 @@ CREATE OR REPLACE VIEW pgl_validate.schema_issues AS
 SELECT * FROM pgl_validate.schema_issue;
 
 CREATE OR REPLACE VIEW pgl_validate.run_progress AS
+WITH chunk_counts AS (
+    SELECT
+        cr.run_id,
+        count(cr.*) FILTER (WHERE cr.state IN ('clean','divergent')) AS chunks_done,
+        count(cr.*) FILTER (WHERE cr.state <> 'split') AS chunks_total
+    FROM pgl_validate.chunk_result cr
+    GROUP BY cr.run_id
+),
+chunk_scan AS (
+    SELECT
+        cnr.run_id,
+        COALESCE(sum(cnr.n_rows), 0)::bigint AS rows_scanned,
+        COALESCE(sum(cnr.n_rows), 0)::bigint * 32 AS bytes_scanned
+    FROM pgl_validate.chunk_node_result cnr
+    GROUP BY cnr.run_id
+),
+table_progress AS (
+    SELECT
+        tnr.run_id,
+        COALESCE(sum(tnr.n_rows), 0)::bigint AS rows_scanned,
+        COALESCE(sum(tnr.n_rows), 0)::bigint * 32 AS bytes_scanned
+    FROM pgl_validate.table_node_result tnr
+    GROUP BY tnr.run_id
+),
+epoch_progress AS (
+    SELECT
+        fe.run_id,
+        max(fe.epoch_seq) AS current_epoch
+    FROM pgl_validate.fence_epoch fe
+    GROUP BY fe.run_id
+),
+fence_progress AS (
+    SELECT
+        fa.run_id,
+        bool_or(fa.status = 'waiting') AS has_waiting_fence
+    FROM pgl_validate.fence_attempt fa
+    GROUP BY fa.run_id
+),
+divergence_progress AS (
+    SELECT
+        d.run_id,
+        bool_or(d.status = 'candidate') AS has_candidate_divergence
+    FROM pgl_validate.divergence d
+    GROUP BY d.run_id
+)
 SELECT
     r.run_id,
     r.status,
-    count(cr.*) FILTER (WHERE cr.state IN ('clean','divergent')) AS chunks_done,
-    count(cr.*) FILTER (WHERE cr.state <> 'split') AS chunks_total,
+    CASE
+        WHEN r.status IN ('completed','failed','canceled','paused') THEN r.status
+        WHEN COALESCE(fp.has_waiting_fence, false) THEN 'fencing'
+        WHEN COALESCE(dp.has_candidate_divergence, false) THEN 'rechecking'
+        WHEN r.status = 'running' THEN 'running'
+        ELSE r.status
+    END AS phase,
+    ep.current_epoch,
+    COALESCE(cc.chunks_done, 0)::bigint AS chunks_done,
+    COALESCE(cc.chunks_total, 0)::bigint AS chunks_total,
+    (COALESCE(cs.rows_scanned, 0) + COALESCE(tp.rows_scanned, 0))::bigint AS rows_scanned,
+    (COALESCE(cs.bytes_scanned, 0) + COALESCE(tp.bytes_scanned, 0))::bigint AS bytes_scanned,
+    CASE
+        WHEN r.status IN ('completed','failed','canceled')
+          OR r.started_at IS NULL
+          OR COALESCE(cc.chunks_done, 0) <= 0
+          OR COALESCE(cc.chunks_total, 0) <= COALESCE(cc.chunks_done, 0)
+        THEN NULL::interval
+        ELSE make_interval(secs => (
+            extract(epoch FROM (clock_timestamp() - r.started_at))
+            * (COALESCE(cc.chunks_total, 0) - COALESCE(cc.chunks_done, 0))::double precision
+            / COALESCE(cc.chunks_done, 0)::double precision
+        ))
+    END AS eta,
     r.started_at,
     r.finished_at
 FROM pgl_validate.run r
-LEFT JOIN pgl_validate.chunk_result cr USING (run_id)
-GROUP BY r.run_id, r.status, r.started_at, r.finished_at;
+LEFT JOIN chunk_counts cc USING (run_id)
+LEFT JOIN chunk_scan cs USING (run_id)
+LEFT JOIN table_progress tp USING (run_id)
+LEFT JOIN epoch_progress ep USING (run_id)
+LEFT JOIN fence_progress fp USING (run_id)
+LEFT JOIN divergence_progress dp USING (run_id);
 

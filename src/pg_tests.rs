@@ -3931,6 +3931,78 @@ mod tests {
     }
 
     #[pg_test]
+    fn run_progress_reports_phase_epoch_scan_counters_and_eta() {
+        let run_id = Spi::get_one::<i64>(
+            "
+            INSERT INTO pgl_validate.run(status, started_at)
+            VALUES ('running', clock_timestamp() - interval '10 seconds')
+            RETURNING run_id
+            ",
+        )
+        .unwrap()
+        .unwrap();
+
+        Spi::run(&format!(
+            "
+            INSERT INTO pgl_validate.fence_epoch(run_id, epoch_seq)
+            VALUES ({run_id}, 2);
+
+            INSERT INTO pgl_validate.table_plan(
+                run_id, schema_name, table_name, validated_property
+            )
+            VALUES ({run_id}, 'public', 'progress_target', 'full');
+
+            INSERT INTO pgl_validate.table_node_result(
+                run_id, schema_name, table_name, node, n_rows, lthash
+            )
+            VALUES ({run_id}, 'public', 'progress_target', 'local', 10, '\\x01'::bytea);
+
+            INSERT INTO pgl_validate.chunk_result(
+                run_id, schema_name, table_name, chunk_id, state
+            )
+            VALUES
+                ({run_id}, 'public', 'progress_target', 1, 'clean'),
+                ({run_id}, 'public', 'progress_target', 2, 'running'),
+                ({run_id}, 'public', 'progress_target', 3, 'split');
+
+            INSERT INTO pgl_validate.chunk_node_result(
+                run_id, schema_name, table_name, chunk_id, node, n_rows, lthash
+            )
+            VALUES
+                ({run_id}, 'public', 'progress_target', 1, 'local', 5, '\\x02'::bytea),
+                ({run_id}, 'public', 'progress_target', 2, 'local', 5, '\\x03'::bytea);
+
+            INSERT INTO pgl_validate.divergence(
+                run_id, schema_name, table_name, key_text, key_bytes,
+                classification, node, detected_epoch
+            )
+            VALUES (
+                {run_id}, 'public', 'progress_target', '1', '\\x31'::bytea,
+                'differs', 'peer', 2
+            );
+            "
+        ))
+        .unwrap();
+
+        let progress = Spi::get_one::<String>(&format!(
+            "
+            SELECT phase || ';' ||
+                   current_epoch::text || ';' ||
+                   chunks_done::text || '/' || chunks_total::text || ';' ||
+                   rows_scanned::text || ';' ||
+                   bytes_scanned::text || ';' ||
+                   (eta IS NOT NULL)::text
+            FROM pgl_validate.run_progress
+            WHERE run_id = {run_id}
+            "
+        ))
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(progress, "rechecking;2;1/2;20;640;true");
+    }
+
+    #[pg_test]
     fn report_and_metrics_include_validation_state() {
         let backend_pid = Spi::get_one::<i32>("SELECT pg_backend_pid()")
             .unwrap()

@@ -51,7 +51,7 @@ COMMENT ON TABLE pgl_validate.repair_result IS
 COMMENT ON VIEW pgl_validate.runs IS
     'Reporting view over validation runs.';
 COMMENT ON VIEW pgl_validate.run_progress IS
-    'Reporting view with chunk completion counts per run.';
+    'Reporting view with phase, current epoch, chunk completion, scan counters, and ETA per run.';
 COMMENT ON VIEW pgl_validate.table_results IS
     'Reporting view over table verdicts.';
 COMMENT ON VIEW pgl_validate.chunk_results IS
