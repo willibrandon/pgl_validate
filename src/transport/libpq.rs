@@ -91,6 +91,19 @@ pub(crate) struct BarrierObservation {
     pub(crate) converged: bool,
 }
 
+/// Physical-standby replay status fetched from a remote participant.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) struct StandbyReplayStatus {
+    /// Remote server_version_num.
+    pub(crate) pg_version: i32,
+    /// Whether the remote participant is currently in recovery.
+    pub(crate) in_recovery: bool,
+    /// Remote `pg_last_wal_replay_lsn()`, or zero when no replay LSN exists.
+    pub(crate) replay_lsn: u64,
+    /// Whether WAL replay is paused on the remote participant.
+    pub(crate) replay_paused: bool,
+}
+
 /// pglogical subscription status fetched from a remote target node.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub(crate) struct SubscriptionStatus {
@@ -427,6 +440,45 @@ pub(crate) fn observe_barrier(
         origin_progress_lsn: parse_lsn(&result.value(0, 0)?)?,
         token_visible: parse_bool(&result.value(0, 1)?)?,
         converged: parse_bool(&result.value(0, 2)?)?,
+    })
+}
+
+/// Fetch physical-standby replay status from a remote participant.
+pub(crate) fn fetch_standby_replay_status(
+    dsn: &str,
+    connect_timeout_seconds: i32,
+    statement_timeout_ms: i32,
+    lock_timeout_ms: i32,
+) -> Result<StandbyReplayStatus, String> {
+    let conn = Connection::connect_with_timeout(dsn, connect_timeout_seconds)?;
+    conn.set_query_timeouts(statement_timeout_ms, lock_timeout_ms)?;
+
+    let result = conn.exec(
+        "SELECT current_setting('server_version_num')::int::text, \
+                pg_is_in_recovery()::text, \
+                COALESCE(pg_last_wal_replay_lsn(), '0/0'::pg_lsn)::text, \
+                CASE WHEN pg_is_in_recovery() \
+                     THEN pg_is_wal_replay_paused() \
+                     ELSE false \
+                END::text",
+    )?;
+    result.require_status(PGRES_TUPLES_OK)?;
+    if result.ntuples() != 1 || result.nfields() != 4 {
+        return Err(format!(
+            "remote standby replay status returned {} row(s) and {} column(s), expected 1 row and 4 columns",
+            result.ntuples(),
+            result.nfields()
+        ));
+    }
+
+    Ok(StandbyReplayStatus {
+        pg_version: result
+            .value(0, 0)?
+            .parse::<i32>()
+            .map_err(|err| format!("invalid remote server_version_num: {err}"))?,
+        in_recovery: parse_bool(&result.value(0, 1)?)?,
+        replay_lsn: parse_lsn(&result.value(0, 2)?)?,
+        replay_paused: parse_bool(&result.value(0, 3)?)?,
     })
 }
 

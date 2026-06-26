@@ -397,6 +397,60 @@ AS 'MODULE_PATHNAME', 'remote_observe_barrier_wrapper';
         ))
     }
 
+    /// Fetch physical-standby replay status from a remote participant.
+    #[pg_extern(
+        volatile,
+        parallel_unsafe,
+        sql = r#"
+CREATE FUNCTION pgl_validate.remote_standby_replay_status(
+    dsn text,
+    connect_timeout_seconds integer DEFAULT 10,
+    statement_timeout_ms integer DEFAULT 600000,
+    lock_timeout_ms integer DEFAULT 30000
+)
+RETURNS TABLE (
+    pg_version integer,
+    in_recovery boolean,
+    replay_lsn pg_lsn,
+    replay_paused boolean
+)
+LANGUAGE c
+STRICT
+VOLATILE
+PARALLEL UNSAFE
+AS 'MODULE_PATHNAME', 'remote_standby_replay_status_wrapper';
+"#
+    )]
+    fn remote_standby_replay_status(
+        dsn: &str,
+        connect_timeout_seconds: default!(i32, 10),
+        statement_timeout_ms: default!(i32, 600000),
+        lock_timeout_ms: default!(i32, 30000),
+    ) -> TableIterator<
+        'static,
+        (
+            name!(pg_version, i32),
+            name!(in_recovery, bool),
+            name!(replay_lsn, i64),
+            name!(replay_paused, bool),
+        ),
+    > {
+        let status = transport::libpq::fetch_standby_replay_status(
+            dsn,
+            connect_timeout_seconds,
+            statement_timeout_ms,
+            lock_timeout_ms,
+        )
+        .unwrap_or_else(|err| pgrx::error!("{err}"));
+
+        TableIterator::once((
+            status.pg_version,
+            status.in_recovery,
+            status.replay_lsn as i64,
+            status.replay_paused,
+        ))
+    }
+
     /// Fetch pglogical subscription status from a remote target node.
     #[pg_extern(
         volatile,
@@ -1137,6 +1191,109 @@ mod tests {
                 sql_literal(&origin_name)
             ),
         );
+    }
+
+    #[pg_test]
+    fn remote_standby_replay_status_reports_primary_not_in_recovery() {
+        let dsn = local_dsn();
+        let status = Spi::get_one::<String>(&format!(
+            "
+            SELECT (pg_version > 0)::text || ';' ||
+                   in_recovery::text || ';' ||
+                   replay_lsn::text || ';' ||
+                   replay_paused::text
+            FROM pgl_validate.remote_standby_replay_status({})
+            ",
+            sql_literal(&dsn)
+        ))
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(status, "true;false;0/0;false");
+    }
+
+    #[pg_test]
+    fn fence_standby_edge_rejects_primary_peer() {
+        let dsn = local_dsn();
+        let sql = format!(
+            "
+            DO $$
+            DECLARE
+                run_id bigint;
+            BEGIN
+                INSERT INTO pgl_validate.run(status)
+                VALUES ('fencing')
+                RETURNING pgl_validate.run.run_id INTO run_id;
+
+                BEGIN
+                    PERFORM pgl_validate.fence_standby_edge(
+                        run_id,
+                        1,
+                        1,
+                        'local',
+                        'primary_peer',
+                        {},
+                        pg_current_wal_lsn(),
+                        10,
+                        10000,
+                        10000,
+                        100,
+                        10
+                    );
+                    RAISE EXCEPTION 'expected primary peer to be rejected';
+                EXCEPTION WHEN SQLSTATE '0A000' THEN
+                    IF SQLERRM <> 'standby peer primary_peer is not in recovery' THEN
+                        RAISE;
+                    END IF;
+                END;
+            END
+            $$;
+            ",
+            sql_literal(&dsn)
+        );
+
+        Spi::run(&sql).unwrap();
+    }
+
+    #[pg_test]
+    fn compare_table_autodetects_standby_backend_and_fails_closed_on_primary_peer() {
+        let dsn = local_dsn();
+        let backend_pid = Spi::get_one::<i32>("SELECT pg_backend_pid()")
+            .unwrap()
+            .unwrap();
+        let table_name = identifier(&format!("pgl_validate_standby_detect_{backend_pid}"));
+
+        Spi::run(&format!(
+            "
+            CREATE TABLE public.{table_name}(id int PRIMARY KEY, value text);
+            INSERT INTO public.{table_name} VALUES (1, 'same');
+            DELETE FROM pgl_validate.peer;
+            INSERT INTO pgl_validate.peer(name, dsn, backend)
+            VALUES ('standby_primary', {}, 'standby');
+            ",
+            sql_literal(&dsn)
+        ))
+        .unwrap();
+
+        let compare_sql = format!(
+            "
+            DO $$
+            BEGIN
+                BEGIN
+                    PERFORM pgl_validate.compare_table('public.{table_name}'::regclass);
+                    RAISE EXCEPTION 'expected standby peer to require replay fencing';
+                EXCEPTION WHEN SQLSTATE '0A000' THEN
+                    IF SQLERRM <> 'standby peer standby_primary is not in recovery' THEN
+                        RAISE;
+                    END IF;
+                END;
+            END
+            $$;
+            "
+        );
+        Spi::run(&compare_sql).unwrap();
+
+        Spi::run("DELETE FROM pgl_validate.peer WHERE name = 'standby_primary'").unwrap();
     }
 
     #[pg_test]

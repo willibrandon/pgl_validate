@@ -1063,6 +1063,139 @@ BEGIN
 END
 $$;
 
+-- Fence one primary->physical-standby edge by capturing a primary WAL LSN and
+-- polling the target until physical replay has reached that cut.
+CREATE FUNCTION pgl_validate.fence_standby_edge(
+    p_run_id bigint,
+    p_epoch_seq int,
+    p_edge_id int,
+    p_provider_node text,
+    p_target_node text,
+    p_target_dsn text,
+    p_target_lsn pg_lsn DEFAULT NULL,
+    p_connect_timeout_seconds int DEFAULT 10,
+    p_statement_timeout_ms int DEFAULT 600000,
+    p_lock_timeout_ms int DEFAULT 30000,
+    p_fence_timeout_ms int DEFAULT 300000,
+    p_poll_interval_ms int DEFAULT 100
+)
+RETURNS pgl_validate.fence_attempt
+LANGUAGE plpgsql
+VOLATILE
+AS $$
+DECLARE
+    target_lsn pg_lsn := COALESCE(p_target_lsn, pg_current_wal_lsn());
+    observation record;
+    deadline timestamptz;
+    attempt_status text;
+    result_row pgl_validate.fence_attempt;
+BEGIN
+    IF p_run_id IS NULL THEN
+        RAISE EXCEPTION 'run_id is required';
+    END IF;
+    IF p_epoch_seq IS NULL THEN
+        RAISE EXCEPTION 'epoch_seq is required';
+    END IF;
+    IF p_edge_id IS NULL THEN
+        RAISE EXCEPTION 'edge_id is required';
+    END IF;
+    IF p_provider_node IS NULL OR p_target_node IS NULL THEN
+        RAISE EXCEPTION 'provider_node and target_node are required';
+    END IF;
+    IF p_target_dsn IS NULL THEN
+        RAISE EXCEPTION 'target_dsn is required';
+    END IF;
+    IF pg_is_in_recovery() THEN
+        RAISE EXCEPTION 'standby fences must be coordinated from a primary'
+            USING ERRCODE = '0A000';
+    END IF;
+    IF p_fence_timeout_ms <= 0 THEN
+        RAISE EXCEPTION 'fence_timeout_ms must be greater than zero';
+    END IF;
+    IF p_poll_interval_ms <= 0 THEN
+        RAISE EXCEPTION 'poll_interval_ms must be greater than zero';
+    END IF;
+
+    INSERT INTO pgl_validate.run_edge(
+        run_id, edge_id, provider_node, target_node, backend,
+        subscription, slot_name, origin_name, repsets
+    )
+    VALUES (
+        p_run_id, p_edge_id, p_provider_node, p_target_node, 'standby',
+        NULL, NULL, NULL, NULL
+    )
+    ON CONFLICT (run_id, edge_id) DO UPDATE
+    SET provider_node = EXCLUDED.provider_node,
+        target_node = EXCLUDED.target_node,
+        backend = 'standby',
+        subscription = NULL,
+        slot_name = NULL,
+        origin_name = NULL,
+        repsets = NULL;
+
+    INSERT INTO pgl_validate.fence_epoch(run_id, epoch_seq)
+    VALUES (p_run_id, p_epoch_seq)
+    ON CONFLICT (run_id, epoch_seq) DO NOTHING;
+
+    INSERT INTO pgl_validate.fence_edge(
+        run_id, epoch_seq, edge_id, fence_kind, barrier_token, barrier_end_lsn
+    )
+    VALUES (
+        p_run_id,
+        p_epoch_seq,
+        p_edge_id,
+        'standby_replay',
+        NULL,
+        target_lsn
+    )
+    ON CONFLICT (run_id, epoch_seq, edge_id) DO UPDATE
+    SET fence_kind = 'standby_replay',
+        barrier_token = NULL,
+        barrier_end_lsn = EXCLUDED.barrier_end_lsn;
+
+    deadline := clock_timestamp() + make_interval(secs => p_fence_timeout_ms / 1000.0);
+    LOOP
+        SELECT *
+        INTO observation
+        FROM pgl_validate.remote_standby_replay_status(
+            p_target_dsn,
+            p_connect_timeout_seconds,
+            p_statement_timeout_ms,
+            p_lock_timeout_ms
+        );
+
+        IF NOT observation.in_recovery THEN
+            RAISE EXCEPTION 'standby peer % is not in recovery', p_target_node
+                USING ERRCODE = '0A000';
+        END IF;
+
+        EXIT WHEN observation.replay_lsn >= target_lsn;
+
+        IF clock_timestamp() >= deadline THEN
+            attempt_status := 'timeout';
+            EXIT;
+        END IF;
+
+        PERFORM pg_sleep(p_poll_interval_ms / 1000.0);
+    END LOOP;
+
+    SELECT *
+    INTO result_row
+    FROM pgl_validate.record_fence_attempt(
+        p_run_id,
+        p_epoch_seq,
+        p_edge_id,
+        target_lsn,
+        observation.replay_lsn,
+        true,
+        NULL,
+        attempt_status
+    );
+
+    RETURN result_row;
+END
+$$;
+
 -- Generate the planner-visible SQL used to checksum a table chunk. Columns are
 -- sorted by name before they are passed as heterogeneous VARIADIC row_digest
 -- arguments; callers may EXPLAIN the returned SQL directly on a participant.
@@ -1484,6 +1617,9 @@ DECLARE
     fence_rec pgl_validate.fence_attempt;
     peer_names text[];
     missing_peers text[];
+    selected_peer_count int := 0;
+    standby_peer_count int := 0;
+    pglogical_peer_count int := 0;
     peer_rec record;
     remote_rec record;
     checksum_sql text;
@@ -1523,16 +1659,10 @@ BEGIN
 
     key_cols := pgl_validate.comparison_key_cols(p_table_name);
 
-    requested_backend := COALESCE(
-        NULLIF(options->>'backend', ''),
-        CASE WHEN options ? 'publications' THEN 'native' ELSE 'pglogical' END
-    );
-    IF requested_backend NOT IN ('pglogical','native','standby') THEN
+    requested_backend := NULLIF(options->>'backend', '');
+    IF requested_backend IS NOT NULL
+       AND requested_backend NOT IN ('pglogical','native','standby') THEN
         RAISE EXCEPTION 'unsupported backend %', requested_backend
-            USING ERRCODE = '0A000';
-    END IF;
-    IF requested_backend = 'standby' THEN
-        RAISE EXCEPTION 'backend=standby requires the replay-LSN fence path, which is not implemented yet'
             USING ERRCODE = '0A000';
     END IF;
     provider_dsn := NULLIF(options->>'provider_dsn', '');
@@ -1566,6 +1696,41 @@ BEGIN
 
         IF missing_peers IS NOT NULL THEN
             RAISE EXCEPTION 'unknown pgl_validate peer(s): %', array_to_string(missing_peers, ', ');
+        END IF;
+    END IF;
+
+    SELECT count(*),
+           count(*) FILTER (WHERE p.backend = 'standby'),
+           count(*) FILTER (WHERE p.backend = 'pglogical')
+    INTO selected_peer_count, standby_peer_count, pglogical_peer_count
+    FROM pgl_validate.peer p
+    WHERE p.name = ANY (peer_names);
+
+    requested_backend := COALESCE(
+        requested_backend,
+        CASE
+            WHEN options ? 'publications' THEN 'native'
+            WHEN selected_peer_count > 0 AND standby_peer_count = selected_peer_count THEN 'standby'
+            ELSE 'pglogical'
+        END
+    );
+
+    IF standby_peer_count > 0
+       AND (requested_backend <> 'standby'
+            OR standby_peer_count <> selected_peer_count) THEN
+        RAISE EXCEPTION
+            'standby peers require a standby-only comparison backend'
+            USING ERRCODE = '0A000';
+    END IF;
+
+    IF requested_backend = 'standby' THEN
+        IF selected_peer_count = 0 THEN
+            RAISE EXCEPTION 'backend=standby requires at least one registered standby peer'
+                USING ERRCODE = '0A000';
+        END IF;
+        IF pg_is_in_recovery() THEN
+            RAISE EXCEPTION 'backend=standby requires the coordinator to be a primary'
+                USING ERRCODE = '0A000';
         END IF;
     END IF;
 
@@ -1876,6 +2041,60 @@ BEGIN
           AND node = 'local';
     END IF;
 
+    IF standby_peer_count > 0 THEN
+        INSERT INTO pgl_validate.fence_epoch(run_id, epoch_seq)
+        VALUES (v_run_id, initial_epoch)
+        ON CONFLICT DO NOTHING;
+
+        UPDATE pgl_validate.run
+        SET status = 'fencing'
+        WHERE pgl_validate.run.run_id = v_run_id;
+
+        FOR peer_rec IN
+            SELECT p.name, p.dsn, p.backend,
+                   p.connect_timeout_seconds,
+                   p.statement_timeout_ms,
+                   p.lock_timeout_ms
+            FROM pgl_validate.peer p
+            WHERE p.name = ANY (peer_names)
+              AND p.backend = 'standby'
+            ORDER BY p.name
+        LOOP
+            edge_seq := edge_seq + 1;
+            current_edge_ids := current_edge_ids || edge_seq;
+
+            SELECT *
+            INTO fence_rec
+            FROM pgl_validate.fence_standby_edge(
+                v_run_id,
+                initial_epoch,
+                edge_seq,
+                provider_node,
+                peer_rec.name,
+                peer_rec.dsn,
+                NULL,
+                peer_rec.connect_timeout_seconds,
+                peer_rec.statement_timeout_ms,
+                peer_rec.lock_timeout_ms,
+                fence_timeout_ms,
+                fence_poll_interval_ms
+            );
+
+            IF fence_rec.status <> 'converged' THEN
+                RAISE EXCEPTION
+                    'standby peer % failed to converge replay fence: %',
+                    peer_rec.name,
+                    fence_rec.status
+                    USING ERRCODE = '57014';
+            END IF;
+        END LOOP;
+
+        UPDATE pgl_validate.run_participant
+        SET status = 'converged'
+        WHERE pgl_validate.run_participant.run_id = v_run_id
+          AND node = 'local';
+    END IF;
+
     UPDATE pgl_validate.run
     SET status = 'running'
     WHERE pgl_validate.run.run_id = v_run_id;
@@ -2082,7 +2301,7 @@ BEGIN
               AND d.schema_name = v_schema_name
               AND d.table_name = v_rel_name
               AND d.status = 'candidate'
-              AND p.backend = 'pglogical'
+              AND p.backend IN ('pglogical','standby')
         ) THEN
             INSERT INTO pgl_validate.fence_epoch(run_id, epoch_seq)
             VALUES (v_run_id, recheck_epoch)
@@ -2139,6 +2358,47 @@ BEGIN
                 END IF;
             END LOOP;
 
+            FOR peer_rec IN
+                SELECT p.name, p.dsn, p.backend,
+                       p.connect_timeout_seconds,
+                       p.statement_timeout_ms,
+                       p.lock_timeout_ms,
+                       re.edge_id
+                FROM pgl_validate.peer p
+                JOIN pgl_validate.run_edge re
+                  ON re.run_id = v_run_id
+                 AND re.target_node = p.name
+                 AND re.edge_id = ANY (current_edge_ids)
+                WHERE p.name = ANY (peer_names)
+                  AND p.backend = 'standby'
+                ORDER BY p.name
+            LOOP
+                SELECT *
+                INTO fence_rec
+                FROM pgl_validate.fence_standby_edge(
+                    v_run_id,
+                    recheck_epoch,
+                    peer_rec.edge_id,
+                    provider_node,
+                    peer_rec.name,
+                    peer_rec.dsn,
+                    NULL,
+                    peer_rec.connect_timeout_seconds,
+                    peer_rec.statement_timeout_ms,
+                    peer_rec.lock_timeout_ms,
+                    fence_timeout_ms,
+                    fence_poll_interval_ms
+                );
+
+                IF fence_rec.status <> 'converged' THEN
+                    RAISE EXCEPTION
+                        'standby peer % failed to converge recheck fence: %',
+                        peer_rec.name,
+                        fence_rec.status
+                        USING ERRCODE = '57014';
+                END IF;
+            END LOOP;
+
             EXECUTE format(
                 'INSERT INTO pg_temp.pgl_validate_localized_sample(sample, node, key_text, key_bytes, row_digest, row_json)
                  SELECT %L, %L, q.key_text, q.key_bytes, q.row_digest, q.row_json::jsonb FROM (%s) AS q',
@@ -2154,7 +2414,7 @@ BEGIN
                        p.lock_timeout_ms
                 FROM pgl_validate.peer p
                 WHERE p.name = ANY (peer_names)
-                  AND p.backend = 'pglogical'
+                  AND p.backend IN ('pglogical','standby')
                 ORDER BY p.name
             LOOP
                 INSERT INTO pg_temp.pgl_validate_localized_sample(
@@ -2231,7 +2491,7 @@ BEGIN
         SET status = 'confirmed'
         FROM pgl_validate.peer p
         WHERE p.name = d.node
-          AND p.backend <> 'pglogical'
+          AND p.backend NOT IN ('pglogical','standby')
           AND d.run_id = v_run_id
           AND d.schema_name = v_schema_name
           AND d.table_name = v_rel_name

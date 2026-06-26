@@ -73,6 +73,8 @@ COMMENT ON FUNCTION pgl_validate.ensure_pglogical_barrier_repset() IS
     'Create or verify the dedicated insert-only pglogical replication set that carries fence barrier tokens.';
 COMMENT ON FUNCTION pgl_validate.fence_pglogical_edge(bigint, integer, integer, text, text, text, text, text, text, text, text[], integer, integer, integer, integer, integer) IS
     'Inject and converge an exact pglogical barrier for one provider-to-target run edge.';
+COMMENT ON FUNCTION pgl_validate.fence_standby_edge(bigint, integer, integer, text, text, text, pg_lsn, integer, integer, integer, integer, integer) IS
+    'Converge one physical standby edge by waiting for replay to reach a primary WAL LSN.';
 COMMENT ON FUNCTION pgl_validate.plan_chunk_sql(regclass, text[], bytea, bytea, text[], text[], text) IS
     'Generate planner-visible SQL for a table chunk checksum.';
 COMMENT ON FUNCTION pgl_validate.plan_localize_sql(regclass, text[], text[], text) IS
@@ -144,6 +146,8 @@ COMMENT ON FUNCTION pgl_validate.remote_wait_slot_confirm_lsn(text, text, pg_lsn
     'Call pglogical.wait_slot_confirm_lsn on a provider and return the slot confirmed_flush_lsn.';
 COMMENT ON FUNCTION pgl_validate.remote_observe_barrier(text, text, uuid, pg_lsn, integer, integer, integer) IS
     'Observe target-side replication origin progress, barrier-token visibility, and convergence.';
+COMMENT ON FUNCTION pgl_validate.remote_standby_replay_status(text, integer, integer, integer) IS
+    'Fetch a remote participant''s recovery state, replay LSN, and replay-pause status.';
 COMMENT ON FUNCTION pgl_validate.remote_pglogical_subscription_status(text, text, integer, integer, integer) IS
     'Fetch pglogical subscription status from a remote target over libpq with bounded timeouts.';
 COMMENT ON FUNCTION pgl_validate.remote_pglogical_forwarding_subscriptions(text, text, integer, integer, integer) IS
