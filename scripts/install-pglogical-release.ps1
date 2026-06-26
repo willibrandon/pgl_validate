@@ -166,7 +166,8 @@ function Update-PglogicalMacDylibReferences {
     $pkglibDir = & $PgConfig --pkglibdir
     $libDir = & $PgConfig --libdir
     $libraryTargets = @($libDir, $pkglibDir) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
-    $pglogicalLibraries = Get-ChildItem -LiteralPath $pkglibDir -File -Filter 'pglogical*.dylib' -ErrorAction SilentlyContinue
+    $pglogicalLibraries = Get-ChildItem -LiteralPath $pkglibDir -File -Filter 'pglogical*' -ErrorAction SilentlyContinue |
+        Where-Object { $_.Extension -in @('.dylib', '.so') }
 
     foreach ($library in $pglogicalLibraries) {
         $dependencies = & $otool -L $library.FullName
@@ -181,8 +182,7 @@ function Update-PglogicalMacDylibReferences {
             }
 
             $dependency = $Matches['path']
-            if ((Test-Path -LiteralPath $dependency) -or
-                $dependency.StartsWith('/usr/lib/', [StringComparison]::Ordinal) -or
+            if ($dependency.StartsWith('/usr/lib/', [StringComparison]::Ordinal) -or
                 $dependency.StartsWith('/System/', [StringComparison]::Ordinal)) {
                 continue
             }
@@ -198,7 +198,15 @@ function Update-PglogicalMacDylibReferences {
             }
 
             if (-not $replacement) {
+                if (Test-Path -LiteralPath $dependency) {
+                    continue
+                }
+
                 throw "Could not relocate missing dependency $dependency for $($library.FullName)."
+            }
+
+            if ([StringComparer]::Ordinal.Equals($dependency, $replacement)) {
+                continue
             }
 
             & $installNameTool -change $dependency $replacement $library.FullName
