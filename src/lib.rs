@@ -78,6 +78,9 @@ static MAX_REPORTED_TUPLE_BYTES: GucSetting<i32> = GucSetting::<i32>::new(8192);
 static MAX_REPORTED_DIVERGENCES: GucSetting<i32> = GucSetting::<i32>::new(1000);
 static HASH_ALGORITHM: GucSetting<Option<CString>> =
     GucSetting::<Option<CString>>::new(Some(c"blake3_256"));
+static JSON_NORMALIZE: GucSetting<bool> = GucSetting::<bool>::new(false);
+static FLOAT_SIGNED_ZERO_DISTINCT: GucSetting<bool> = GucSetting::<bool>::new(false);
+static FLOAT_NAN_DISTINCT: GucSetting<bool> = GucSetting::<bool>::new(false);
 static ALLOW_APPROXIMATE_FILTERS: GucSetting<bool> = GucSetting::<bool>::new(false);
 static ALLOW_DEGRADED_FENCE: GucSetting<bool> = GucSetting::<bool>::new(false);
 static CHUNK_TARGET_ROWS: GucSetting<i32> = GucSetting::<i32>::new(50000);
@@ -109,6 +112,16 @@ pub(crate) fn current_hash_algorithm() -> digest::algorithm::HashAlgorithm {
         .unwrap_or_else(|_| pgrx::error!("pgl_validate.hash_algorithm must be valid UTF-8"));
 
     digest::algorithm::HashAlgorithm::parse(name).unwrap_or_else(|err| pgrx::error!("{err}"))
+}
+
+/// Return whether row digests should distinguish `-0.0` from `+0.0`.
+pub(crate) fn float_signed_zero_distinct() -> bool {
+    FLOAT_SIGNED_ZERO_DISTINCT.get()
+}
+
+/// Return whether row digests should preserve distinct NaN bit patterns.
+pub(crate) fn float_nan_distinct() -> bool {
+    FLOAT_NAN_DISTINCT.get()
 }
 
 /// Register `pgl_validate.*` settings with PostgreSQL.
@@ -159,6 +172,30 @@ pub extern "C-unwind" fn _PG_init() {
         c"Row digest hash algorithm.",
         c"Algorithm contract for row and set digests. Supported values are blake3_256 and blake3_512.",
         &HASH_ALGORITHM,
+        GucContext::Userset,
+        flags,
+    );
+    GucRegistry::define_bool_guc(
+        c"pgl_validate.json_normalize",
+        c"Normalize json values through jsonb in row digests.",
+        c"Off preserves json's stored text exactly; on treats json values with equal jsonb semantics as equal.",
+        &JSON_NORMALIZE,
+        GucContext::Userset,
+        flags,
+    );
+    GucRegistry::define_bool_guc(
+        c"pgl_validate.float_signed_zero_distinct",
+        c"Distinguish floating-point signed zero in row digests.",
+        c"Off normalizes -0.0 and +0.0 to the same canonical value before send/text encoding.",
+        &FLOAT_SIGNED_ZERO_DISTINCT,
+        GucContext::Userset,
+        flags,
+    );
+    GucRegistry::define_bool_guc(
+        c"pgl_validate.float_nan_distinct",
+        c"Distinguish floating-point NaN payloads in row digests.",
+        c"Off normalizes all float4/float8 NaN bit patterns to one canonical quiet NaN before send/text encoding.",
+        &FLOAT_NAN_DISTINCT,
         GucContext::Userset,
         flags,
     );

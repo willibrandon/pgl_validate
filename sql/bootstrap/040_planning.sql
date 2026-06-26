@@ -384,6 +384,48 @@ BEGIN
 END
 $$;
 
+-- Generate the CTE used by coordinator-built SQL to pin digest-affecting GUCs
+-- on the participant session before row_digest or schema_signature runs.
+CREATE FUNCTION pgl_validate.plan_settings_cte(hash_algorithm text DEFAULT NULL)
+RETURNS text
+LANGUAGE plpgsql
+STABLE
+AS $$
+DECLARE
+    effective_hash_algorithm text := COALESCE(
+        NULLIF(hash_algorithm, ''),
+        NULLIF(current_setting('pgl_validate.hash_algorithm', true), ''),
+        'blake3_256'
+    );
+    json_normalize boolean := COALESCE(
+        NULLIF(current_setting('pgl_validate.json_normalize', true), '')::boolean,
+        false
+    );
+    float_signed_zero_distinct boolean := COALESCE(
+        NULLIF(current_setting('pgl_validate.float_signed_zero_distinct', true), '')::boolean,
+        false
+    );
+    float_nan_distinct boolean := COALESCE(
+        NULLIF(current_setting('pgl_validate.float_nan_distinct', true), '')::boolean,
+        false
+    );
+BEGIN
+    IF effective_hash_algorithm NOT IN ('blake3_256','blake3_512') THEN
+        RAISE EXCEPTION 'hash_algorithm % is not implemented; supported values are blake3_256, blake3_512',
+            effective_hash_algorithm
+            USING ERRCODE = '0A000';
+    END IF;
+
+    RETURN format(
+        'pgl_validate_settings AS MATERIALIZED (SELECT set_config(''pgl_validate.hash_algorithm'', %L, true) AS hash_algorithm, set_config(''pgl_validate.json_normalize'', %L, true) AS json_normalize, set_config(''pgl_validate.float_signed_zero_distinct'', %L, true) AS float_signed_zero_distinct, set_config(''pgl_validate.float_nan_distinct'', %L, true) AS float_nan_distinct, set_config(''extra_float_digits'', ''3'', true) AS extra_float_digits, set_config(''DateStyle'', ''ISO, YMD'', true) AS date_style, set_config(''IntervalStyle'', ''iso_8601'', true) AS interval_style, set_config(''bytea_output'', ''hex'', true) AS bytea_output, set_config(''TimeZone'', ''UTC'', true) AS time_zone)',
+        effective_hash_algorithm,
+        json_normalize::text,
+        float_signed_zero_distinct::text,
+        float_nan_distinct::text
+    );
+END
+$$;
+
 -- Generate remote SQL that returns one schema_signature text column. It uses
 -- schema/table names instead of a regclass literal so a missing remote relation
 -- is reported as a signature mismatch rather than aborting SQL generation.
@@ -400,6 +442,7 @@ AS $$
 DECLARE
     cols_sql text;
     key_cols_sql text;
+    settings_cte text;
 BEGIN
     cols_sql := CASE
         WHEN cols IS NULL THEN 'NULL::text[]'
@@ -409,9 +452,11 @@ BEGIN
         WHEN key_cols IS NULL THEN 'NULL::text[]'
         ELSE format('%L::text[]', key_cols::text)
     END;
+    settings_cte := pgl_validate.plan_settings_cte(NULL);
 
     RETURN format(
-        'SELECT pgl_validate.schema_signature(%L, %L, %s, %s)::text AS signature',
+        'WITH %s SELECT pgl_validate.schema_signature(%L, %L, %s, %s)::text AS signature FROM pgl_validate_settings',
+        settings_cte,
         schema_name,
         table_name,
         cols_sql,
@@ -511,10 +556,7 @@ BEGIN
             effective_hash_algorithm
             USING ERRCODE = '0A000';
     END IF;
-    settings_cte := format(
-        'pgl_validate_settings AS MATERIALIZED (SELECT set_config(''pgl_validate.hash_algorithm'', %L, true) AS hash_algorithm)',
-        effective_hash_algorithm
-    );
+    settings_cte := pgl_validate.plan_settings_cte(effective_hash_algorithm);
     filter_sql := CASE
         WHEN row_filter_sql IS NULL OR btrim(row_filter_sql) = '' THEN 'true'
         ELSE format('(%s)', row_filter_sql)
@@ -647,10 +689,7 @@ BEGIN
             effective_hash_algorithm
             USING ERRCODE = '0A000';
     END IF;
-    settings_cte := format(
-        'pgl_validate_settings AS MATERIALIZED (SELECT set_config(''pgl_validate.hash_algorithm'', %L, true) AS hash_algorithm)',
-        effective_hash_algorithm
-    );
+    settings_cte := pgl_validate.plan_settings_cte(effective_hash_algorithm);
     source_sql := format(
         'pglogical.table_data_filtered(NULL::%s, %L::regclass, %L::text[]) AS t',
         rel_sql,
@@ -784,10 +823,7 @@ BEGIN
             effective_hash_algorithm
             USING ERRCODE = '0A000';
     END IF;
-    settings_cte := format(
-        'pgl_validate_settings AS MATERIALIZED (SELECT set_config(''pgl_validate.hash_algorithm'', %L, true) AS hash_algorithm)',
-        effective_hash_algorithm
-    );
+    settings_cte := pgl_validate.plan_settings_cte(effective_hash_algorithm);
     range_sql := pgl_validate.plan_key_range_predicate(rel, key_cols, lo, hi);
     where_sql := COALESCE(
         NULLIF(

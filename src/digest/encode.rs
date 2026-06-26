@@ -1,5 +1,6 @@
 use core::ffi::CStr;
 use pgrx::prelude::*;
+use std::ffi::CString;
 
 /// Encoding selected by the coordinator for one row_digest column position.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -8,6 +9,8 @@ pub enum EncodingMode {
     Send = 1,
     /// Use the type's text output function.
     Text = 2,
+    /// Convert `json` through `jsonb` before using jsonb binary send.
+    JsonbNormalize = 3,
 }
 
 impl TryFrom<i32> for EncodingMode {
@@ -17,6 +20,7 @@ impl TryFrom<i32> for EncodingMode {
         match value {
             1 => Ok(Self::Send),
             2 => Ok(Self::Text),
+            3 => Ok(Self::JsonbNormalize),
             _ => Err(format!("unknown pgl_validate encoding mode {value}")),
         }
     }
@@ -47,10 +51,100 @@ pub unsafe fn encode_datum(
     datum: pg_sys::Datum,
     mode: EncodingMode,
 ) -> Vec<u8> {
+    let datum = unsafe { normalize_float_datum(type_oid, datum) };
     match mode {
         EncodingMode::Send => unsafe { encode_send(type_oid, datum) },
         EncodingMode::Text => unsafe { encode_text(type_oid, datum) },
+        EncodingMode::JsonbNormalize => unsafe { encode_json_as_jsonb(type_oid, datum) },
     }
+}
+
+unsafe fn encode_json_as_jsonb(type_oid: pg_sys::Oid, datum: pg_sys::Datum) -> Vec<u8> {
+    if type_oid != pg_sys::JSONOID {
+        pgrx::error!("jsonb-normalize encoding mode requires json input, got type oid {type_oid}");
+    }
+
+    let json_text = unsafe { encode_text(pg_sys::JSONOID, datum) };
+    let json_cstring = CString::new(json_text)
+        .unwrap_or_else(|_| pgrx::error!("json output unexpectedly contained NUL"));
+    let mut input_oid = pg_sys::InvalidOid;
+    let mut type_io_param = pg_sys::InvalidOid;
+    unsafe {
+        pg_sys::getTypeInputInfo(pg_sys::JSONBOID, &mut input_oid, &mut type_io_param);
+    }
+    if input_oid == pg_sys::InvalidOid {
+        pgrx::error!("jsonb input function was not found");
+    }
+
+    let jsonb_datum = unsafe {
+        pg_sys::OidInputFunctionCall(
+            input_oid,
+            json_cstring.as_ptr().cast_mut(),
+            type_io_param,
+            -1,
+        )
+    };
+    unsafe { encode_send(pg_sys::JSONBOID, jsonb_datum) }
+}
+
+unsafe fn normalize_float_datum(type_oid: pg_sys::Oid, datum: pg_sys::Datum) -> pg_sys::Datum {
+    if type_oid == pg_sys::FLOAT4OID {
+        let value =
+            unsafe { f32::from_datum(datum, false) }.expect("non-null float4 datum must decode");
+        return normalize_f32(value)
+            .into_datum()
+            .expect("float4 value must encode as datum");
+    }
+
+    if type_oid == pg_sys::FLOAT8OID {
+        let value =
+            unsafe { f64::from_datum(datum, false) }.expect("non-null float8 datum must decode");
+        return normalize_f64(value)
+            .into_datum()
+            .expect("float8 value must encode as datum");
+    }
+
+    datum
+}
+
+fn normalize_f32(value: f32) -> f32 {
+    normalize_f32_with_policy(
+        value,
+        crate::float_signed_zero_distinct(),
+        crate::float_nan_distinct(),
+    )
+}
+
+fn normalize_f64(value: f64) -> f64 {
+    normalize_f64_with_policy(
+        value,
+        crate::float_signed_zero_distinct(),
+        crate::float_nan_distinct(),
+    )
+}
+
+fn normalize_f32_with_policy(value: f32, signed_zero_distinct: bool, nan_distinct: bool) -> f32 {
+    if value.is_nan() && !nan_distinct {
+        return f32::from_bits(0x7fc0_0000);
+    }
+
+    if value == 0.0 && !signed_zero_distinct {
+        return 0.0;
+    }
+
+    value
+}
+
+fn normalize_f64_with_policy(value: f64, signed_zero_distinct: bool, nan_distinct: bool) -> f64 {
+    if value.is_nan() && !nan_distinct {
+        return f64::from_bits(0x7ff8_0000_0000_0000);
+    }
+
+    if value == 0.0 && !signed_zero_distinct {
+        return 0.0;
+    }
+
+    value
 }
 
 unsafe fn encode_send(type_oid: pg_sys::Oid, datum: pg_sys::Datum) -> Vec<u8> {
@@ -111,7 +205,52 @@ mod tests {
     fn encoding_modes_are_explicit() {
         assert_eq!(EncodingMode::try_from(1).unwrap(), EncodingMode::Send);
         assert_eq!(EncodingMode::try_from(2).unwrap(), EncodingMode::Text);
+        assert_eq!(
+            EncodingMode::try_from(3).unwrap(),
+            EncodingMode::JsonbNormalize
+        );
         assert!(EncodingMode::try_from(0).is_err());
+    }
+
+    #[test]
+    fn float_normalization_canonicalizes_signed_zero_and_nan_payloads() {
+        assert_eq!(
+            normalize_f32_with_policy(-0.0, false, false).to_bits(),
+            0.0f32.to_bits()
+        );
+        assert_eq!(
+            normalize_f64_with_policy(-0.0, false, false).to_bits(),
+            0.0f64.to_bits()
+        );
+        assert_eq!(
+            normalize_f32_with_policy(f32::from_bits(0x7fc0_0001), false, false).to_bits(),
+            0x7fc0_0000
+        );
+        assert_eq!(
+            normalize_f64_with_policy(f64::from_bits(0x7ff8_0000_0000_0001), false, false)
+                .to_bits(),
+            0x7ff8_0000_0000_0000
+        );
+    }
+
+    #[test]
+    fn float_normalization_policy_can_preserve_bits() {
+        assert_eq!(
+            normalize_f32_with_policy(-0.0, true, false).to_bits(),
+            (-0.0f32).to_bits()
+        );
+        assert_eq!(
+            normalize_f64_with_policy(-0.0, true, false).to_bits(),
+            (-0.0f64).to_bits()
+        );
+        assert_eq!(
+            normalize_f32_with_policy(f32::from_bits(0x7fc0_0001), false, true).to_bits(),
+            0x7fc0_0001
+        );
+        assert_eq!(
+            normalize_f64_with_policy(f64::from_bits(0x7ff8_0000_0000_0001), false, true).to_bits(),
+            0x7ff8_0000_0000_0001
+        );
     }
 
     fn frame_reference(values: &[Option<Vec<u8>>]) -> Vec<u8> {

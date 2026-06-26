@@ -1,4 +1,5 @@
 \set ON_ERROR_STOP on
+\pset format unaligned
 \pset null '<null>'
 
 DROP TABLE IF EXISTS public.pgl_validate_regress_plan;

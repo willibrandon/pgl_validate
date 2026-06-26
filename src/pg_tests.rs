@@ -118,6 +118,98 @@ mod tests {
     }
 
     #[pg_test]
+    fn row_digest_normalizes_float_signed_zero_by_default() {
+        let float4_digest =
+            Spi::get_one::<Vec<u8>>("SELECT pgl_validate.row_digest(ARRAY[1], '-0'::float4)")
+                .unwrap()
+                .unwrap();
+        let float4_positive_digest =
+            Spi::get_one::<Vec<u8>>("SELECT pgl_validate.row_digest(ARRAY[1], '0'::float4)")
+                .unwrap()
+                .unwrap();
+        let float8_digest =
+            Spi::get_one::<Vec<u8>>("SELECT pgl_validate.row_digest(ARRAY[1], '-0'::float8)")
+                .unwrap()
+                .unwrap();
+        let float8_positive_digest =
+            Spi::get_one::<Vec<u8>>("SELECT pgl_validate.row_digest(ARRAY[1], '0'::float8)")
+                .unwrap()
+                .unwrap();
+
+        assert_eq!(float4_digest, float4_positive_digest);
+        assert_eq!(float8_digest, float8_positive_digest);
+    }
+
+    #[pg_test]
+    fn row_digest_can_distinguish_float_signed_zero() {
+        Spi::run("SET LOCAL pgl_validate.float_signed_zero_distinct = on").unwrap();
+
+        let negative_digest =
+            Spi::get_one::<Vec<u8>>("SELECT pgl_validate.row_digest(ARRAY[1], '-0'::float8)")
+                .unwrap()
+                .unwrap();
+        let positive_digest =
+            Spi::get_one::<Vec<u8>>("SELECT pgl_validate.row_digest(ARRAY[1], '0'::float8)")
+                .unwrap()
+                .unwrap();
+
+        assert_ne!(negative_digest, positive_digest);
+    }
+
+    #[pg_test]
+    fn row_digest_preserves_json_exact_text_by_default() {
+        let compact_digest = Spi::get_one::<Vec<u8>>(
+            r#"SELECT pgl_validate.row_digest(ARRAY[2], '{"a":1,"b":2}'::json)"#,
+        )
+        .unwrap()
+        .unwrap();
+        let reordered_digest = Spi::get_one::<Vec<u8>>(
+            r#"SELECT pgl_validate.row_digest(ARRAY[2], '{"b":2,"a":1}'::json)"#,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_ne!(compact_digest, reordered_digest);
+    }
+
+    #[pg_test]
+    fn row_digest_can_normalize_json_through_jsonb() {
+        let compact_digest = Spi::get_one::<Vec<u8>>(
+            r#"SELECT pgl_validate.row_digest(ARRAY[3], '{"a":1,"b":2}'::json)"#,
+        )
+        .unwrap()
+        .unwrap();
+        let reordered_digest = Spi::get_one::<Vec<u8>>(
+            r#"SELECT pgl_validate.row_digest(ARRAY[3], '{"b":2,"a":1}'::json)"#,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(compact_digest, reordered_digest);
+    }
+
+    #[pg_test]
+    fn column_encoding_mode_honors_json_normalize() {
+        let default_mode =
+            Spi::get_one::<i32>("SELECT pgl_validate.column_encoding_mode('json'::regtype::oid)")
+                .unwrap()
+                .unwrap();
+        Spi::run("SET LOCAL pgl_validate.json_normalize = on").unwrap();
+        let normalized_mode =
+            Spi::get_one::<i32>("SELECT pgl_validate.column_encoding_mode('json'::regtype::oid)")
+                .unwrap()
+                .unwrap();
+        let jsonb_mode =
+            Spi::get_one::<i32>("SELECT pgl_validate.column_encoding_mode('jsonb'::regtype::oid)")
+                .unwrap()
+                .unwrap();
+
+        assert_eq!(default_mode, 2);
+        assert_eq!(normalized_mode, 3);
+        assert_eq!(jsonb_mode, 1);
+    }
+
+    #[pg_test]
     fn lthash_aggregate_is_order_independent_and_duplicate_sensitive() {
         Spi::run(
             r#"
@@ -231,13 +323,12 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert!(wide_sql.contains(
-            "set_config('pgl_validate.hash_algorithm', 'blake3_512', true)"
-        ));
-        let wide_set_hash_bytes =
-            Spi::get_one::<i32>(&format!("SELECT octet_length(set_hash) FROM ({wide_sql}) AS q"))
-                .unwrap()
-                .unwrap();
+        assert!(wide_sql.contains("set_config('pgl_validate.hash_algorithm', 'blake3_512', true)"));
+        let wide_set_hash_bytes = Spi::get_one::<i32>(&format!(
+            "SELECT octet_length(set_hash) FROM ({wide_sql}) AS q"
+        ))
+        .unwrap()
+        .unwrap();
         assert_eq!(wide_set_hash_bytes, 64);
         Spi::run("SET LOCAL pgl_validate.hash_algorithm = 'blake3_256'").unwrap();
 
@@ -843,14 +934,17 @@ mod tests {
                    (options->>'recheck_passes') || ';' ||
                    (options->>'throttle_max_lag') || ';' ||
                    (options->>'hash_algorithm') || ';' ||
-                   (options->>'split_fanout')
+                   (options->>'split_fanout') || ';' ||
+                   (options->>'json_normalize') || ';' ||
+                   (options->>'float_signed_zero_distinct') || ';' ||
+                   (options->>'float_nan_distinct')
             FROM pgl_validate.run
             WHERE run_id = {guc_run_id}
             "
         ))
         .unwrap()
         .unwrap();
-        assert_eq!(guc_run_options, "2;2;off;blake3_256;3");
+        assert_eq!(guc_run_options, "2;2;off;blake3_256;3;false;false;false");
 
         let override_run_id = Spi::get_one::<i64>(&format!(
             "
@@ -1856,7 +1950,10 @@ mod tests {
         let concurrent_probe = Spi::get_one::<i64>(&concurrent_sql).unwrap().unwrap();
         assert_eq!(concurrent_probe, 2);
 
-        let serial_sql = concurrent_sql.replace("                2\n            )", "                1\n            )");
+        let serial_sql = concurrent_sql.replace(
+            "                2\n            )",
+            "                1\n            )",
+        );
         let serial_probe = Spi::get_one::<i64>(&serial_sql).unwrap().unwrap();
         assert_eq!(serial_probe, 1);
     }
@@ -4172,10 +4269,9 @@ mod tests {
         assert_eq!(changed, "true;true");
         assert_eq!(run_count_after, run_count_before);
 
-        let removed =
-            Spi::get_one::<bool>("SELECT pgl_validate.delete_schedule('nightly')")
-                .unwrap()
-                .unwrap();
+        let removed = Spi::get_one::<bool>("SELECT pgl_validate.delete_schedule('nightly')")
+            .unwrap()
+            .unwrap();
         let exists = Spi::get_one::<bool>(
             "SELECT EXISTS (SELECT 1 FROM pgl_validate.schedule WHERE name = 'nightly')",
         )
@@ -5504,8 +5600,7 @@ mod tests {
                AND (doc->'io'->>'bytes_transferred')::bigint >= 0
             FROM metrics
             "
-        ),
-        )
+        ))
         .unwrap()
         .unwrap();
         assert!(metrics_ok);

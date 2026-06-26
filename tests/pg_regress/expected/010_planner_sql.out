@@ -1,4 +1,5 @@
 \set ON_ERROR_STOP on
+\pset format unaligned
 \pset null '<null>'
 DROP TABLE IF EXISTS public.pgl_validate_regress_plan;
 DROP TABLE IF EXISTS public.pgl_validate_regress_composite;
@@ -24,11 +25,9 @@ SELECT pgl_validate.plan_chunk_sql(
     true,
     'blake3_512'
 ) AS checksum_sql;
-                                                                                                                                                                                                                                                                                                                                          checksum_sql                                                                                                                                                                                                                                                                                                                                           
--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
- WITH pgl_validate_settings AS MATERIALIZED (SELECT set_config('pgl_validate.hash_algorithm', 'blake3_512', true) AS hash_algorithm), digests AS MATERIALIZED (SELECT pgl_validate.row_digest('{2,1,1}'::int[], t.amount, t.id, t.status) AS rd FROM pgl_validate_settings, public.pgl_validate_regress_plan t WHERE (id >= 1) AND t.id >= '2'::integer AND t.id < '10'::integer), aggregate AS (SELECT count(*)::bigint AS n_rows, pgl_validate.lthash_bytes(pgl_validate.lthash(rd)) AS lthash FROM digests) SELECT aggregate.n_rows, aggregate.lthash, (SELECT pgl_validate.hash_digest_array(COALESCE(array_agg(rd ORDER BY rd), ARRAY[]::bytea[])) FROM digests) AS set_hash FROM aggregate
+checksum_sql
+WITH pgl_validate_settings AS MATERIALIZED (SELECT set_config('pgl_validate.hash_algorithm', 'blake3_512', true) AS hash_algorithm, set_config('pgl_validate.json_normalize', 'false', true) AS json_normalize, set_config('pgl_validate.float_signed_zero_distinct', 'false', true) AS float_signed_zero_distinct, set_config('pgl_validate.float_nan_distinct', 'false', true) AS float_nan_distinct, set_config('extra_float_digits', '3', true) AS extra_float_digits, set_config('DateStyle', 'ISO, YMD', true) AS date_style, set_config('IntervalStyle', 'iso_8601', true) AS interval_style, set_config('bytea_output', 'hex', true) AS bytea_output, set_config('TimeZone', 'UTC', true) AS time_zone), digests AS MATERIALIZED (SELECT pgl_validate.row_digest('{2,1,1}'::int[], t.amount, t.id, t.status) AS rd FROM pgl_validate_settings, public.pgl_validate_regress_plan t WHERE (id >= 1) AND t.id >= '2'::integer AND t.id < '10'::integer), aggregate AS (SELECT count(*)::bigint AS n_rows, pgl_validate.lthash_bytes(pgl_validate.lthash(rd)) AS lthash FROM digests) SELECT aggregate.n_rows, aggregate.lthash, (SELECT pgl_validate.hash_digest_array(COALESCE(array_agg(rd ORDER BY rd), ARRAY[]::bytea[])) FROM digests) AS set_hash FROM aggregate
 (1 row)
-
 SELECT string_agg(
            chunk_id::text || ':' ||
            COALESCE(convert_from(lo, 'UTF8')::jsonb->>'id', '<null>') || ':' ||
@@ -43,11 +42,9 @@ FROM pgl_validate.plan_key_ranges(
     NULL,
     2
 );
-      planned_ranges       
----------------------------
- 1:<null>:9:2,2:9:<null>:2
+planned_ranges
+1:<null>:9:2,2:9:<null>:2
 (1 row)
-
 CREATE TABLE public.pgl_validate_regress_composite(
     part int NOT NULL,
     code text NOT NULL,
@@ -66,11 +63,9 @@ SELECT pgl_validate.plan_key_range_predicate(
     convert_to('{"part":1,"code":"b"}', 'UTF8'),
     convert_to('{"part":2,"code":"b"}', 'UTF8')
 ) AS composite_predicate;
-                                      composite_predicate                                       
-------------------------------------------------------------------------------------------------
- (t.part, t.code) >= ('1'::integer, 'b'::text) AND (t.part, t.code) < ('2'::integer, 'b'::text)
+composite_predicate
+(t.part, t.code) >= ('1'::integer, 'b'::text) AND (t.part, t.code) < ('2'::integer, 'b'::text)
 (1 row)
-
 SELECT pgl_validate.plan_localize_sql(
     'public.pgl_validate_regress_composite'::regclass,
     ARRAY['part','code'],
@@ -80,8 +75,6 @@ SELECT pgl_validate.plan_localize_sql(
     NULL,
     'blake3_256'
 ) AS localize_sql;
-                                                                                                                                                                                                                                                                                               localize_sql                                                                                                                                                                                                                                                                                               
-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
- WITH pgl_validate_settings AS MATERIALIZED (SELECT set_config('pgl_validate.hash_algorithm', 'blake3_256', true) AS hash_algorithm) SELECT jsonb_build_object('part', t.part, 'code', t.code)::text AS key_text, pgl_validate.row_digest('{1,1}'::int[], t.part, t.code) AS key_bytes, pgl_validate.row_digest('{1,1,1}'::int[], t.amount, t.code, t.part) AS row_digest, to_jsonb(t)::text AS row_json FROM pgl_validate_settings, public.pgl_validate_regress_composite t WHERE (t.part, t.code) >= ('1'::integer, 'b'::text) AND (t.part, t.code) < ('2'::integer, 'b'::text) ORDER BY t.part, t.code
+localize_sql
+WITH pgl_validate_settings AS MATERIALIZED (SELECT set_config('pgl_validate.hash_algorithm', 'blake3_256', true) AS hash_algorithm, set_config('pgl_validate.json_normalize', 'false', true) AS json_normalize, set_config('pgl_validate.float_signed_zero_distinct', 'false', true) AS float_signed_zero_distinct, set_config('pgl_validate.float_nan_distinct', 'false', true) AS float_nan_distinct, set_config('extra_float_digits', '3', true) AS extra_float_digits, set_config('DateStyle', 'ISO, YMD', true) AS date_style, set_config('IntervalStyle', 'iso_8601', true) AS interval_style, set_config('bytea_output', 'hex', true) AS bytea_output, set_config('TimeZone', 'UTC', true) AS time_zone) SELECT jsonb_build_object('part', t.part, 'code', t.code)::text AS key_text, pgl_validate.row_digest('{1,1}'::int[], t.part, t.code) AS key_bytes, pgl_validate.row_digest('{1,1,1}'::int[], t.amount, t.code, t.part) AS row_digest, to_jsonb(t)::text AS row_json FROM pgl_validate_settings, public.pgl_validate_regress_composite t WHERE (t.part, t.code) >= ('1'::integer, 'b'::text) AND (t.part, t.code) < ('2'::integer, 'b'::text) ORDER BY t.part, t.code
 (1 row)
-

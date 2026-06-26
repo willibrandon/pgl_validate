@@ -69,6 +69,8 @@ COMMENT ON VIEW pgl_validate.worker_tasks IS
 
 COMMENT ON FUNCTION pgl_validate.column_encoding_mode(oid) IS
     'Select the coordinator-pushed row_digest encoding mode for a column type.';
+COMMENT ON FUNCTION pgl_validate.plan_settings_cte(text) IS
+    'Build the generated-SQL CTE that pins digest-affecting GUCs on a participant session.';
 COMMENT ON FUNCTION pgl_validate.comparison_key_cols(regclass) IS
     'Select the replica-identity, primary-key, or safe unique-index columns used for row-level divergence localization.';
 COMMENT ON FUNCTION pgl_validate.pglogical_table_contract(regclass, text[], name) IS

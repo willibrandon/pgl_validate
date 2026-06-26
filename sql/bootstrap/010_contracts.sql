@@ -8,6 +8,8 @@ LANGUAGE sql
 STABLE
 AS $$
     SELECT CASE
+        WHEN type_oid = 'json'::regtype::oid
+         AND COALESCE(NULLIF(current_setting('pgl_validate.json_normalize', true), '')::boolean, false) THEN 3
         WHEN type_oid IN ('json'::regtype::oid, 'numeric'::regtype::oid) THEN 2
         WHEN t.typsend = 0 THEN 2
         ELSE 1

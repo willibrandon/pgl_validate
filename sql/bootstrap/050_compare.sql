@@ -557,6 +557,21 @@ DECLARE
         NULLIF(current_setting('pgl_validate.hash_algorithm', true), ''),
         'blake3_256'
     );
+    json_normalize boolean := COALESCE(
+        (NULLIF(options->>'json_normalize', ''))::boolean,
+        NULLIF(current_setting('pgl_validate.json_normalize', true), '')::boolean,
+        false
+    );
+    float_signed_zero_distinct boolean := COALESCE(
+        (NULLIF(options->>'float_signed_zero_distinct', ''))::boolean,
+        NULLIF(current_setting('pgl_validate.float_signed_zero_distinct', true), '')::boolean,
+        false
+    );
+    float_nan_distinct boolean := COALESCE(
+        (NULLIF(options->>'float_nan_distinct', ''))::boolean,
+        NULLIF(current_setting('pgl_validate.float_nan_distinct', true), '')::boolean,
+        false
+    );
     chunk_target_rows int := COALESCE(
         (NULLIF(options->>'chunk_target_rows', ''))::int,
         NULLIF(current_setting('pgl_validate.chunk_target_rows', true), '')::int,
@@ -687,6 +702,9 @@ BEGIN
             USING ERRCODE = '0A000';
     END IF;
     PERFORM set_config('pgl_validate.hash_algorithm', hash_algorithm, true);
+    PERFORM set_config('pgl_validate.json_normalize', json_normalize::text, true);
+    PERFORM set_config('pgl_validate.float_signed_zero_distinct', float_signed_zero_distinct::text, true);
+    PERFORM set_config('pgl_validate.float_nan_distinct', float_nan_distinct::text, true);
     stored_options := (COALESCE(options, '{}'::jsonb) - '_pgl_validate_parent_run_id')
         || jsonb_build_object(
             'allow_approximate_filters', allow_approximate_filters,
@@ -698,7 +716,10 @@ BEGIN
             'chunk_target_rows', chunk_target_rows,
             'fence_poll_interval_ms', fence_poll_interval_ms,
             'fence_timeout_ms', fence_timeout_ms,
+            'float_nan_distinct', float_nan_distinct,
+            'float_signed_zero_distinct', float_signed_zero_distinct,
             'hash_algorithm', hash_algorithm,
+            'json_normalize', json_normalize,
             'localize_threshold', localize_threshold,
             'max_parallel_chunks', max_parallel_chunks,
             'max_reported_divergences', max_reported_divergences,
