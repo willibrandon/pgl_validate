@@ -2516,6 +2516,21 @@ BEGIN
         has_row_filter, sync_status, validated_property
     );
 
+    IF current_setting('track_commit_timestamp', true) = 'off' THEN
+        INSERT INTO pgl_validate.schema_issue(
+            run_id, node, schema_name, table_name, issue_code, detail
+        )
+        VALUES (
+            v_run_id,
+            provider_node,
+            v_schema_name,
+            v_rel_name,
+            'NO_COMMIT_TS',
+            'track_commit_timestamp is off; validation remains sound, but origin-attribution diagnostics and last-update-wins repair are unavailable'
+        )
+        ON CONFLICT DO NOTHING;
+    END IF;
+
     approximate_filter_mode :=
         NOT exact_comparable
         AND has_row_filter

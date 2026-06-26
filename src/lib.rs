@@ -1241,6 +1241,52 @@ mod tests {
     }
 
     #[pg_test]
+    fn compare_table_records_commit_timestamp_advisory_when_disabled() {
+        Spi::run(
+            "
+            CREATE TEMP TABLE commit_ts_advisory_target(
+                id int PRIMARY KEY,
+                value text
+            );
+            INSERT INTO commit_ts_advisory_target VALUES (1, 'same');
+            ",
+        )
+        .unwrap();
+
+        let setting = Spi::get_one::<String>("SHOW track_commit_timestamp")
+            .unwrap()
+            .unwrap();
+        let run_id = Spi::get_one::<i64>(
+            "SELECT (pgl_validate.compare_table('commit_ts_advisory_target'::regclass)).run_id",
+        )
+        .unwrap()
+        .unwrap();
+
+        let advisory_count = Spi::get_one::<i64>(&format!(
+            "
+            SELECT count(*)
+            FROM pgl_validate.schema_issue
+            WHERE run_id = {run_id}
+              AND issue_code = 'NO_COMMIT_TS'
+            "
+        ))
+        .unwrap()
+        .unwrap();
+        if setting == "off" {
+            assert_eq!(advisory_count, 1);
+        } else {
+            assert_eq!(advisory_count, 0);
+        }
+
+        let verdict = Spi::get_one::<String>(&format!(
+            "SELECT verdict FROM pgl_validate.table_result WHERE run_id = {run_id}"
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(verdict, "match");
+    }
+
+    #[pg_test]
     fn compare_table_persists_planned_key_range_chunks() {
         Spi::run(
             r#"
@@ -3761,6 +3807,7 @@ mod tests {
              AND si.schema_name = tr.schema_name
              AND si.table_name = tr.table_name
             WHERE tr.run_id = {run_id}
+              AND si.issue_code = 'NONDETERMINISTIC_ROW_FILTER'
             "
         ))
         .unwrap()
@@ -3796,6 +3843,7 @@ mod tests {
              AND tnr.table_name = tr.table_name
              AND tnr.node = 'local'
             WHERE tr.run_id = {approx_run_id}
+              AND si.issue_code = 'NONDETERMINISTIC_ROW_FILTER'
             "
         ))
         .unwrap()
