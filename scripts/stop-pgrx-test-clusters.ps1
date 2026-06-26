@@ -122,7 +122,7 @@ function Stop-DataDirectoryCluster {
 }
 
 function Get-RepoClusterDataDirectories {
-    $known = $configuredTargets | Where-Object { Test-Path -LiteralPath $_ }
+    $known = @($configuredTargets | Where-Object { Test-Path -LiteralPath $_ })
 
     $targetRoot = Join-Path $workspace 'target'
     $discovered = @()
@@ -136,7 +136,11 @@ function Get-RepoClusterDataDirectories {
             }
     }
 
-    @($known + $discovered) |
+    $allTargets = @()
+    $allTargets += @($known)
+    $allTargets += @($discovered)
+
+    $allTargets |
         Where-Object { $_ } |
         ForEach-Object { Assert-WorkspaceTargetPath -Path $_ } |
         Sort-Object -Unique
@@ -173,10 +177,15 @@ foreach ($proc in $procs) {
 Start-Sleep -Milliseconds 500
 
 if ($RemoveData) {
-    $removalTargets = @($configuredTargets + $targets) |
+    $removalCandidates = @()
+    $removalCandidates += @($configuredTargets)
+    $removalCandidates += @($targets)
+
+    $removalTargets = $removalCandidates |
         Where-Object { Test-Path -LiteralPath $_ } |
         ForEach-Object { Assert-WorkspaceTargetPath -Path $_ } |
-        Sort-Object -Unique
+        Sort-Object -Unique |
+        Sort-Object Length
 
     foreach ($target in $removalTargets) {
         if (Test-Path -LiteralPath $target) {
