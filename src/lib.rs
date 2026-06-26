@@ -41,9 +41,14 @@ extension_sql_file!(
     requires = ["bootstrap_fencing"]
 );
 extension_sql_file!(
+    "../sql/bootstrap/036_re_fence.sql",
+    name = "bootstrap_re_fence",
+    requires = ["bootstrap_throttle"]
+);
+extension_sql_file!(
     "../sql/bootstrap/040_planning.sql",
     name = "bootstrap_planning",
-    requires = ["bootstrap_throttle"]
+    requires = ["bootstrap_re_fence"]
 );
 extension_sql_file!(
     "../sql/bootstrap/050_compare.sql",
@@ -223,7 +228,7 @@ pub extern "C-unwind" fn _PG_init() {
     GucRegistry::define_string_guc(
         c"pgl_validate.max_snapshot_age",
         c"Maximum validation snapshot age.",
-        c"Design knob for refencing long-running table validation snapshots to bound vacuum impact.",
+        c"Re-fence the selected edge vector before starting another chunk when the current convergence epoch is older than this interval.",
         &MAX_SNAPSHOT_AGE,
         GucContext::Userset,
         flags,

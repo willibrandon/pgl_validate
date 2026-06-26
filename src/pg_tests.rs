@@ -1566,6 +1566,77 @@ mod tests {
     }
 
     #[pg_test]
+    fn re_fence_run_edges_noops_empty_vector_and_requires_known_peers() {
+        Spi::run(
+            "
+            DO $pgl_validate_re_fence$
+            DECLARE
+                v_run_id bigint;
+                v_re_fenced int;
+            BEGIN
+                INSERT INTO pgl_validate.run(status)
+                VALUES ('fencing')
+                RETURNING run_id INTO v_run_id;
+
+                SELECT pgl_validate.re_fence_run_edges(
+                    v_run_id,
+                    1,
+                    'local',
+                    NULL,
+                    ARRAY[]::int[],
+                    1,
+                    1
+                )
+                INTO v_re_fenced;
+
+                IF v_re_fenced <> 0 THEN
+                    RAISE EXCEPTION 'expected empty edge vector to re-fence zero edges, got %', v_re_fenced;
+                END IF;
+
+                IF NOT EXISTS (
+                    SELECT 1
+                    FROM pgl_validate.fence_epoch
+                    WHERE run_id = v_run_id
+                      AND epoch_seq = 1
+                ) THEN
+                    RAISE EXCEPTION 'empty re-fence did not persist its epoch';
+                END IF;
+
+                INSERT INTO pgl_validate.run_edge(
+                    run_id, edge_id, provider_node, target_node, backend,
+                    subscription, slot_name, origin_name, repsets
+                )
+                VALUES (
+                    v_run_id, 1, 'local', 'missing_peer', 'native',
+                    'sub', 'slot', 'origin', ARRAY['pgl_validate_barrier']
+                );
+
+                BEGIN
+                    PERFORM pgl_validate.re_fence_run_edges(
+                        v_run_id,
+                        2,
+                        'local',
+                        'dbname=' || current_database(),
+                        ARRAY[1],
+                        1,
+                        1
+                    );
+                EXCEPTION WHEN others THEN
+                    IF SQLERRM = 'cannot re-fence edge 1, target peer missing_peer was not found' THEN
+                        RETURN;
+                    END IF;
+                    RAISE;
+                END;
+
+                RAISE EXCEPTION 'expected re_fence_run_edges to reject an unknown target peer';
+            END
+            $pgl_validate_re_fence$;
+            ",
+        )
+        .unwrap();
+    }
+
+    #[pg_test]
     fn remote_observe_barrier_reports_origin_progress_and_token_visibility() {
         let dsn = local_dsn();
         let backend_pid = Spi::get_one::<i32>("SELECT pg_backend_pid()")

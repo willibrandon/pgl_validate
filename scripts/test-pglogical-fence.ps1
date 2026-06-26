@@ -499,6 +499,56 @@ SELECT EXISTS (
         throw 'compare_table did not record a converged fence'
     }
 
+    Write-Step 'Re-fencing the recorded pglogical edge vector'
+    Invoke-Sql -Database 'provider' -Sql @"
+DO `$pgl_validate_re_fence`$
+DECLARE
+    v_run_id bigint;
+    v_epoch int;
+    v_edges int;
+BEGIN
+    SELECT tr.run_id
+    INTO v_run_id
+    FROM pgl_validate.table_result tr
+    WHERE tr.schema_name = 'public'
+      AND tr.table_name = 'accounts'
+      AND tr.verdict = 'match'
+    ORDER BY tr.run_id DESC
+    LIMIT 1;
+
+    SELECT COALESCE(max(fe.epoch_seq), 0) + 1
+    INTO v_epoch
+    FROM pgl_validate.fence_epoch fe
+    WHERE fe.run_id = v_run_id;
+
+    SELECT pgl_validate.re_fence_run_edges(
+        v_run_id,
+        v_epoch,
+        'provider',
+        $providerDsnSql,
+        NULL,
+        30000,
+        100
+    )
+    INTO v_edges;
+
+    IF v_edges <> 1 THEN
+        RAISE EXCEPTION 'expected one pglogical edge to be re-fenced, got %', v_edges;
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pgl_validate.fence_attempt fa
+        WHERE fa.run_id = v_run_id
+          AND fa.epoch_seq = v_epoch
+          AND fa.status = 'converged'
+    ) THEN
+        RAISE EXCEPTION 're-fenced pglogical edge did not converge';
+    END IF;
+END
+`$pgl_validate_re_fence`$;
+"@ | Out-Null
+
     Write-Step 'Validating bidirectional pglogical fence vector'
     Invoke-Sql -Database 'target' -Sql 'SELECT pgl_validate.ensure_pglogical_barrier_repset()' | Out-Null
     Invoke-Sql -Database 'provider' -Sql @"

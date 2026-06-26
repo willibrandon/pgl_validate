@@ -308,8 +308,11 @@ DECLARE
     parent_run_id bigint := NULLIF(options->>'_pgl_validate_parent_run_id', '')::bigint;
     append_to_parent boolean := false;
     initial_epoch int := 1;
+    current_epoch int := 1;
     recheck_epoch int := 2;
     recheck_pass int;
+    last_re_fence_at timestamptz;
+    re_fenced_edges int;
     previous_sample text := 'A';
     current_sample text;
     v_schema_name text;
@@ -814,6 +817,7 @@ BEGIN
             || stored_options
         WHERE pgl_validate.run.run_id = v_run_id;
     END IF;
+    current_epoch := initial_epoch;
 
     INSERT INTO pgl_validate.run_participant(run_id, node, role, backend, pg_version, status)
     VALUES (v_run_id, 'local', 'coordinator', requested_backend, current_setting('server_version_num')::int, 'connected')
@@ -2022,6 +2026,7 @@ BEGIN
             RETURN result_row;
         END IF;
     END IF;
+    last_re_fence_at := clock_timestamp();
 
     PERFORM pgl_validate.throttle_replication_lag(
         v_run_id,
@@ -2223,6 +2228,43 @@ BEGIN
             child_chunk_id := range_rec.chunk_id + 1;
             chunk_differ_count := 0;
 
+            IF COALESCE(cardinality(current_edge_ids), 0) > 0
+               AND clock_timestamp() - last_re_fence_at >= max_snapshot_age THEN
+                SELECT COALESCE(max(fe.epoch_seq), 0) + 1
+                INTO current_epoch
+                FROM pgl_validate.fence_epoch fe
+                WHERE fe.run_id = v_run_id;
+
+                UPDATE pgl_validate.run
+                SET status = 'fencing'
+                WHERE pgl_validate.run.run_id = v_run_id;
+
+                SELECT pgl_validate.re_fence_run_edges(
+                    v_run_id,
+                    current_epoch,
+                    provider_node,
+                    provider_dsn,
+                    current_edge_ids,
+                    fence_timeout_ms,
+                    fence_poll_interval_ms
+                )
+                INTO re_fenced_edges;
+
+                IF re_fenced_edges <> cardinality(current_edge_ids) THEN
+                    RAISE EXCEPTION
+                        'expected to re-fence % edge(s), got %',
+                        cardinality(current_edge_ids),
+                        re_fenced_edges
+                        USING ERRCODE = '57014';
+                END IF;
+
+                last_re_fence_at := clock_timestamp();
+
+                UPDATE pgl_validate.run
+                SET status = 'running'
+                WHERE pgl_validate.run.run_id = v_run_id;
+            END IF;
+
             PERFORM pgl_validate.throttle_replication_lag(
                 v_run_id,
                 v_schema_name,
@@ -2398,6 +2440,43 @@ BEGIN
             ) localized_ranges
             ORDER BY chunk_id
         LOOP
+            IF COALESCE(cardinality(current_edge_ids), 0) > 0
+               AND clock_timestamp() - last_re_fence_at >= max_snapshot_age THEN
+                SELECT COALESCE(max(fe.epoch_seq), 0) + 1
+                INTO current_epoch
+                FROM pgl_validate.fence_epoch fe
+                WHERE fe.run_id = v_run_id;
+
+                UPDATE pgl_validate.run
+                SET status = 'fencing'
+                WHERE pgl_validate.run.run_id = v_run_id;
+
+                SELECT pgl_validate.re_fence_run_edges(
+                    v_run_id,
+                    current_epoch,
+                    provider_node,
+                    provider_dsn,
+                    current_edge_ids,
+                    fence_timeout_ms,
+                    fence_poll_interval_ms
+                )
+                INTO re_fenced_edges;
+
+                IF re_fenced_edges <> cardinality(current_edge_ids) THEN
+                    RAISE EXCEPTION
+                        'expected to re-fence % edge(s), got %',
+                        cardinality(current_edge_ids),
+                        re_fenced_edges
+                        USING ERRCODE = '57014';
+                END IF;
+
+                last_re_fence_at := clock_timestamp();
+
+                UPDATE pgl_validate.run
+                SET status = 'running'
+                WHERE pgl_validate.run.run_id = v_run_id;
+            END IF;
+
             PERFORM pgl_validate.throttle_replication_lag(
                 v_run_id,
                 v_schema_name,
@@ -2468,6 +2547,43 @@ BEGIN
                 ) localized_ranges
                 ORDER BY chunk_id
             LOOP
+                IF COALESCE(cardinality(current_edge_ids), 0) > 0
+                   AND clock_timestamp() - last_re_fence_at >= max_snapshot_age THEN
+                    SELECT COALESCE(max(fe.epoch_seq), 0) + 1
+                    INTO current_epoch
+                    FROM pgl_validate.fence_epoch fe
+                    WHERE fe.run_id = v_run_id;
+
+                    UPDATE pgl_validate.run
+                    SET status = 'fencing'
+                    WHERE pgl_validate.run.run_id = v_run_id;
+
+                    SELECT pgl_validate.re_fence_run_edges(
+                        v_run_id,
+                        current_epoch,
+                        provider_node,
+                        provider_dsn,
+                        current_edge_ids,
+                        fence_timeout_ms,
+                        fence_poll_interval_ms
+                    )
+                    INTO re_fenced_edges;
+
+                    IF re_fenced_edges <> cardinality(current_edge_ids) THEN
+                        RAISE EXCEPTION
+                            'expected to re-fence % edge(s), got %',
+                            cardinality(current_edge_ids),
+                            re_fenced_edges
+                            USING ERRCODE = '57014';
+                    END IF;
+
+                    last_re_fence_at := clock_timestamp();
+
+                    UPDATE pgl_validate.run
+                    SET status = 'running'
+                    WHERE pgl_validate.run.run_id = v_run_id;
+                END IF;
+
                 PERFORM pgl_validate.throttle_replication_lag(
                     v_run_id,
                     v_schema_name,
@@ -2557,7 +2673,7 @@ BEGIN
                         THEN 'advisory'
                         ELSE 'candidate'
                     END,
-                    initial_epoch,
+                    current_epoch,
                     jsonb_build_object(
                         'local', pgl_validate.reported_tuple_json(
                             n.local_row_json,
@@ -2627,7 +2743,11 @@ BEGIN
                   )
             );
 
-            recheck_epoch := initial_epoch + recheck_pass;
+            SELECT COALESCE(max(fe.epoch_seq), 0) + 1
+            INTO recheck_epoch
+            FROM pgl_validate.fence_epoch fe
+            WHERE fe.run_id = v_run_id;
+            current_epoch := recheck_epoch;
             current_sample := format('R%s', recheck_pass);
 
             INSERT INTO pgl_validate.fence_epoch(run_id, epoch_seq)
@@ -2824,6 +2944,7 @@ BEGIN
                         USING ERRCODE = '57014';
                 END IF;
             END LOOP;
+            last_re_fence_at := clock_timestamp();
 
             DELETE FROM pg_temp.pgl_validate_localized_sample
             WHERE sample = current_sample;

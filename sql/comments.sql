@@ -216,6 +216,8 @@ COMMENT ON FUNCTION pgl_validate.remote_pglogical_conflict_history(text, text, t
     'Fetch pglogical conflict-history rows for one remote subscription and relation, returning typed text fields for catalog-side casting.';
 COMMENT ON FUNCTION pgl_validate.throttle_replication_lag(bigint, text, text, text, text, int[], interval, integer, integer) IS
     'Pause a run while any exact logical or standby edge in the current edge vector exceeds the configured replication-lag threshold.';
+COMMENT ON FUNCTION pgl_validate.re_fence_run_edges(bigint, integer, text, text, int[], integer, integer) IS
+    'Re-fence the selected edge vector for an existing run and epoch without rediscovering topology.';
 COMMENT ON TYPE pgl_validate.lthash_state IS
     'Internal varlena state for the LtHash multiset accumulator.';
 COMMENT ON FUNCTION pgl_validate.lthash_state_in(cstring) IS
