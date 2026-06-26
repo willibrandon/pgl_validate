@@ -385,21 +385,54 @@ DECLARE
         NULLIF(current_setting('pgl_validate.paranoid_confirm_max_rows', true), '')::int,
         1000
     );
+    hash_algorithm text := COALESCE(
+        NULLIF(options->>'hash_algorithm', ''),
+        NULLIF(current_setting('pgl_validate.hash_algorithm', true), ''),
+        'blake3_256'
+    );
     chunk_target_rows int := COALESCE(
         (NULLIF(options->>'chunk_target_rows', ''))::int,
         NULLIF(current_setting('pgl_validate.chunk_target_rows', true), '')::int,
         50000
+    );
+    chunk_max_duration interval := COALESCE(
+        (NULLIF(options->>'chunk_max_duration', ''))::interval,
+        (NULLIF(current_setting('pgl_validate.chunk_max_duration', true), ''))::interval,
+        interval '2 seconds'
     );
     localize_threshold int := COALESCE(
         (NULLIF(options->>'localize_threshold', ''))::int,
         NULLIF(current_setting('pgl_validate.localize_threshold', true), '')::int,
         1000
     );
+    max_parallel_chunks int := COALESCE(
+        (NULLIF(options->>'max_parallel_chunks', ''))::int,
+        NULLIF(current_setting('pgl_validate.max_parallel_chunks', true), '')::int,
+        4
+    );
     recheck_passes int := COALESCE(
         (NULLIF(options->>'recheck_passes', ''))::int,
         NULLIF(current_setting('pgl_validate.recheck_passes', true), '')::int,
         3
     );
+    max_snapshot_age interval := COALESCE(
+        (NULLIF(options->>'max_snapshot_age', ''))::interval,
+        (NULLIF(current_setting('pgl_validate.max_snapshot_age', true), ''))::interval,
+        interval '5 minutes'
+    );
+    statement_timeout_per_chunk interval := COALESCE(
+        (NULLIF(options->>'statement_timeout_per_chunk', ''))::interval,
+        (NULLIF(current_setting('pgl_validate.statement_timeout_per_chunk', true), ''))::interval,
+        interval '30 seconds'
+    );
+    statement_timeout_per_chunk_ms int;
+    previous_statement_timeout text;
+    throttle_max_lag_setting text := COALESCE(
+        NULLIF(options->>'throttle_max_lag', ''),
+        NULLIF(current_setting('pgl_validate.throttle_max_lag', true), ''),
+        'off'
+    );
+    throttle_max_lag interval;
     correlate_conflict_history boolean := COALESCE(
         (NULLIF(options->>'correlate_conflict_history', ''))::boolean,
         NULLIF(current_setting('pgl_validate.correlate_conflict_history', true), '')::boolean,
@@ -470,14 +503,42 @@ BEGIN
     IF paranoid_confirm_max_rows <= 0 THEN
         RAISE EXCEPTION 'paranoid_confirm_max_rows must be greater than zero';
     END IF;
+    IF hash_algorithm <> 'blake3_256' THEN
+        RAISE EXCEPTION 'hash_algorithm % is not implemented; only blake3_256 is currently available', hash_algorithm
+            USING ERRCODE = '0A000';
+    END IF;
     IF chunk_target_rows <= 0 THEN
         RAISE EXCEPTION 'chunk_target_rows must be greater than zero';
+    END IF;
+    IF chunk_max_duration <= interval '0' THEN
+        RAISE EXCEPTION 'chunk_max_duration must be greater than zero';
     END IF;
     IF localize_threshold <= 0 THEN
         RAISE EXCEPTION 'localize_threshold must be greater than zero';
     END IF;
+    IF max_parallel_chunks <= 0 THEN
+        RAISE EXCEPTION 'max_parallel_chunks must be greater than zero';
+    END IF;
     IF recheck_passes <= 0 THEN
         RAISE EXCEPTION 'recheck_passes must be greater than zero';
+    END IF;
+    IF max_snapshot_age <= interval '0' THEN
+        RAISE EXCEPTION 'max_snapshot_age must be greater than zero';
+    END IF;
+    IF statement_timeout_per_chunk <= interval '0' THEN
+        RAISE EXCEPTION 'statement_timeout_per_chunk must be greater than zero';
+    END IF;
+    statement_timeout_per_chunk_ms := ceil(extract(epoch FROM statement_timeout_per_chunk) * 1000)::int;
+    IF statement_timeout_per_chunk_ms <= 0 THEN
+        RAISE EXCEPTION 'statement_timeout_per_chunk must be at least one millisecond';
+    END IF;
+    IF lower(throttle_max_lag_setting) = 'off' THEN
+        throttle_max_lag := NULL;
+    ELSE
+        throttle_max_lag := throttle_max_lag_setting::interval;
+        IF throttle_max_lag <= interval '0' THEN
+            RAISE EXCEPTION 'throttle_max_lag must be greater than zero or off';
+        END IF;
     END IF;
 
     IF peers IS NULL OR cardinality(peers) = 0 THEN
@@ -746,7 +807,15 @@ BEGIN
             );
         END IF;
 
-        EXECUTE checksum_sql INTO n_rows, lthash, set_hash;
+        previous_statement_timeout := current_setting('statement_timeout');
+        PERFORM set_config('statement_timeout', statement_timeout_per_chunk_ms::text, true);
+        BEGIN
+            EXECUTE checksum_sql INTO n_rows, lthash, set_hash;
+        EXCEPTION WHEN others THEN
+            PERFORM set_config('statement_timeout', previous_statement_timeout, true);
+            RAISE;
+        END;
+        PERFORM set_config('statement_timeout', previous_statement_timeout, true);
 
         INSERT INTO pgl_validate.table_node_result(
             run_id, schema_name, table_name, node, n_rows, lthash, set_hash
@@ -781,7 +850,7 @@ BEGIN
                 peer_rec.dsn,
                 remote_checksum_sql,
                 peer_rec.connect_timeout_seconds,
-                peer_rec.statement_timeout_ms,
+                LEAST(peer_rec.statement_timeout_ms, statement_timeout_per_chunk_ms),
                 peer_rec.lock_timeout_ms
             ) AS rc;
 
@@ -1898,7 +1967,15 @@ BEGIN
         NULL,
         false
     );
-    EXECUTE checksum_sql INTO n_rows, lthash, set_hash;
+    previous_statement_timeout := current_setting('statement_timeout');
+    PERFORM set_config('statement_timeout', statement_timeout_per_chunk_ms::text, true);
+    BEGIN
+        EXECUTE checksum_sql INTO n_rows, lthash, set_hash;
+    EXCEPTION WHEN others THEN
+        PERFORM set_config('statement_timeout', previous_statement_timeout, true);
+        RAISE;
+    END;
+    PERFORM set_config('statement_timeout', previous_statement_timeout, true);
 
     IF paranoid_confirm AND n_rows <= paranoid_confirm_max_rows THEN
         checksum_sql := pgl_validate.plan_chunk_sql(
@@ -1911,7 +1988,15 @@ BEGIN
             row_filter_sql,
             true
         );
-        EXECUTE checksum_sql INTO n_rows, lthash, set_hash;
+        previous_statement_timeout := current_setting('statement_timeout');
+        PERFORM set_config('statement_timeout', statement_timeout_per_chunk_ms::text, true);
+        BEGIN
+            EXECUTE checksum_sql INTO n_rows, lthash, set_hash;
+        EXCEPTION WHEN others THEN
+            PERFORM set_config('statement_timeout', previous_statement_timeout, true);
+            RAISE;
+        END;
+        PERFORM set_config('statement_timeout', previous_statement_timeout, true);
     END IF;
 
     INSERT INTO pgl_validate.table_node_result(
@@ -1934,7 +2019,7 @@ BEGIN
             peer_rec.dsn,
             remote_checksum_sql,
             peer_rec.connect_timeout_seconds,
-            peer_rec.statement_timeout_ms,
+            LEAST(peer_rec.statement_timeout_ms, statement_timeout_per_chunk_ms),
             peer_rec.lock_timeout_ms
         ) AS rc;
 
@@ -1958,7 +2043,7 @@ BEGIN
                 peer_rec.dsn,
                 remote_set_hash_sql,
                 peer_rec.connect_timeout_seconds,
-                peer_rec.statement_timeout_ms,
+                LEAST(peer_rec.statement_timeout_ms, statement_timeout_per_chunk_ms),
                 peer_rec.lock_timeout_ms
             ) AS rc;
         END IF;
@@ -2077,7 +2162,15 @@ BEGIN
                 row_filter_sql,
                 paranoid_confirm
             );
-            EXECUTE checksum_sql INTO chunk_n_rows, chunk_lthash, chunk_set_hash;
+            previous_statement_timeout := current_setting('statement_timeout');
+            PERFORM set_config('statement_timeout', statement_timeout_per_chunk_ms::text, true);
+            BEGIN
+                EXECUTE checksum_sql INTO chunk_n_rows, chunk_lthash, chunk_set_hash;
+            EXCEPTION WHEN others THEN
+                PERFORM set_config('statement_timeout', previous_statement_timeout, true);
+                RAISE;
+            END;
+            PERFORM set_config('statement_timeout', previous_statement_timeout, true);
 
             INSERT INTO pgl_validate.chunk_node_result(
                 run_id, schema_name, table_name, chunk_id, node, n_rows, lthash
@@ -2121,7 +2214,7 @@ BEGIN
                     peer_rec.dsn,
                     remote_checksum_sql,
                     peer_rec.connect_timeout_seconds,
-                    peer_rec.statement_timeout_ms,
+                    LEAST(peer_rec.statement_timeout_ms, statement_timeout_per_chunk_ms),
                     peer_rec.lock_timeout_ms
                 ) AS rc;
 
@@ -2210,13 +2303,21 @@ BEGIN
                 row_filter_sql
             );
 
-            EXECUTE format(
-                'INSERT INTO pg_temp.pgl_validate_localized_sample(sample, node, key_text, key_bytes, row_digest, row_json)
-                 SELECT %L, %L, q.key_text, q.key_bytes, q.row_digest, q.row_json::jsonb FROM (%s) AS q',
-                'A',
-                'local',
-                localize_sql
-            );
+            previous_statement_timeout := current_setting('statement_timeout');
+            PERFORM set_config('statement_timeout', statement_timeout_per_chunk_ms::text, true);
+            BEGIN
+                EXECUTE format(
+                    'INSERT INTO pg_temp.pgl_validate_localized_sample(sample, node, key_text, key_bytes, row_digest, row_json)
+                     SELECT %L, %L, q.key_text, q.key_bytes, q.row_digest, q.row_json::jsonb FROM (%s) AS q',
+                    'A',
+                    'local',
+                    localize_sql
+                );
+            EXCEPTION WHEN others THEN
+                PERFORM set_config('statement_timeout', previous_statement_timeout, true);
+                RAISE;
+            END;
+            PERFORM set_config('statement_timeout', previous_statement_timeout, true);
         END LOOP;
 
         FOR peer_rec IN
@@ -2268,7 +2369,7 @@ BEGIN
                     peer_rec.dsn,
                     remote_localize_sql,
                     peer_rec.connect_timeout_seconds,
-                    peer_rec.statement_timeout_ms,
+                    LEAST(peer_rec.statement_timeout_ms, statement_timeout_per_chunk_ms),
                     peer_rec.lock_timeout_ms
                 ) AS r;
             END LOOP;
@@ -2588,13 +2689,21 @@ BEGIN
                     row_filter_sql
                 );
 
-                EXECUTE format(
-                    'INSERT INTO pg_temp.pgl_validate_localized_sample(sample, node, key_text, key_bytes, row_digest, row_json)
-                     SELECT %L, %L, q.key_text, q.key_bytes, q.row_digest, q.row_json::jsonb FROM (%s) AS q',
-                    current_sample,
-                    'local',
-                    localize_sql
-                );
+                previous_statement_timeout := current_setting('statement_timeout');
+                PERFORM set_config('statement_timeout', statement_timeout_per_chunk_ms::text, true);
+                BEGIN
+                    EXECUTE format(
+                        'INSERT INTO pg_temp.pgl_validate_localized_sample(sample, node, key_text, key_bytes, row_digest, row_json)
+                         SELECT %L, %L, q.key_text, q.key_bytes, q.row_digest, q.row_json::jsonb FROM (%s) AS q',
+                        current_sample,
+                        'local',
+                        localize_sql
+                    );
+                EXCEPTION WHEN others THEN
+                    PERFORM set_config('statement_timeout', previous_statement_timeout, true);
+                    RAISE;
+                END;
+                PERFORM set_config('statement_timeout', previous_statement_timeout, true);
             END LOOP;
 
             FOR peer_rec IN
@@ -2657,7 +2766,7 @@ BEGIN
                         peer_rec.dsn,
                         remote_localize_sql,
                         peer_rec.connect_timeout_seconds,
-                        peer_rec.statement_timeout_ms,
+                        LEAST(peer_rec.statement_timeout_ms, statement_timeout_per_chunk_ms),
                         peer_rec.lock_timeout_ms
                     ) AS r;
                 END LOOP;

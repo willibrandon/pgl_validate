@@ -532,6 +532,12 @@ mod tests {
             "
             SET LOCAL pgl_validate.chunk_target_rows = 2;
             SET LOCAL pgl_validate.recheck_passes = 2;
+            SET LOCAL pgl_validate.hash_algorithm = 'blake3_256';
+            SET LOCAL pgl_validate.chunk_max_duration = '2s';
+            SET LOCAL pgl_validate.max_parallel_chunks = 4;
+            SET LOCAL pgl_validate.max_snapshot_age = '5min';
+            SET LOCAL pgl_validate.statement_timeout_per_chunk = '30s';
+            SET LOCAL pgl_validate.throttle_max_lag = 'off';
             SET LOCAL pgl_validate.sequence_buffer_multiplier = 1;
             DELETE FROM pgl_validate.peer;
             CREATE TABLE public.{table_name}(id int PRIMARY KEY, value text);
@@ -595,6 +601,15 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(recheck_setting, "2");
+        let statement_timeout_setting =
+            Spi::get_one::<String>("SHOW pgl_validate.statement_timeout_per_chunk")
+                .unwrap()
+                .unwrap();
+        assert_eq!(statement_timeout_setting, "30s");
+        let throttle_lag_setting = Spi::get_one::<String>("SHOW pgl_validate.throttle_max_lag")
+            .unwrap()
+            .unwrap();
+        assert_eq!(throttle_lag_setting, "off");
 
         Spi::run(&format!(
             r#"
@@ -618,6 +633,63 @@ mod tests {
 
                 IF NOT rejected THEN
                     RAISE EXCEPTION 'expected compare_table to reject recheck_passes=0';
+                END IF;
+
+                rejected := false;
+                BEGIN
+                    PERFORM pgl_validate.compare_table(
+                        'public.{table_name}'::regclass,
+                        ARRAY['remote_guc'],
+                        '{{"hash_algorithm":"sha256_256"}}'::jsonb
+                    );
+                EXCEPTION WHEN others THEN
+                    IF SQLERRM LIKE 'hash_algorithm sha256_256 is not implemented%' THEN
+                        rejected := true;
+                    ELSE
+                        RAISE;
+                    END IF;
+                END;
+
+                IF NOT rejected THEN
+                    RAISE EXCEPTION 'expected compare_table to reject unsupported hash_algorithm';
+                END IF;
+
+                rejected := false;
+                BEGIN
+                    PERFORM pgl_validate.compare_table(
+                        'public.{table_name}'::regclass,
+                        ARRAY['remote_guc'],
+                        '{{"statement_timeout_per_chunk":"0s"}}'::jsonb
+                    );
+                EXCEPTION WHEN others THEN
+                    IF SQLERRM = 'statement_timeout_per_chunk must be greater than zero' THEN
+                        rejected := true;
+                    ELSE
+                        RAISE;
+                    END IF;
+                END;
+
+                IF NOT rejected THEN
+                    RAISE EXCEPTION 'expected compare_table to reject statement_timeout_per_chunk=0s';
+                END IF;
+
+                rejected := false;
+                BEGIN
+                    PERFORM pgl_validate.compare_table(
+                        'public.{table_name}'::regclass,
+                        ARRAY['remote_guc'],
+                        '{{"throttle_max_lag":"0s"}}'::jsonb
+                    );
+                EXCEPTION WHEN others THEN
+                    IF SQLERRM = 'throttle_max_lag must be greater than zero or off' THEN
+                        rejected := true;
+                    ELSE
+                        RAISE;
+                    END IF;
+                END;
+
+                IF NOT rejected THEN
+                    RAISE EXCEPTION 'expected compare_table to reject throttle_max_lag=0s';
                 END IF;
             END
             $pgl_validate_recheck$;

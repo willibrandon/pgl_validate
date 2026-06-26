@@ -6,6 +6,7 @@
 
 use pgrx::prelude::*;
 use pgrx::{GucContext, GucFlags, GucRegistry, GucSetting};
+use std::ffi::CString;
 
 mod digest;
 mod sql_api;
@@ -63,11 +64,22 @@ extension_sql_file!("../sql/comments.sql", name = "comments", finalize);
 
 static PARANOID_CONFIRM: GucSetting<bool> = GucSetting::<bool>::new(false);
 static PARANOID_CONFIRM_MAX_ROWS: GucSetting<i32> = GucSetting::<i32>::new(1000);
+static HASH_ALGORITHM: GucSetting<Option<CString>> =
+    GucSetting::<Option<CString>>::new(Some(c"blake3_256"));
 static ALLOW_APPROXIMATE_FILTERS: GucSetting<bool> = GucSetting::<bool>::new(false);
 static ALLOW_DEGRADED_FENCE: GucSetting<bool> = GucSetting::<bool>::new(false);
 static CHUNK_TARGET_ROWS: GucSetting<i32> = GucSetting::<i32>::new(50000);
+static CHUNK_MAX_DURATION: GucSetting<Option<CString>> =
+    GucSetting::<Option<CString>>::new(Some(c"2s"));
 static LOCALIZE_THRESHOLD: GucSetting<i32> = GucSetting::<i32>::new(1000);
+static MAX_PARALLEL_CHUNKS: GucSetting<i32> = GucSetting::<i32>::new(4);
 static RECHECK_PASSES: GucSetting<i32> = GucSetting::<i32>::new(3);
+static MAX_SNAPSHOT_AGE: GucSetting<Option<CString>> =
+    GucSetting::<Option<CString>>::new(Some(c"5min"));
+static STATEMENT_TIMEOUT_PER_CHUNK: GucSetting<Option<CString>> =
+    GucSetting::<Option<CString>>::new(Some(c"30s"));
+static THROTTLE_MAX_LAG: GucSetting<Option<CString>> =
+    GucSetting::<Option<CString>>::new(Some(c"off"));
 static FENCE_TIMEOUT_MS: GucSetting<i32> = GucSetting::<i32>::new(300000);
 static FENCE_POLL_INTERVAL_MS: GucSetting<i32> = GucSetting::<i32>::new(100);
 static SEQUENCE_BUFFER_MULTIPLIER: GucSetting<i32> = GucSetting::<i32>::new(2);
@@ -97,6 +109,14 @@ pub extern "C-unwind" fn _PG_init() {
         GucContext::Userset,
         flags,
     );
+    GucRegistry::define_string_guc(
+        c"pgl_validate.hash_algorithm",
+        c"Row digest hash algorithm.",
+        c"Algorithm contract for row digests. Currently blake3_256 is implemented; other design algorithms are rejected until implemented.",
+        &HASH_ALGORITHM,
+        GucContext::Userset,
+        flags,
+    );
     GucRegistry::define_bool_guc(
         c"pgl_validate.allow_approximate_filters",
         c"Allow approximate row-filter diagnostics.",
@@ -123,11 +143,29 @@ pub extern "C-unwind" fn _PG_init() {
         GucContext::Userset,
         flags,
     );
+    GucRegistry::define_string_guc(
+        c"pgl_validate.chunk_max_duration",
+        c"Maximum planned chunk duration.",
+        c"Design knob for adaptive split-and-retry chunk sizing. The current SQL engine validates the setting and records it in run options.",
+        &CHUNK_MAX_DURATION,
+        GucContext::Userset,
+        flags,
+    );
     GucRegistry::define_int_guc(
         c"pgl_validate.localize_threshold",
         c"Rows per range while localizing divergence.",
         c"Controls the smaller chunk size used after a table-level checksum mismatch.",
         &LOCALIZE_THRESHOLD,
+        1,
+        i32::MAX,
+        GucContext::Userset,
+        flags,
+    );
+    GucRegistry::define_int_guc(
+        c"pgl_validate.max_parallel_chunks",
+        c"Maximum parallel chunk workers.",
+        c"Upper bound for concurrent chunk subtrees when the async fan-out executor schedules chunk work.",
+        &MAX_PARALLEL_CHUNKS,
         1,
         i32::MAX,
         GucContext::Userset,
@@ -140,6 +178,30 @@ pub extern "C-unwind" fn _PG_init() {
         &RECHECK_PASSES,
         1,
         i32::MAX,
+        GucContext::Userset,
+        flags,
+    );
+    GucRegistry::define_string_guc(
+        c"pgl_validate.max_snapshot_age",
+        c"Maximum validation snapshot age.",
+        c"Design knob for refencing long-running table validation snapshots to bound vacuum impact.",
+        &MAX_SNAPSHOT_AGE,
+        GucContext::Userset,
+        flags,
+    );
+    GucRegistry::define_string_guc(
+        c"pgl_validate.statement_timeout_per_chunk",
+        c"Statement timeout per checksum chunk.",
+        c"Hard timeout applied to checksum and localization statements generated for a validation chunk.",
+        &STATEMENT_TIMEOUT_PER_CHUNK,
+        GucContext::Userset,
+        flags,
+    );
+    GucRegistry::define_string_guc(
+        c"pgl_validate.throttle_max_lag",
+        c"Maximum tolerated replication lag before throttling.",
+        c"Design knob for lag-aware validation throttling. Use off to disable lag throttling.",
+        &THROTTLE_MAX_LAG,
         GucContext::Userset,
         flags,
     );
