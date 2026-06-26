@@ -81,6 +81,8 @@ COMMENT ON FUNCTION pgl_validate.plan_key_ranges(regclass, text[], bytea, bytea,
     'Plan ordered key ranges as bytea JSON boundaries for Merkle chunk validation.';
 COMMENT ON FUNCTION pgl_validate.plan_chunk_sql(regclass, text[], bytea, bytea, text[], text[], text, boolean) IS
     'Generate planner-visible SQL for a table chunk checksum and optional cryptographic set confirmation.';
+COMMENT ON FUNCTION pgl_validate.plan_pglogical_filtered_sql(regclass, text[], text[], boolean) IS
+    'Generate diagnostic-only checksum SQL using pglogical.table_data_filtered for session-sensitive row filters.';
 COMMENT ON FUNCTION pgl_validate.plan_localize_sql(regclass, text[], bytea, bytea, text[], text) IS
     'Generate planner-visible SQL for key and row-digest enumeration within a bounded divergent range.';
 COMMENT ON FUNCTION pgl_validate.plan_localize_sql(regclass, text[], text[], text) IS

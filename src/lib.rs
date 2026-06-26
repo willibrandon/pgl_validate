@@ -17,6 +17,7 @@ extension_sql_file!("../sql/comments.sql", name = "comments", finalize);
 
 static PARANOID_CONFIRM: GucSetting<bool> = GucSetting::<bool>::new(false);
 static PARANOID_CONFIRM_MAX_ROWS: GucSetting<i32> = GucSetting::<i32>::new(1000);
+static ALLOW_APPROXIMATE_FILTERS: GucSetting<bool> = GucSetting::<bool>::new(false);
 static CHUNK_TARGET_ROWS: GucSetting<i32> = GucSetting::<i32>::new(50000);
 static LOCALIZE_THRESHOLD: GucSetting<i32> = GucSetting::<i32>::new(1000);
 static RECHECK_PASSES: GucSetting<i32> = GucSetting::<i32>::new(3);
@@ -46,6 +47,14 @@ pub extern "C-unwind" fn _PG_init() {
         &PARANOID_CONFIRM_MAX_ROWS,
         1,
         i32::MAX,
+        GucContext::Userset,
+        flags,
+    );
+    GucRegistry::define_bool_guc(
+        c"pgl_validate.allow_approximate_filters",
+        c"Allow approximate row-filter diagnostics.",
+        c"Permit explicit approximate validation of session-sensitive row filters; results are never exact.",
+        &ALLOW_APPROXIMATE_FILTERS,
         GucContext::Userset,
         flags,
     );
@@ -3581,6 +3590,7 @@ mod tests {
             CREATE EXTENSION pglogical;
             SELECT pglogical.create_node({node}, 'dbname=' || current_database());
             CREATE TABLE public.{table_name}(id int PRIMARY KEY);
+            INSERT INTO public.{table_name} VALUES (0), (1);
             SELECT pglogical.create_replication_set({repset}, true, true, true, true);
             SELECT pglogical.replication_set_add_table(
                 {repset},
@@ -3637,6 +3647,41 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(issue, "skipped;NONDETERMINISTIC_ROW_FILTER");
+
+        let approx_run_id = Spi::get_one::<i64>(&format!(
+            "
+            SELECT (pgl_validate.compare_table(
+                'public.{table_name}'::regclass,
+                ARRAY[]::text[],
+                jsonb_build_object(
+                    'repsets', jsonb_build_array({repset}),
+                    'allow_approximate_filters', true
+                )
+            )).run_id
+            ",
+            repset = sql_literal(&repset_name)
+        ))
+        .unwrap()
+        .unwrap();
+        let approximate = Spi::get_one::<String>(&format!(
+            "
+            SELECT tr.verdict || ';' || si.issue_code || ';' || tnr.n_rows::text
+            FROM pgl_validate.table_result tr
+            JOIN pgl_validate.schema_issue si
+              ON si.run_id = tr.run_id
+             AND si.schema_name = tr.schema_name
+             AND si.table_name = tr.table_name
+            JOIN pgl_validate.table_node_result tnr
+              ON tnr.run_id = tr.run_id
+             AND tnr.schema_name = tr.schema_name
+             AND tnr.table_name = tr.table_name
+             AND tnr.node = 'local'
+            WHERE tr.run_id = {approx_run_id}
+            "
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(approximate, "approximate;NONDETERMINISTIC_ROW_FILTER;1");
     }
 
     #[pg_test]

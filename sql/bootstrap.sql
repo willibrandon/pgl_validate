@@ -1556,6 +1556,111 @@ BEGIN
 END
 $$;
 
+-- Generate the diagnostic-only pglogical row-filter SQL used for
+-- session-sensitive filters. This intentionally calls pglogical's own
+-- table_data_filtered() function instead of the exact path's deparsed
+-- predicate, and callers must stamp the resulting verdict as approximate.
+CREATE FUNCTION pgl_validate.plan_pglogical_filtered_sql(
+    rel regclass,
+    cols text[],
+    repsets text[],
+    include_set_hash boolean DEFAULT false
+)
+RETURNS text
+LANGUAGE plpgsql
+STABLE
+AS $$
+DECLARE
+    rel_sql text;
+    enc_modes int[];
+    digest_args text;
+    row_digest_expr text;
+    selected_cols text[];
+    source_sql text;
+BEGIN
+    IF to_regprocedure('pglogical.table_data_filtered(anyelement,regclass,text[])') IS NULL THEN
+        RAISE EXCEPTION 'pglogical.table_data_filtered(anyelement,regclass,text[]) is not available'
+            USING ERRCODE = '0A000';
+    END IF;
+
+    SELECT format('%I.%I', n.nspname, c.relname)
+    INTO rel_sql
+    FROM pg_class c
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE c.oid = rel;
+
+    IF rel_sql IS NULL THEN
+        RAISE EXCEPTION 'relation % does not exist', rel;
+    END IF;
+
+    IF repsets IS NULL OR cardinality(repsets) = 0 THEN
+        RAISE EXCEPTION 'repsets are required for pglogical.table_data_filtered()';
+    END IF;
+
+    IF cols IS NULL OR cardinality(cols) = 0 THEN
+        SELECT array_agg(a.attname ORDER BY a.attname)
+        INTO selected_cols
+        FROM pg_attribute a
+        WHERE a.attrelid = rel
+          AND a.attnum > 0
+          AND NOT a.attisdropped;
+    ELSE
+        SELECT array_agg(a.attname ORDER BY a.attname)
+        INTO selected_cols
+        FROM unnest(cols) requested(col_name)
+        JOIN pg_attribute a
+          ON a.attrelid = rel
+         AND a.attname = requested.col_name
+         AND a.attnum > 0
+         AND NOT a.attisdropped;
+
+        IF cardinality(selected_cols) IS DISTINCT FROM cardinality(cols) THEN
+            RAISE EXCEPTION 'one or more requested columns are not present on %', rel::text;
+        END IF;
+    END IF;
+
+    IF selected_cols IS NULL OR cardinality(selected_cols) = 0 THEN
+        RAISE EXCEPTION 'no comparable columns found on %', rel::text;
+    END IF;
+
+    SELECT
+        array_agg(pgl_validate.column_encoding_mode(a.atttypid) ORDER BY a.attname),
+        string_agg(format('t.%I', a.attname), ', ' ORDER BY a.attname)
+    INTO enc_modes, digest_args
+    FROM pg_attribute a
+    WHERE a.attrelid = rel
+      AND a.attname = ANY (selected_cols)
+      AND a.attnum > 0
+      AND NOT a.attisdropped;
+
+    row_digest_expr := format(
+        'pgl_validate.row_digest(%L::int[], %s)',
+        enc_modes::text,
+        digest_args
+    );
+    source_sql := format(
+        'pglogical.table_data_filtered(NULL::%s, %L::regclass, %L::text[]) AS t',
+        rel_sql,
+        rel_sql,
+        repsets::text
+    );
+
+    IF include_set_hash THEN
+        RETURN format(
+            'WITH digests AS MATERIALIZED (SELECT %s AS rd FROM %s), aggregate AS (SELECT count(*)::bigint AS n_rows, pgl_validate.lthash_bytes(pgl_validate.lthash(rd)) AS lthash FROM digests) SELECT aggregate.n_rows, aggregate.lthash, (SELECT pgl_validate.hash_digest_array(COALESCE(array_agg(rd ORDER BY rd), ARRAY[]::bytea[])) FROM digests) AS set_hash FROM aggregate',
+            row_digest_expr,
+            source_sql
+        );
+    END IF;
+
+    RETURN format(
+        'SELECT count(*)::bigint AS n_rows, pgl_validate.lthash_bytes(pgl_validate.lthash(%s)) AS lthash, NULL::bytea AS set_hash FROM %s',
+        row_digest_expr,
+        source_sql
+    );
+END
+$$;
+
 -- Generate the planner-visible SQL used to enumerate keys and row digests for
 -- a localized divergent key range.
 CREATE FUNCTION pgl_validate.plan_localize_sql(
@@ -1908,6 +2013,12 @@ DECLARE
     has_row_filter boolean := false;
     row_filter_sql text;
     row_filter_exact boolean := true;
+    allow_approximate_filters boolean := COALESCE(
+        (NULLIF(options->>'allow_approximate_filters', ''))::boolean,
+        NULLIF(current_setting('pgl_validate.allow_approximate_filters', true), '')::boolean,
+        false
+    );
+    approximate_filter_mode boolean := false;
     sync_status "char" := 'r';
     validated_property text := 'full';
     exact_comparable boolean := true;
@@ -2262,6 +2373,184 @@ BEGIN
         repl_insert, repl_update, repl_delete, repl_truncate,
         has_row_filter, sync_status, validated_property
     );
+
+    approximate_filter_mode :=
+        NOT exact_comparable
+        AND has_row_filter
+        AND NOT row_filter_exact
+        AND allow_approximate_filters;
+
+    IF approximate_filter_mode THEN
+        INSERT INTO pgl_validate.schema_issue(
+            run_id, node, schema_name, table_name, issue_code, detail
+        )
+        VALUES (
+            v_run_id,
+            provider_node,
+            v_schema_name,
+            v_rel_name,
+            'NONDETERMINISTIC_ROW_FILTER',
+            contract_reason
+        )
+        ON CONFLICT DO NOTHING;
+
+        IF requested_backend = 'pglogical' THEN
+            checksum_sql := pgl_validate.plan_pglogical_filtered_sql(
+                p_table_name,
+                cols,
+                plan_repsets,
+                false
+            );
+        ELSE
+            checksum_sql := pgl_validate.plan_chunk_sql(
+                p_table_name,
+                key_cols,
+                NULL,
+                NULL,
+                cols,
+                NULL,
+                row_filter_sql,
+                false
+            );
+        END IF;
+
+        EXECUTE checksum_sql INTO n_rows, lthash, set_hash;
+
+        INSERT INTO pgl_validate.table_node_result(
+            run_id, schema_name, table_name, node, n_rows, lthash, set_hash
+        )
+        VALUES (v_run_id, v_schema_name, v_rel_name, 'local', n_rows, lthash, set_hash);
+
+        remote_checksum_sql := pgl_validate.plan_chunk_sql(
+            p_table_name,
+            key_cols,
+            NULL,
+            NULL,
+            cols,
+            NULL,
+            NULL,
+            false
+        );
+
+        differ_count := 0;
+        participant_count := 1;
+        FOR peer_rec IN
+            SELECT p.name, p.dsn, p.backend,
+                   p.connect_timeout_seconds,
+                   p.statement_timeout_ms,
+                   p.lock_timeout_ms
+            FROM pgl_validate.peer p
+            WHERE p.name = ANY (peer_names)
+            ORDER BY p.name
+        LOOP
+            SELECT rc.pg_version, rc.n_rows, rc.lthash, rc.set_hash
+            INTO remote_rec
+            FROM pgl_validate.remote_checksum(
+                peer_rec.dsn,
+                remote_checksum_sql,
+                peer_rec.connect_timeout_seconds,
+                peer_rec.statement_timeout_ms,
+                peer_rec.lock_timeout_ms
+            ) AS rc;
+
+            participant_count := participant_count + 1;
+
+            INSERT INTO pgl_validate.run_participant(
+                run_id, node, role, backend, pg_version, dsn_ref, status
+            )
+            VALUES (
+                v_run_id, peer_rec.name, 'participant', peer_rec.backend,
+                remote_rec.pg_version, peer_rec.name, 'done'
+            )
+            ON CONFLICT (run_id, node) DO UPDATE
+            SET backend = EXCLUDED.backend,
+                pg_version = EXCLUDED.pg_version,
+                dsn_ref = EXCLUDED.dsn_ref,
+                status = EXCLUDED.status;
+
+            INSERT INTO pgl_validate.table_node_result(
+                run_id, schema_name, table_name, node, n_rows, lthash, set_hash
+            )
+            VALUES (
+                v_run_id, v_schema_name, v_rel_name, peer_rec.name,
+                remote_rec.n_rows, remote_rec.lthash, remote_rec.set_hash
+            );
+
+            IF remote_rec.n_rows IS DISTINCT FROM n_rows
+               OR remote_rec.lthash IS DISTINCT FROM lthash THEN
+                differ_count := differ_count + 1;
+            END IF;
+        END LOOP;
+
+        verdict := 'approximate';
+        result_reason := format(
+            'approximate row-filter diagnostic %s across %s participant(s); exact validation refused: %s',
+            CASE WHEN differ_count = 0 THEN 'matched' ELSE 'found checksum differences' END,
+            participant_count,
+            contract_reason
+        );
+
+        INSERT INTO pgl_validate.table_result(
+            run_id, schema_name, table_name, verdict, reason, finished_at
+        )
+        VALUES (
+            v_run_id, v_schema_name, v_rel_name, verdict, result_reason, now()
+        )
+        RETURNING * INTO result_row;
+
+        INSERT INTO pgl_validate.chunk_result(
+            run_id, schema_name, table_name, chunk_id, parent_id, lo, hi, state, updated_at
+        )
+        VALUES (
+            v_run_id,
+            v_schema_name,
+            v_rel_name,
+            1,
+            NULL,
+            NULL,
+            NULL,
+            'candidate',
+            now()
+        )
+        ON CONFLICT (run_id, schema_name, table_name, chunk_id) DO UPDATE
+        SET state = EXCLUDED.state,
+            updated_at = EXCLUDED.updated_at;
+
+        INSERT INTO pgl_validate.chunk_node_result(
+            run_id, schema_name, table_name, chunk_id, node, n_rows, lthash
+        )
+        SELECT
+            tnr.run_id,
+            tnr.schema_name,
+            tnr.table_name,
+            1,
+            tnr.node,
+            tnr.n_rows,
+            tnr.lthash
+        FROM pgl_validate.table_node_result tnr
+        WHERE tnr.run_id = v_run_id
+          AND tnr.schema_name = v_schema_name
+          AND tnr.table_name = v_rel_name
+        ON CONFLICT (run_id, schema_name, table_name, chunk_id, node) DO UPDATE
+        SET n_rows = EXCLUDED.n_rows,
+            lthash = EXCLUDED.lthash;
+
+        IF NOT append_to_parent THEN
+            UPDATE pgl_validate.run
+            SET status = 'completed',
+                finished_at = now(),
+                tables_matched = 0,
+                tables_differ = 0
+            WHERE pgl_validate.run.run_id = v_run_id;
+
+            UPDATE pgl_validate.run_participant
+            SET status = 'done'
+            WHERE pgl_validate.run_participant.run_id = v_run_id
+              AND node = 'local';
+        END IF;
+
+        RETURN result_row;
+    END IF;
 
     IF NOT exact_comparable THEN
         issue_code := CASE
