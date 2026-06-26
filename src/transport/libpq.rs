@@ -1,8 +1,7 @@
 use core::ffi::{c_char, c_int};
+use pgrx::pg_sys;
 use serde::Deserialize;
 use std::ffi::{CStr, CString};
-use std::thread;
-use std::time::Duration;
 
 const CONNECTION_OK: c_int = 0;
 const PGRES_COMMAND_OK: c_int = 1;
@@ -26,6 +25,7 @@ unsafe extern "C" {
     fn PQexec(conn: *mut PGconn, query: *const c_char) -> *mut PGresult;
     fn PQsetnonblocking(conn: *mut PGconn, arg: c_int) -> c_int;
     fn PQsendQuery(conn: *mut PGconn, query: *const c_char) -> c_int;
+    fn PQsocket(conn: *const PGconn) -> c_int;
     fn PQconsumeInput(conn: *mut PGconn) -> c_int;
     fn PQisBusy(conn: *mut PGconn) -> c_int;
     fn PQgetResult(conn: *mut PGconn) -> *mut PGresult;
@@ -317,6 +317,18 @@ impl Connection {
         }
     }
 
+    fn socket(&self) -> Result<pg_sys::pgsocket, String> {
+        let socket = unsafe { PQsocket(self.raw) };
+        if socket < 0 {
+            Err(format!(
+                "libpq connection has no waitable socket: {}",
+                self.error_message()
+            ))
+        } else {
+            Ok(socket as pg_sys::pgsocket)
+        }
+    }
+
     fn consume_input(&self) -> Result<(), String> {
         if unsafe { PQconsumeInput(self.raw) } == 1 {
             Ok(())
@@ -357,6 +369,97 @@ impl Connection {
     fn error_message(&self) -> String {
         unsafe { c_message(PQerrorMessage(self.raw)) }
     }
+}
+
+struct WaitEventSetGuard {
+    raw: *mut pg_sys::WaitEventSet,
+}
+
+impl WaitEventSetGuard {
+    fn new(event_count: usize) -> Result<Self, String> {
+        let raw = unsafe { create_wait_event_set(event_count as c_int) };
+        if raw.is_null() {
+            Err("CreateWaitEventSet returned NULL".to_string())
+        } else {
+            Ok(Self { raw })
+        }
+    }
+}
+
+impl Drop for WaitEventSetGuard {
+    fn drop(&mut self) {
+        unsafe { pg_sys::FreeWaitEventSet(self.raw) };
+    }
+}
+
+#[cfg(any(feature = "pg15", feature = "pg16"))]
+unsafe fn create_wait_event_set(event_count: c_int) -> *mut pg_sys::WaitEventSet {
+    unsafe { pg_sys::CreateWaitEventSet(pg_sys::CurrentMemoryContext, event_count) }
+}
+
+#[cfg(not(any(feature = "pg15", feature = "pg16")))]
+unsafe fn create_wait_event_set(event_count: c_int) -> *mut pg_sys::WaitEventSet {
+    unsafe { pg_sys::CreateWaitEventSet(pg_sys::CurrentResourceOwner, event_count) }
+}
+
+fn wait_for_remote_input(active: &[ActiveChecksumTask]) -> Result<(), String> {
+    let sockets = active
+        .iter()
+        .map(|task| task.conn.socket())
+        .collect::<Result<Vec<_>, _>>()?;
+    let wait_set = WaitEventSetGuard::new(sockets.len() + 1)?;
+
+    unsafe {
+        let invalid_socket = !0 as pg_sys::pgsocket;
+        let latch_pos = pg_sys::AddWaitEventToSet(
+            wait_set.raw,
+            pg_sys::WL_LATCH_SET,
+            invalid_socket,
+            pg_sys::MyLatch,
+            std::ptr::null_mut(),
+        );
+        if latch_pos < 0 {
+            return Err("AddWaitEventToSet failed for backend latch".to_string());
+        }
+
+        let socket_events = if pg_sys::WaitEventSetCanReportClosed() {
+            pg_sys::WL_SOCKET_READABLE | pg_sys::WL_SOCKET_CLOSED
+        } else {
+            pg_sys::WL_SOCKET_READABLE
+        };
+
+        for socket in sockets {
+            let socket_pos = pg_sys::AddWaitEventToSet(
+                wait_set.raw,
+                socket_events,
+                socket,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            );
+            if socket_pos < 0 {
+                return Err(format!(
+                    "AddWaitEventToSet failed for libpq socket {socket}"
+                ));
+            }
+        }
+
+        let mut occurred_events = vec![pg_sys::WaitEvent::default(); active.len() + 1];
+        let ready_count = pg_sys::WaitEventSetWait(
+            wait_set.raw,
+            -1,
+            occurred_events.as_mut_ptr(),
+            occurred_events.len() as c_int,
+            pg_sys::PG_WAIT_EXTENSION,
+        );
+        pg_sys::ResetLatch(pg_sys::MyLatch);
+        pg_sys::check_for_interrupts!();
+
+        if ready_count < 0 {
+            return Err("WaitEventSetWait failed while waiting for libpq input".to_string());
+        }
+    }
+
+    Ok(())
 }
 
 impl Drop for Connection {
@@ -1171,7 +1274,7 @@ pub(crate) fn fetch_checksums_batch(
         }
 
         if !made_progress {
-            thread::sleep(Duration::from_millis(1));
+            wait_for_remote_input(&active)?;
         }
     }
 
