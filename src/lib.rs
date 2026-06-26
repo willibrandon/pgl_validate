@@ -83,6 +83,7 @@ static ALLOW_DEGRADED_FENCE: GucSetting<bool> = GucSetting::<bool>::new(false);
 static CHUNK_TARGET_ROWS: GucSetting<i32> = GucSetting::<i32>::new(50000);
 static CHUNK_MAX_DURATION: GucSetting<Option<CString>> =
     GucSetting::<Option<CString>>::new(Some(c"2s"));
+static SPLIT_FANOUT: GucSetting<i32> = GucSetting::<i32>::new(4);
 static LOCALIZE_THRESHOLD: GucSetting<i32> = GucSetting::<i32>::new(1000);
 static MAX_PARALLEL_CHUNKS: GucSetting<i32> = GucSetting::<i32>::new(4);
 static RECHECK_PASSES: GucSetting<i32> = GucSetting::<i32>::new(3);
@@ -192,6 +193,16 @@ pub extern "C-unwind" fn _PG_init() {
         c"Maximum planned chunk duration.",
         c"Split and retry key-range chunks that exceed this elapsed-time threshold, down to single-row ranges.",
         &CHUNK_MAX_DURATION,
+        GucContext::Userset,
+        flags,
+    );
+    GucRegistry::define_int_guc(
+        c"pgl_validate.split_fanout",
+        c"Merkle split fanout.",
+        c"Target number of child ranges when a slow or oversized key-range chunk is split.",
+        &SPLIT_FANOUT,
+        2,
+        i32::MAX,
         GucContext::Userset,
         flags,
     );

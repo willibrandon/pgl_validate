@@ -567,6 +567,11 @@ DECLARE
         (NULLIF(current_setting('pgl_validate.chunk_max_duration', true), ''))::interval,
         interval '2 seconds'
     );
+    split_fanout int := COALESCE(
+        (NULLIF(options->>'split_fanout', ''))::int,
+        NULLIF(current_setting('pgl_validate.split_fanout', true), '')::int,
+        4
+    );
     localize_threshold int := COALESCE(
         (NULLIF(options->>'localize_threshold', ''))::int,
         NULLIF(current_setting('pgl_validate.localize_threshold', true), '')::int,
@@ -704,6 +709,7 @@ BEGIN
             'paranoid_confirm', paranoid_confirm,
             'paranoid_confirm_max_rows', paranoid_confirm_max_rows,
             'recheck_passes', recheck_passes,
+            'split_fanout', split_fanout,
             'statement_timeout_per_chunk', statement_timeout_per_chunk,
             'throttle_max_lag', throttle_max_lag_setting
         );
@@ -712,6 +718,9 @@ BEGIN
     END IF;
     IF chunk_max_duration <= interval '0' THEN
         RAISE EXCEPTION 'chunk_max_duration must be greater than zero';
+    END IF;
+    IF split_fanout <= 1 THEN
+        RAISE EXCEPTION 'split_fanout must be greater than one';
     END IF;
     IF localize_threshold <= 0 THEN
         RAISE EXCEPTION 'localize_threshold must be greater than zero';
@@ -2732,7 +2741,7 @@ BEGIN
                         1,
                         LEAST(
                             range_rec.target_rows - 1,
-                            ceil(max_chunk_n_rows::numeric / 2.0)::int
+                            ceil(max_chunk_n_rows::numeric / split_fanout::numeric)::int
                         )
                     );
 

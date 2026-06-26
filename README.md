@@ -112,6 +112,7 @@ SET pgl_validate.max_reported_tuple_bytes = 8192;
 SET pgl_validate.max_reported_divergences = 1000;
 SET pgl_validate.hash_algorithm = 'blake3_256'; -- or blake3_512
 SET pgl_validate.chunk_max_duration = '2s';
+SET pgl_validate.split_fanout = 4;
 SET pgl_validate.max_parallel_chunks = 4;
 SET pgl_validate.max_snapshot_age = '5min';
 SET pgl_validate.statement_timeout_per_chunk = '30s';

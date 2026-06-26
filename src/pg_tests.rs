@@ -697,6 +697,65 @@ mod tests {
     }
 
     #[pg_test]
+    fn compare_table_uses_split_fanout_for_slow_chunk_retries() {
+        Spi::run(
+            r#"
+            DELETE FROM pgl_validate.peer;
+            CREATE TEMP TABLE split_fanout_target(
+                id int PRIMARY KEY,
+                value text
+            );
+            INSERT INTO split_fanout_target
+            SELECT g, 'value-' || g::text
+            FROM generate_series(1, 8) AS g;
+            "#,
+        )
+        .unwrap();
+
+        let run_id = Spi::get_one::<i64>(
+            r#"
+            SELECT (pgl_validate.compare_table(
+                'split_fanout_target'::regclass,
+                ARRAY[]::text[],
+                '{"chunk_target_rows":4,"chunk_max_duration":"1 microsecond","split_fanout":4}'::jsonb
+            )).run_id
+            "#,
+        )
+        .unwrap()
+        .unwrap();
+
+        let non_root_split_count = Spi::get_one::<i64>(&format!(
+            "
+            SELECT count(*)
+            FROM pgl_validate.chunk_result
+            WHERE run_id = {run_id}
+              AND table_name = 'split_fanout_target'
+              AND chunk_id <> 1
+              AND state = 'split'
+            "
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(non_root_split_count, 2);
+
+        let leaf_shape = Spi::get_one::<String>(&format!(
+            "
+            SELECT count(*)::text || ';' || max(cnr.n_rows)::text
+            FROM pgl_validate.chunk_result cr
+            JOIN pgl_validate.chunk_node_result cnr
+              USING (run_id, schema_name, table_name, chunk_id)
+            WHERE cr.run_id = {run_id}
+              AND cr.table_name = 'split_fanout_target'
+              AND cr.state <> 'split'
+              AND cnr.node = 'local'
+            "
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(leaf_shape, "8;1");
+    }
+
+    #[pg_test]
     fn compare_uses_guc_defaults_with_option_overrides() {
         let backend_pid = Spi::get_one::<i32>("SELECT pg_backend_pid()")
             .unwrap()
@@ -739,6 +798,7 @@ mod tests {
             SET LOCAL pgl_validate.max_reported_divergences = 1000;
             SET LOCAL pgl_validate.hash_algorithm = 'blake3_256';
             SET LOCAL pgl_validate.chunk_max_duration = '2s';
+            SET LOCAL pgl_validate.split_fanout = 3;
             SET LOCAL pgl_validate.max_parallel_chunks = 4;
             SET LOCAL pgl_validate.max_snapshot_age = '5min';
             SET LOCAL pgl_validate.statement_timeout_per_chunk = '30s';
@@ -782,14 +842,15 @@ mod tests {
             SELECT (options->>'chunk_target_rows') || ';' ||
                    (options->>'recheck_passes') || ';' ||
                    (options->>'throttle_max_lag') || ';' ||
-                   (options->>'hash_algorithm')
+                   (options->>'hash_algorithm') || ';' ||
+                   (options->>'split_fanout')
             FROM pgl_validate.run
             WHERE run_id = {guc_run_id}
             "
         ))
         .unwrap()
         .unwrap();
-        assert_eq!(guc_run_options, "2;2;off;blake3_256");
+        assert_eq!(guc_run_options, "2;2;off;blake3_256;3");
 
         let override_run_id = Spi::get_one::<i64>(&format!(
             "
