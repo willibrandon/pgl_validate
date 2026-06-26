@@ -1036,7 +1036,7 @@ SELECT EXISTS (
     }
 
     Write-Step 'Validating post-fence provider UPDATE is cleared by digest-stability recheck'
-    $clearedTimeoutSeconds = [Math]::Min($TimeoutSeconds, 60)
+    $clearedTimeoutSeconds = [Math]::Min($TimeoutSeconds, 30)
     Invoke-Sql -Database 'provider' -Sql @"
 CREATE FUNCTION public.pgl_validate_recheck_gate(i int)
 RETURNS boolean
@@ -1044,16 +1044,29 @@ LANGUAGE plpgsql
 IMMUTABLE
 AS `$pgl_validate_gate`$
 DECLARE
+    app_name text := current_setting('application_name', true);
     call_no int;
+    lock_object int;
+    trigger_call int;
 BEGIN
-    IF current_setting('application_name', true) = 'pgl_validate_recheck_clear' THEN
-        call_no := COALESCE(NULLIF(current_setting('pgl_validate.recheck_gate_calls', true), '')::int, 0) + 1;
-        PERFORM set_config('pgl_validate.recheck_gate_calls', call_no::text, false);
-        IF call_no = 2 THEN
-            PERFORM pg_advisory_lock(76422, 2);
-            PERFORM pg_sleep(4);
-            PERFORM pg_advisory_unlock(76422, 2);
-        END IF;
+    SELECT signal_lock, signal_call
+    INTO lock_object, trigger_call
+    FROM (VALUES
+        ('pgl_validate_recheck_update'::text, 2, 2),
+        ('pgl_validate_recheck_delete'::text, 3, 3)
+    ) AS locks(name, signal_lock, signal_call)
+    WHERE name = app_name;
+
+    IF lock_object IS NULL THEN
+        RETURN true;
+    END IF;
+
+    call_no := COALESCE(NULLIF(current_setting('pgl_validate.recheck_gate_calls', true), '')::int, 0) + 1;
+    PERFORM set_config('pgl_validate.recheck_gate_calls', call_no::text, false);
+    IF call_no = trigger_call THEN
+        PERFORM pg_advisory_lock(76422, lock_object);
+        PERFORM pg_sleep(4);
+        PERFORM pg_advisory_unlock(76422, lock_object);
     END IF;
     RETURN true;
 END
@@ -1085,7 +1098,7 @@ CREATE TABLE public.post_fence_update_accounts(
     Invoke-Sql -Database 'target' -Sql "UPDATE public.post_fence_update_accounts SET value = 'after-update' WHERE id = 1" | Out-Null
 
     $clearedCompareSql = @"
-SET application_name = 'pgl_validate_recheck_clear';
+SET application_name = 'pgl_validate_recheck_update';
 SET pgl_validate.recheck_gate_calls = '0';
 SELECT run_id::text || ';' || verdict
 FROM pgl_validate.compare_table(
@@ -1154,6 +1167,125 @@ WHERE d.run_id = $clearedRunId
 "@
     if ($clearedEvidence -ne 'differs;cleared;cleared;match;filtered_intersection') {
         throw "post-fence UPDATE did not persist a cleared recheck outcome: $clearedEvidence"
+    }
+
+    Write-Step 'Validating post-fence provider DELETE is cleared by digest-stability recheck'
+    Invoke-Sql -Database 'provider' -Sql @"
+CREATE TABLE public.post_fence_delete_accounts(
+    id int PRIMARY KEY,
+    value text
+);
+SELECT pglogical.replication_set_add_table(
+    'default',
+    'public.post_fence_delete_accounts'::regclass,
+    false,
+    NULL,
+    'public.pgl_validate_recheck_gate(id)'
+);
+"@ | Out-Null
+    Invoke-Sql -Database 'target' -Sql @"
+CREATE TABLE public.post_fence_delete_accounts(
+    id int PRIMARY KEY,
+    value text
+)
+"@ | Out-Null
+    Invoke-Sql -Database 'provider' -Sql "INSERT INTO public.post_fence_delete_accounts VALUES (1, 'before-delete')" | Out-Null
+    Wait-SqlEquals `
+        -Database 'target' `
+        -Sql "SELECT value FROM public.post_fence_delete_accounts WHERE id = 1" `
+        -Expected 'before-delete' `
+        -TimeoutSeconds $TimeoutSeconds
+    Invoke-Sql -Database 'target' -Sql "UPDATE public.post_fence_delete_accounts SET value = 'target-delete-drift' WHERE id = 1" | Out-Null
+
+    $deleteCompareSql = @"
+SET application_name = 'pgl_validate_recheck_delete';
+SET pgl_validate.recheck_gate_calls = '0';
+SELECT run_id::text || ';' || verdict
+FROM pgl_validate.compare_table(
+    'public.post_fence_delete_accounts'::regclass,
+    ARRAY['target'],
+    jsonb_build_object(
+        'provider_dsn', $providerDsnSql,
+        'provider_node', 'provider',
+        'repsets', jsonb_build_array('default'),
+        'recheck_passes', 2,
+        'fence_timeout_ms', 30000,
+        'fence_poll_interval_ms', 100
+    )
+)
+"@
+    $deleteProcess = Start-AsyncSql -Database 'provider' -Sql $deleteCompareSql
+    try {
+        Wait-AdvisoryLockHeld `
+            -Database 'provider' `
+            -ClassId 76422 `
+            -ObjectId 3 `
+            -TimeoutSeconds $clearedTimeoutSeconds
+
+        Invoke-Sql -Database 'provider' -Sql "DELETE FROM public.post_fence_delete_accounts WHERE id = 1" | Out-Null
+        Wait-SqlEquals `
+            -Database 'target' `
+            -Sql "SELECT count(*)::text FROM public.post_fence_delete_accounts WHERE id = 1" `
+            -Expected '0' `
+            -TimeoutSeconds $clearedTimeoutSeconds
+
+        $deleteResult = Wait-AsyncSql `
+            -Process $deleteProcess `
+            -TimeoutSeconds $clearedTimeoutSeconds `
+            -Context 'post-fence DELETE compare_table'
+    }
+    finally {
+        if ($deleteProcess -and -not $deleteProcess.HasExited) {
+            Stop-ProcessTree -ProcessId $deleteProcess.Id
+        }
+    }
+
+    $deleteParts = $deleteResult.Split(';', 2)
+    if ($deleteParts.Count -ne 2) {
+        throw "unexpected post-fence DELETE compare_table result: $deleteResult"
+    }
+    $deleteRunId = $deleteParts[0]
+    $deleteVerdict = $deleteParts[1]
+    if ($deleteVerdict -ne 'match') {
+        throw "post-fence DELETE should clear to match after recheck, saw: $deleteResult"
+    }
+
+    $deleteCleared = Invoke-Sql -Database 'provider' -Sql @"
+SELECT EXISTS (
+    SELECT 1
+    FROM pgl_validate.divergence d
+    JOIN pgl_validate.divergence_recheck dr USING (run_id, schema_name, table_name, key_bytes, node)
+    JOIN pgl_validate.table_result tr USING (run_id, schema_name, table_name)
+    JOIN pgl_validate.table_plan tp USING (run_id, schema_name, table_name)
+    WHERE d.run_id = $deleteRunId
+      AND d.schema_name = 'public'
+      AND d.table_name = 'post_fence_delete_accounts'
+      AND d.node = 'target'
+      AND d.classification IN ('differs', 'missing_on')
+      AND d.status = 'cleared'
+      AND tr.verdict = 'match'
+      AND tp.validated_property = 'filtered_intersection'
+    GROUP BY d.run_id, d.schema_name, d.table_name, d.key_bytes, d.node
+    HAVING bool_or(dr.outcome = 'cleared')
+)::text
+"@
+    if ($deleteCleared -ne 'true') {
+        $deleteEvidence = Invoke-Sql -Database 'provider' -Sql @"
+SELECT d.classification || ';' ||
+       d.status || ';' ||
+       dr.outcome || ';' ||
+       tr.verdict || ';' ||
+       tp.validated_property
+FROM pgl_validate.divergence d
+JOIN pgl_validate.divergence_recheck dr USING (run_id, schema_name, table_name, key_bytes, node)
+JOIN pgl_validate.table_result tr USING (run_id, schema_name, table_name)
+JOIN pgl_validate.table_plan tp USING (run_id, schema_name, table_name)
+WHERE d.run_id = $deleteRunId
+  AND d.schema_name = 'public'
+  AND d.table_name = 'post_fence_delete_accounts'
+  AND d.node = 'target'
+"@
+        throw "post-fence DELETE did not persist a cleared recheck outcome: $deleteEvidence"
     }
 
     Write-Step 'Creating subscriber-side drift and applying audited pglogical repair'
