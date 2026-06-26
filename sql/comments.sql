@@ -75,8 +75,8 @@ COMMENT ON FUNCTION pgl_validate.fence_pglogical_edge(bigint, integer, integer, 
     'Inject and converge an exact pglogical barrier for one provider-to-target run edge.';
 COMMENT ON FUNCTION pgl_validate.fence_standby_edge(bigint, integer, integer, text, text, text, pg_lsn, integer, integer, integer, integer, integer) IS
     'Converge one physical standby edge by waiting for replay to reach a primary WAL LSN.';
-COMMENT ON FUNCTION pgl_validate.plan_chunk_sql(regclass, text[], bytea, bytea, text[], text[], text) IS
-    'Generate planner-visible SQL for a table chunk checksum.';
+COMMENT ON FUNCTION pgl_validate.plan_chunk_sql(regclass, text[], bytea, bytea, text[], text[], text, boolean) IS
+    'Generate planner-visible SQL for a table chunk checksum and optional cryptographic set confirmation.';
 COMMENT ON FUNCTION pgl_validate.plan_localize_sql(regclass, text[], text[], text) IS
     'Generate planner-visible SQL for key and row-digest enumeration during divergence localization.';
 COMMENT ON FUNCTION pgl_validate.plan_sequence_sql(regclass) IS
@@ -133,7 +133,7 @@ COMMENT ON FUNCTION pgl_validate.hash_digest_array(bytea[]) IS
 COMMENT ON FUNCTION pgl_validate.row_filter_tree_is_immutable(text) IS
     'Return whether a serialized PostgreSQL row-filter expression tree contains only immutable functions.';
 COMMENT ON FUNCTION pgl_validate.remote_checksum(text, text, integer, integer, integer) IS
-    'Execute generated checksum SQL on a named peer DSN via libpq with bounded connect, statement, and lock timeouts.';
+    'Execute generated checksum SQL on a named peer DSN via libpq, returning row count, LtHash, and optional set hash.';
 COMMENT ON FUNCTION pgl_validate.remote_localize_rows(text, text, integer, integer, integer) IS
     'Execute generated row-localization SQL on a named peer DSN via libpq with bounded connect, statement, and lock timeouts, returning key, digest, and row JSON.';
 COMMENT ON FUNCTION pgl_validate.remote_sequence_value(text, text, integer, integer, integer) IS

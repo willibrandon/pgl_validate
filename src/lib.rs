@@ -166,6 +166,7 @@ mod pgl_validate {
             name!(pg_version, i32),
             name!(n_rows, i64),
             name!(lthash, Vec<u8>),
+            name!(set_hash, Option<Vec<u8>>),
         ),
     > {
         let checksum = transport::libpq::fetch_checksum(
@@ -177,7 +178,12 @@ mod pgl_validate {
         )
         .unwrap_or_else(|err| pgrx::error!("{err}"));
 
-        TableIterator::once((checksum.pg_version, checksum.n_rows, checksum.lthash))
+        TableIterator::once((
+            checksum.pg_version,
+            checksum.n_rows,
+            checksum.lthash,
+            checksum.set_hash,
+        ))
     }
 
     /// Execute generated row-localization SQL on a remote peer over libpq.
@@ -845,10 +851,31 @@ mod tests {
 
         assert!(sql.contains("count(*)::bigint AS n_rows"));
         assert!(sql.contains("pgl_validate.lthash_bytes(pgl_validate.lthash("));
+        assert!(sql.contains("NULL::bytea AS set_hash"));
         assert!(
             sql.contains("pgl_validate.row_digest('{2,1,1}'::int[], t.amount, t.id, t.status)")
         );
         assert!(!sql.contains("ARRAY[t."));
+
+        let confirm_sql = Spi::get_one::<String>(
+            r#"
+            SELECT pgl_validate.plan_chunk_sql(
+                'plan_target'::regclass,
+                ARRAY['id'],
+                NULL,
+                NULL,
+                ARRAY['status','id','amount'],
+                NULL,
+                NULL,
+                true
+            )
+            "#,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert!(confirm_sql.contains("pgl_validate.hash_digest_array"));
+        assert!(confirm_sql.contains("array_agg(rd ORDER BY rd)"));
     }
 
     #[pg_test]
@@ -1010,7 +1037,7 @@ mod tests {
     #[pg_test]
     fn remote_checksum_reads_over_libpq() {
         let dsn = local_dsn();
-        let checksum_sql = "SELECT 7::bigint AS n_rows, decode('010203', 'hex') AS lthash";
+        let checksum_sql = "SELECT 7::bigint AS n_rows, decode('010203', 'hex') AS lthash, decode('040506', 'hex') AS set_hash";
         let sql = format!(
             "SELECT n_rows FROM pgl_validate.remote_checksum({}, {})",
             sql_literal(&dsn),
@@ -1027,6 +1054,14 @@ mod tests {
         );
         let lthash = Spi::get_one::<Vec<u8>>(&sql).unwrap().unwrap();
         assert_eq!(lthash, vec![0x01, 0x02, 0x03]);
+
+        let sql = format!(
+            "SELECT set_hash FROM pgl_validate.remote_checksum({}, {})",
+            sql_literal(&dsn),
+            sql_literal(checksum_sql)
+        );
+        let set_hash = Spi::get_one::<Vec<u8>>(&sql).unwrap().unwrap();
+        assert_eq!(set_hash, vec![0x04, 0x05, 0x06]);
     }
 
     #[pg_test]
@@ -1485,11 +1520,20 @@ mod tests {
         ))
         .unwrap();
 
-        let verdict_sql = format!(
-            "SELECT (pgl_validate.compare_table({}::regclass)).verdict",
+        let result_sql = format!(
+            "SELECT (r).run_id::text || ';' || (r).verdict FROM (
+                SELECT pgl_validate.compare_table(
+                    {}::regclass,
+                    NULL,
+                    '{{\"paranoid_confirm\":true}}'::jsonb
+                ) AS r
+             ) s",
             sql_literal(&format!("public.{table_name}"))
         );
-        let verdict = Spi::get_one::<String>(&verdict_sql).unwrap().unwrap();
+        let result = Spi::get_one::<String>(&result_sql).unwrap().unwrap();
+        let (run_id, verdict) = result
+            .split_once(';')
+            .expect("compare_table result should include run id and verdict");
         assert_eq!(verdict, "match");
 
         let participants = Spi::get_one::<i64>(
@@ -1498,6 +1542,19 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(participants, 2);
+
+        let confirmed_nodes = Spi::get_one::<i64>(&format!(
+            "
+            SELECT count(*)
+            FROM pgl_validate.table_node_result
+            WHERE run_id = {run_id}
+              AND node IN ('local', 'self_peer')
+              AND set_hash IS NOT NULL
+            "
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(confirmed_nodes, 2);
     }
 
     #[pg_test]

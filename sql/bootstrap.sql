@@ -1206,7 +1206,8 @@ CREATE FUNCTION pgl_validate.plan_chunk_sql(
     hi bytea,
     cols text[],
     repsets text[] DEFAULT NULL,
-    row_filter_sql text DEFAULT NULL
+    row_filter_sql text DEFAULT NULL,
+    include_set_hash boolean DEFAULT false
 )
 RETURNS text
 LANGUAGE plpgsql
@@ -1216,7 +1217,9 @@ DECLARE
     rel_sql text;
     enc_modes int[];
     digest_args text;
+    row_digest_expr text;
     selected_cols text[];
+    where_sql text;
 BEGIN
     IF lo IS NOT NULL OR hi IS NOT NULL THEN
         RAISE EXCEPTION 'bounded chunks are not available until Merkle planning is enabled'
@@ -1269,15 +1272,30 @@ BEGIN
       AND a.attnum > 0
       AND NOT a.attisdropped;
 
-    RETURN format(
-        'SELECT count(*)::bigint AS n_rows, pgl_validate.lthash_bytes(pgl_validate.lthash(pgl_validate.row_digest(%L::int[], %s))) AS lthash FROM %s t WHERE %s',
+    row_digest_expr := format(
+        'pgl_validate.row_digest(%L::int[], %s)',
         enc_modes::text,
-        digest_args,
+        digest_args
+    );
+    where_sql := CASE
+        WHEN row_filter_sql IS NULL OR btrim(row_filter_sql) = '' THEN 'true'
+        ELSE format('(%s)', row_filter_sql)
+    END;
+
+    IF include_set_hash THEN
+        RETURN format(
+            'WITH digests AS MATERIALIZED (SELECT %s AS rd FROM %s t WHERE %s), aggregate AS (SELECT count(*)::bigint AS n_rows, pgl_validate.lthash_bytes(pgl_validate.lthash(rd)) AS lthash FROM digests) SELECT aggregate.n_rows, aggregate.lthash, (SELECT pgl_validate.hash_digest_array(COALESCE(array_agg(rd ORDER BY rd), ARRAY[]::bytea[])) FROM digests) AS set_hash FROM aggregate',
+            row_digest_expr,
+            rel_sql,
+            where_sql
+        );
+    END IF;
+
+    RETURN format(
+        'SELECT count(*)::bigint AS n_rows, pgl_validate.lthash_bytes(pgl_validate.lthash(%s)) AS lthash, NULL::bytea AS set_hash FROM %s t WHERE %s',
+        row_digest_expr,
         rel_sql,
-        CASE
-            WHEN row_filter_sql IS NULL OR btrim(row_filter_sql) = '' THEN 'true'
-            ELSE format('(%s)', row_filter_sql)
-        END
+        where_sql
     );
 END
 $$;
@@ -1628,6 +1646,7 @@ DECLARE
     remote_localize_sql text;
     n_rows bigint;
     lthash bytea;
+    set_hash bytea;
     differ_count int := 0;
     confirmed_count int := 0;
     advisory_count int := 0;
@@ -1636,6 +1655,7 @@ DECLARE
     verdict text;
     result_reason text;
     result_row pgl_validate.table_result;
+    paranoid_confirm boolean := COALESCE((options->>'paranoid_confirm')::boolean, false);
     correlate_conflict_history boolean := COALESCE((options->>'correlate_conflict_history')::boolean, true);
     conflict_history_lookback interval := COALESCE((NULLIF(options->>'conflict_history_lookback', ''))::interval, interval '24 hours');
     conflict_history_max_rows int := COALESCE((NULLIF(options->>'conflict_history_max_rows', ''))::int, 1000);
@@ -2106,7 +2126,8 @@ BEGIN
         NULL,
         cols,
         NULL,
-        row_filter_sql
+        row_filter_sql,
+        paranoid_confirm
     );
     remote_checksum_sql := pgl_validate.plan_chunk_sql(
         p_table_name,
@@ -2115,14 +2136,15 @@ BEGIN
         NULL,
         cols,
         NULL,
-        NULL
+        NULL,
+        paranoid_confirm
     );
-    EXECUTE checksum_sql INTO n_rows, lthash;
+    EXECUTE checksum_sql INTO n_rows, lthash, set_hash;
 
     INSERT INTO pgl_validate.table_node_result(
         run_id, schema_name, table_name, node, n_rows, lthash, set_hash
     )
-    VALUES (v_run_id, v_schema_name, v_rel_name, 'local', n_rows, lthash, NULL);
+    VALUES (v_run_id, v_schema_name, v_rel_name, 'local', n_rows, lthash, set_hash);
 
     FOR peer_rec IN
         SELECT p.name, p.dsn, p.backend,
@@ -2133,7 +2155,7 @@ BEGIN
         WHERE p.name = ANY (peer_names)
         ORDER BY p.name
     LOOP
-        SELECT rc.pg_version, rc.n_rows, rc.lthash
+        SELECT rc.pg_version, rc.n_rows, rc.lthash, rc.set_hash
         INTO remote_rec
         FROM pgl_validate.remote_checksum(
             peer_rec.dsn,
@@ -2163,11 +2185,12 @@ BEGIN
         )
         VALUES (
             v_run_id, v_schema_name, v_rel_name, peer_rec.name,
-            remote_rec.n_rows, remote_rec.lthash, NULL
+            remote_rec.n_rows, remote_rec.lthash, remote_rec.set_hash
         );
 
         IF remote_rec.n_rows IS DISTINCT FROM n_rows
-           OR remote_rec.lthash IS DISTINCT FROM lthash THEN
+           OR remote_rec.lthash IS DISTINCT FROM lthash
+           OR (paranoid_confirm AND remote_rec.set_hash IS DISTINCT FROM set_hash) THEN
             differ_count := differ_count + 1;
         END IF;
     END LOOP;

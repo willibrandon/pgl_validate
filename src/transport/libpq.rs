@@ -40,6 +40,8 @@ pub(crate) struct RemoteChecksum {
     pub(crate) n_rows: i64,
     /// Remote LtHash bytes.
     pub(crate) lthash: Vec<u8>,
+    /// Optional cryptographic set hash for paranoid confirmation.
+    pub(crate) set_hash: Option<Vec<u8>>,
 }
 
 /// Key and row digest fetched while localizing a divergent chunk.
@@ -675,16 +677,17 @@ pub(crate) fn fetch_checksum(
     let wrapped_sql = format!(
         "SELECT current_setting('server_version_num')::int::text, \
                 q.n_rows::bigint::text, \
-                encode(q.lthash, 'hex') \
+                encode(q.lthash, 'hex'), \
+                encode(q.set_hash, 'hex') \
          FROM ({checksum_sql}) AS q"
     );
 
     let result = conn.exec(&wrapped_sql)?;
     result.require_status(PGRES_TUPLES_OK)?;
 
-    if result.ntuples() != 1 || result.nfields() != 3 {
+    if result.ntuples() != 1 || result.nfields() != 4 {
         return Err(format!(
-            "remote checksum returned {} row(s) and {} column(s), expected 1 row and 3 columns",
+            "remote checksum returned {} row(s) and {} column(s), expected 1 row and 4 columns",
             result.ntuples(),
             result.nfields()
         ));
@@ -699,11 +702,16 @@ pub(crate) fn fetch_checksum(
         .parse::<i64>()
         .map_err(|err| format!("invalid remote row count: {err}"))?;
     let lthash = parse_hex(&result.value(0, 2)?)?;
+    let set_hash = result
+        .value_opt(0, 3)?
+        .map(|value| parse_hex(&value))
+        .transpose()?;
 
     Ok(RemoteChecksum {
         pg_version,
         n_rows,
         lthash,
+        set_hash,
     })
 }
 
