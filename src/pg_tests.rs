@@ -1674,6 +1674,44 @@ mod tests {
     }
 
     #[pg_test]
+    fn remote_checksum_batch_reads_over_bounded_libpq_fanout() {
+        let dsn = local_dsn();
+        let sql = format!(
+            "
+            SELECT string_agg(
+                       task_id::text || ':' || n_rows::text || ':' || encode(lthash, 'hex'),
+                       ',' ORDER BY task_id
+                   )
+            FROM pgl_validate.remote_checksum_batch(
+                jsonb_build_array(
+                    jsonb_build_object(
+                        'task_id', 1,
+                        'dsn', {dsn},
+                        'checksum_sql', 'SELECT 11::bigint AS n_rows, decode(''0a'', ''hex'') AS lthash, NULL::bytea AS set_hash',
+                        'connect_timeout_seconds', 10,
+                        'statement_timeout_ms', 600000,
+                        'lock_timeout_ms', 30000
+                    ),
+                    jsonb_build_object(
+                        'task_id', 2,
+                        'dsn', {dsn},
+                        'checksum_sql', 'SELECT 12::bigint AS n_rows, decode(''0b'', ''hex'') AS lthash, NULL::bytea AS set_hash',
+                        'connect_timeout_seconds', 10,
+                        'statement_timeout_ms', 600000,
+                        'lock_timeout_ms', 30000
+                    )
+                ),
+                2
+            )
+            ",
+            dsn = sql_literal(&dsn)
+        );
+
+        let summary = Spi::get_one::<String>(&sql).unwrap().unwrap();
+        assert_eq!(summary, "1:11:0a,2:12:0b");
+    }
+
+    #[pg_test]
     fn remote_inject_barrier_returns_visible_token_and_lsn() {
         let dsn = local_dsn();
         let sql = format!(

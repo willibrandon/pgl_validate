@@ -176,6 +176,8 @@ COMMENT ON FUNCTION pgl_validate.row_filter_tree_is_immutable(text) IS
     'Return whether a serialized PostgreSQL row-filter expression tree contains only immutable functions.';
 COMMENT ON FUNCTION pgl_validate.remote_checksum(text, text, integer, integer, integer) IS
     'Execute generated checksum SQL on a named peer DSN via libpq, returning row count, LtHash, and optional set hash.';
+COMMENT ON FUNCTION pgl_validate.remote_checksum_batch(jsonb, integer) IS
+    'Execute generated checksum SQL tasks through bounded libpq fan-out for parallel chunk validation.';
 COMMENT ON FUNCTION pgl_validate.remote_schema_signature(text, text, integer, integer, integer) IS
     'Execute generated schema-signature SQL on a named peer DSN via libpq, returning remote server version and signature text.';
 COMMENT ON FUNCTION pgl_validate.remote_localize_rows(text, text, integer, integer, integer) IS

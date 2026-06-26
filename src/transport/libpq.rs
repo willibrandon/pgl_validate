@@ -1,5 +1,8 @@
 use core::ffi::{c_char, c_int};
+use serde::Deserialize;
 use std::ffi::{CStr, CString};
+use std::thread;
+use std::time::Duration;
 
 const CONNECTION_OK: c_int = 0;
 const PGRES_COMMAND_OK: c_int = 1;
@@ -21,6 +24,11 @@ unsafe extern "C" {
     fn PQerrorMessage(conn: *const PGconn) -> *mut c_char;
     fn PQfinish(conn: *mut PGconn);
     fn PQexec(conn: *mut PGconn, query: *const c_char) -> *mut PGresult;
+    fn PQsetnonblocking(conn: *mut PGconn, arg: c_int) -> c_int;
+    fn PQsendQuery(conn: *mut PGconn, query: *const c_char) -> c_int;
+    fn PQconsumeInput(conn: *mut PGconn) -> c_int;
+    fn PQisBusy(conn: *mut PGconn) -> c_int;
+    fn PQgetResult(conn: *mut PGconn) -> *mut PGresult;
     fn PQresultStatus(res: *const PGresult) -> c_int;
     fn PQresultErrorMessage(res: *const PGresult) -> *mut c_char;
     fn PQntuples(res: *const PGresult) -> c_int;
@@ -42,6 +50,32 @@ pub(crate) struct RemoteChecksum {
     pub(crate) lthash: Vec<u8>,
     /// Optional cryptographic set hash for paranoid confirmation.
     pub(crate) set_hash: Option<Vec<u8>>,
+}
+
+/// One generated checksum request scheduled by the chunk fan-out executor.
+#[derive(Debug, Clone, Deserialize, Eq, PartialEq)]
+pub(crate) struct RemoteChecksumTask {
+    /// Stable task identifier assigned by SQL for joining results back to chunks.
+    pub(crate) task_id: i32,
+    /// Remote libpq connection string.
+    pub(crate) dsn: String,
+    /// Generated checksum SQL to execute on the remote node.
+    pub(crate) checksum_sql: String,
+    /// libpq connection timeout in seconds.
+    pub(crate) connect_timeout_seconds: i32,
+    /// PostgreSQL statement timeout in milliseconds.
+    pub(crate) statement_timeout_ms: i32,
+    /// PostgreSQL lock timeout in milliseconds.
+    pub(crate) lock_timeout_ms: i32,
+}
+
+/// Result for one generated checksum request in a fan-out batch.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) struct RemoteChecksumBatchResult {
+    /// Stable task identifier from `RemoteChecksumTask`.
+    pub(crate) task_id: i32,
+    /// Remote server checksum result.
+    pub(crate) checksum: RemoteChecksum,
 }
 
 /// Schema-contract signature fetched from a remote participant.
@@ -260,6 +294,51 @@ impl Connection {
     fn exec_command(&self, sql: &str) -> Result<(), String> {
         let result = self.exec(sql)?;
         result.require_status(PGRES_COMMAND_OK)
+    }
+
+    fn set_nonblocking(&self, enabled: bool) -> Result<(), String> {
+        let value = if enabled { 1 } else { 0 };
+        if unsafe { PQsetnonblocking(self.raw, value) } == 0 {
+            Ok(())
+        } else {
+            Err(format!(
+                "could not set libpq nonblocking mode: {}",
+                self.error_message()
+            ))
+        }
+    }
+
+    fn send_query(&self, sql: &str) -> Result<(), String> {
+        let sql = CString::new(sql).map_err(|_| "query contains an embedded NUL".to_string())?;
+        if unsafe { PQsendQuery(self.raw, sql.as_ptr()) } == 1 {
+            Ok(())
+        } else {
+            Err(format!("libpq send query failed: {}", self.error_message()))
+        }
+    }
+
+    fn consume_input(&self) -> Result<(), String> {
+        if unsafe { PQconsumeInput(self.raw) } == 1 {
+            Ok(())
+        } else {
+            Err(format!(
+                "libpq consume input failed: {}",
+                self.error_message()
+            ))
+        }
+    }
+
+    fn is_busy(&self) -> bool {
+        unsafe { PQisBusy(self.raw) == 1 }
+    }
+
+    fn next_result(&self) -> Option<QueryResult> {
+        let raw = unsafe { PQgetResult(self.raw) };
+        if raw.is_null() {
+            None
+        } else {
+            Some(QueryResult { raw })
+        }
     }
 
     fn set_query_timeouts(
@@ -1036,6 +1115,159 @@ pub(crate) fn fetch_checksum(
     );
 
     let result = conn.exec(&wrapped_sql)?;
+    result.require_status(PGRES_TUPLES_OK)?;
+
+    if result.ntuples() != 1 || result.nfields() != 4 {
+        return Err(format!(
+            "remote checksum returned {} row(s) and {} column(s), expected 1 row and 4 columns",
+            result.ntuples(),
+            result.nfields()
+        ));
+    }
+
+    let pg_version = result
+        .value(0, 0)?
+        .parse::<i32>()
+        .map_err(|err| format!("invalid remote server_version_num: {err}"))?;
+    let n_rows = result
+        .value(0, 1)?
+        .parse::<i64>()
+        .map_err(|err| format!("invalid remote row count: {err}"))?;
+    let lthash = parse_hex(&result.value(0, 2)?)?;
+    let set_hash = result
+        .value_opt(0, 3)?
+        .map(|value| parse_hex(&value))
+        .transpose()?;
+
+    Ok(RemoteChecksum {
+        pg_version,
+        n_rows,
+        lthash,
+        set_hash,
+    })
+}
+
+/// Run generated checksum SQL requests concurrently over bounded libpq fan-out.
+pub(crate) fn fetch_checksums_batch(
+    tasks: Vec<RemoteChecksumTask>,
+    max_parallel: i32,
+) -> Result<Vec<RemoteChecksumBatchResult>, String> {
+    if max_parallel <= 0 {
+        return Err("max_parallel must be greater than zero".to_string());
+    }
+
+    let mut pending = tasks.into_iter();
+    let mut active = Vec::<ActiveChecksumTask>::new();
+    let mut results = Vec::<RemoteChecksumBatchResult>::new();
+    let max_parallel = max_parallel as usize;
+
+    loop {
+        while active.len() < max_parallel {
+            let Some(task) = pending.next() else {
+                break;
+            };
+            active.push(ActiveChecksumTask::start(task)?);
+        }
+
+        if active.is_empty() {
+            break;
+        }
+
+        let mut index = 0;
+        let mut made_progress = false;
+        while index < active.len() {
+            match active[index].try_finish()? {
+                Some(result) => {
+                    results.push(result);
+                    active.swap_remove(index);
+                    made_progress = true;
+                }
+                None => {
+                    index += 1;
+                }
+            }
+        }
+
+        if !made_progress {
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    results.sort_by_key(|result| result.task_id);
+    Ok(results)
+}
+
+struct ActiveChecksumTask {
+    task: RemoteChecksumTask,
+    conn: Connection,
+    saw_result: bool,
+}
+
+impl ActiveChecksumTask {
+    fn start(task: RemoteChecksumTask) -> Result<Self, String> {
+        if task.task_id <= 0 {
+            return Err("remote checksum batch task_id must be greater than zero".to_string());
+        }
+
+        let conn = Connection::connect_with_timeout(&task.dsn, task.connect_timeout_seconds)?;
+        conn.set_query_timeouts(task.statement_timeout_ms, task.lock_timeout_ms)?;
+        conn.set_nonblocking(true)?;
+        conn.send_query(&checksum_wrapper_sql(&task.checksum_sql))?;
+
+        Ok(Self {
+            task,
+            conn,
+            saw_result: false,
+        })
+    }
+
+    fn try_finish(&mut self) -> Result<Option<RemoteChecksumBatchResult>, String> {
+        self.conn.consume_input()?;
+        if self.conn.is_busy() {
+            return Ok(None);
+        }
+
+        let mut checksum = None;
+        while let Some(result) = self.conn.next_result() {
+            if self.saw_result {
+                return Err(format!(
+                    "remote checksum batch task {} returned more than one result",
+                    self.task.task_id
+                ));
+            }
+
+            checksum = Some(parse_checksum_result(&result)?);
+            self.saw_result = true;
+        }
+
+        let Some(checksum) = checksum else {
+            if self.saw_result {
+                return Ok(None);
+            }
+            return Err(format!(
+                "remote checksum batch task {} completed without a result",
+                self.task.task_id
+            ));
+        };
+
+        Ok(Some(RemoteChecksumBatchResult {
+            task_id: self.task.task_id,
+            checksum,
+        }))
+    }
+}
+
+fn checksum_wrapper_sql(checksum_sql: &str) -> String {
+    format!(
+        "SELECT current_setting('server_version_num')::int::text, \
+                q.n_rows::bigint::text, \
+                encode(q.lthash, 'hex'), \
+                encode(q.set_hash, 'hex') \
+         FROM ({checksum_sql}) AS q"
+    )
+}
+
+fn parse_checksum_result(result: &QueryResult) -> Result<RemoteChecksum, String> {
     result.require_status(PGRES_TUPLES_OK)?;
 
     if result.ntuples() != 1 || result.nfields() != 4 {

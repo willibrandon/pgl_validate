@@ -48,9 +48,9 @@ mod pgl_validate {
     use super::digest;
     use super::transport;
     use super::worker;
-    use pgrx::StringInfo;
     use pgrx::aggregate::*;
     use pgrx::prelude::*;
+    use pgrx::{JsonB, StringInfo};
     use serde::{Deserialize, Serialize};
     use std::ffi::CString;
 
@@ -176,6 +176,37 @@ mod pgl_validate {
             checksum.lthash,
             checksum.set_hash,
         ))
+    }
+
+    /// Execute generated checksum SQL tasks over bounded libpq fan-out.
+    #[pg_extern(volatile, parallel_unsafe)]
+    fn remote_checksum_batch(
+        tasks: JsonB,
+        max_parallel: default!(i32, 4),
+    ) -> TableIterator<
+        'static,
+        (
+            name!(task_id, i32),
+            name!(pg_version, i32),
+            name!(n_rows, i64),
+            name!(lthash, Vec<u8>),
+            name!(set_hash, Option<Vec<u8>>),
+        ),
+    > {
+        let tasks = serde_json::from_value::<Vec<transport::libpq::RemoteChecksumTask>>(tasks.0)
+            .unwrap_or_else(|err| pgrx::error!("could not decode remote checksum tasks: {err}"));
+        let results = transport::libpq::fetch_checksums_batch(tasks, max_parallel)
+            .unwrap_or_else(|err| pgrx::error!("{err}"));
+
+        TableIterator::new(results.into_iter().map(|result| {
+            (
+                result.task_id,
+                result.checksum.pg_version,
+                result.checksum.n_rows,
+                result.checksum.lthash,
+                result.checksum.set_hash,
+            )
+        }))
     }
 
     /// Execute generated schema-signature SQL on a remote peer over libpq.
