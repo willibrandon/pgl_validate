@@ -231,6 +231,41 @@ function Invoke-Logged {
     }
 }
 
+function Install-HomebrewFormula {
+    param([string[]] $Formulae)
+
+    $brew = Get-PglCommandSource -Name 'brew'
+    if (-not $brew) {
+        throw 'Homebrew was not found.'
+    }
+
+    foreach ($formula in $Formulae) {
+        $installed = & $brew list --versions $formula 2>$null
+        if ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace(($installed -join ''))) {
+            Write-Host "+ brew list --versions $formula"
+            Write-Host ($installed -join [Environment]::NewLine)
+            continue
+        }
+
+        Write-Host "+ brew install $formula"
+        $output = & $brew install $formula 2>&1
+        $exitCode = $LASTEXITCODE
+        foreach ($line in $output) {
+            $text = "$line"
+            if ($text -match '^Warning: postgresql@\d+ was installed but not linked because .+ already installed\. To link this version, run: brew link postgresql@\d+$') {
+                Write-Host "Homebrew did not link $formula; CI uses its explicit pg_config path."
+                continue
+            }
+
+            Write-Host $text
+        }
+
+        if ($exitCode -ne 0) {
+            throw "brew install $formula exited with code $exitCode."
+        }
+    }
+}
+
 function Get-PostgresSourceVersion {
     param([int] $Major)
 
@@ -448,7 +483,7 @@ function Initialize-LinuxPostgres {
 function Initialize-MacPostgres {
     Remove-UntrustedHomebrewTaps
     Disconnect-HomebrewPostgresLinks
-    Invoke-Logged -FilePath 'brew' -Arguments @('install', 'llvm', 'pkg-config', "postgresql@$PgMajor")
+    Install-HomebrewFormula -Formulae @('llvm', 'pkg-config', "postgresql@$PgMajor")
 
     $llvmPrefix = (& brew --prefix llvm).Trim()
     $llvmBin = Join-Path $llvmPrefix 'bin'
