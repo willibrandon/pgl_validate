@@ -511,6 +511,104 @@ SELECT EXISTS (
         throw 'compare_table did not record a native converged fence'
     }
 
+    Write-Step 'Validating native row-filter transition semantics'
+    Invoke-Sql -Database 'provider' -Sql @"
+CREATE TABLE public.native_filtered_accounts(
+    id int PRIMARY KEY,
+    include_row boolean NOT NULL,
+    value text
+);
+ALTER TABLE public.native_filtered_accounts REPLICA IDENTITY FULL;
+CREATE PUBLICATION native_filter_pub
+FOR TABLE public.native_filtered_accounts
+WHERE (include_row);
+"@ | Out-Null
+    Invoke-Sql -Database 'target' -Sql @"
+CREATE TABLE public.native_filtered_accounts(
+    id int PRIMARY KEY,
+    include_row boolean NOT NULL,
+    value text
+);
+"@ | Out-Null
+    Invoke-Sql -Database 'target' -Sql @"
+ALTER SUBSCRIPTION native_sub
+ADD PUBLICATION native_filter_pub
+WITH (copy_data = false, refresh = true);
+"@ | Out-Null
+    $null = Wait-NativeSubscriptionReady `
+        -SubscriberDatabase 'target' `
+        -SubscriptionName 'native_sub' `
+        -ProviderDatabase 'provider' `
+        -MinReadyRelations 3 `
+        -TimeoutSeconds $TimeoutSeconds
+
+    $filteredOutLsn = Invoke-Sql -Database 'provider' -Sql @"
+INSERT INTO public.native_filtered_accounts
+VALUES (6, false, 'insert-filtered-out');
+SELECT pg_current_wal_lsn()::text;
+"@
+    Wait-SqlEquals `
+        -Database 'provider' `
+        -Sql "SELECT COALESCE((SELECT (confirmed_flush_lsn >= '$filteredOutLsn'::pg_lsn)::text FROM pg_replication_slots WHERE slot_name = 'native_sub'), 'false')" `
+        -Expected 'true' `
+        -TimeoutSeconds $TimeoutSeconds
+    $filteredInsertAbsent = Invoke-Sql -Database 'target' -Sql "SELECT count(*)::text FROM public.native_filtered_accounts WHERE id = 6"
+    if ($filteredInsertAbsent -ne '0') {
+        throw "native filtered-out INSERT unexpectedly appeared on subscriber: $filteredInsertAbsent"
+    }
+
+    Invoke-Sql -Database 'provider' -Sql @"
+UPDATE public.native_filtered_accounts
+SET include_row = true,
+    value = 'entered-filter-through-update'
+WHERE id = 6;
+"@ | Out-Null
+    Wait-SqlEquals `
+        -Database 'target' `
+        -Sql "SELECT count(*)::text FROM public.native_filtered_accounts WHERE id = 6 AND include_row AND value = 'entered-filter-through-update'" `
+        -Expected '1' `
+        -TimeoutSeconds $TimeoutSeconds
+
+    $nativeFilterResult = Invoke-Sql -Database 'provider' -Sql @"
+SELECT run_id::text || ';' || verdict
+FROM pgl_validate.compare_table(
+    'public.native_filtered_accounts'::regclass,
+    ARRAY['target'],
+    jsonb_build_object(
+        'backend', 'native',
+        'provider_dsn', $providerDsnSql,
+        'provider_node', 'provider',
+        'publications', jsonb_build_array('native_filter_pub'),
+        'fence_timeout_ms', 30000,
+        'fence_poll_interval_ms', 100
+    )
+)
+"@
+    $nativeFilterParts = $nativeFilterResult.Split(';', 2)
+    if ($nativeFilterParts.Count -ne 2) {
+        throw "unexpected native filtered compare_table result: $nativeFilterResult"
+    }
+    $nativeFilterRunId = $nativeFilterParts[0]
+    $nativeFilterVerdict = $nativeFilterParts[1]
+    if ($nativeFilterVerdict -ne 'match') {
+        throw "unexpected native filtered compare_table verdict: $nativeFilterVerdict"
+    }
+
+    $nativeFilterContract = Invoke-Sql -Database 'provider' -Sql @"
+SELECT tp.validated_property || ';' ||
+       tp.has_row_filter::text || ';' ||
+       COALESCE(count(d.*), 0)::text
+FROM pgl_validate.table_plan tp
+LEFT JOIN pgl_validate.divergence d USING (run_id, schema_name, table_name)
+WHERE tp.run_id = $nativeFilterRunId
+  AND tp.schema_name = 'public'
+  AND tp.table_name = 'native_filtered_accounts'
+GROUP BY tp.validated_property, tp.has_row_filter
+"@
+    if ($nativeFilterContract -ne 'full;true;0') {
+        throw "native filtered table was not validated as full equality: $nativeFilterContract"
+    }
+
     Write-Step 'Validating native mid-sync table is skipped before fencing'
     $nativeSyncMarked = Invoke-Sql -Database 'target' -Sql @"
 UPDATE pg_subscription_rel sr
@@ -640,7 +738,7 @@ SELECT EXISTS (
         throw 'native subscriber-side drift was not confirmed through a recheck fence'
     }
 
-    Write-Output "native logical fence, compare_table, and divergence recheck tests passed on pg$PgMajor using slot $slotName"
+    Write-Output "native logical fence, row-filter transition, compare_table, and divergence recheck tests passed on pg$PgMajor using slot $slotName"
 }
 catch {
     if (Test-Path -LiteralPath $log) {
