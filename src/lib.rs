@@ -3364,6 +3364,33 @@ mod tests {
         let contract = Spi::get_one::<String>(&contract_sql).unwrap().unwrap();
 
         assert_eq!(contract, "skipped;false;false");
+
+        let run_id = Spi::get_one::<i64>(&format!(
+            "
+            SELECT (pgl_validate.compare_table(
+                'public.{table_name}'::regclass,
+                ARRAY[]::text[],
+                jsonb_build_object('repsets', jsonb_build_array({repset}))
+            )).run_id
+            ",
+            repset = sql_literal(&repset_name)
+        ))
+        .unwrap()
+        .unwrap();
+        let issue = Spi::get_one::<String>(&format!(
+            "
+            SELECT tr.verdict || ';' || si.issue_code
+            FROM pgl_validate.table_result tr
+            JOIN pgl_validate.schema_issue si
+              ON si.run_id = tr.run_id
+             AND si.schema_name = tr.schema_name
+             AND si.table_name = tr.table_name
+            WHERE tr.run_id = {run_id}
+            "
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(issue, "skipped;NONDETERMINISTIC_ROW_FILTER");
     }
 
     #[pg_test]

@@ -1909,6 +1909,7 @@ DECLARE
     validated_property text := 'full';
     exact_comparable boolean := true;
     contract_reason text := 'direct full-table comparison';
+    issue_code text;
     pglogical_available boolean;
     table_in_pglogical boolean := false;
     table_in_native_publication boolean := false;
@@ -2242,20 +2243,28 @@ BEGIN
     );
 
     IF NOT exact_comparable THEN
-        IF has_row_filter AND NOT row_filter_exact THEN
-            INSERT INTO pgl_validate.schema_issue(
-                run_id, node, schema_name, table_name, issue_code, detail
-            )
-            VALUES (
-                v_run_id,
-                provider_node,
-                v_schema_name,
-                v_rel_name,
-                'NONDETERMINISTIC_ROW_FILTER',
-                contract_reason
-            )
-            ON CONFLICT DO NOTHING;
-        END IF;
+        issue_code := CASE
+            WHEN has_row_filter AND NOT row_filter_exact THEN 'NONDETERMINISTIC_ROW_FILTER'
+            WHEN sync_status IS NOT NULL AND sync_status <> 'r' THEN 'SYNC_NOT_READY'
+            WHEN validated_property = 'unsupported_mask' THEN 'UNSUPPORTED_ACTION_MASK'
+            WHEN validated_property = 'filtered_advisory' THEN 'FILTERED_ADVISORY_ONLY'
+            WHEN contract_reason ILIKE '%incompatible column list%' THEN 'INCOMPATIBLE_COLUMN_LIST'
+            WHEN contract_reason ILIKE '%not a member%' THEN 'TABLE_NOT_IN_REPLICATION_CONTRACT'
+            ELSE 'NOT_EXACT_COMPARABLE'
+        END;
+
+        INSERT INTO pgl_validate.schema_issue(
+            run_id, node, schema_name, table_name, issue_code, detail
+        )
+        VALUES (
+            v_run_id,
+            provider_node,
+            v_schema_name,
+            v_rel_name,
+            issue_code,
+            contract_reason
+        )
+        ON CONFLICT DO NOTHING;
 
         verdict := CASE
             WHEN validated_property IN ('skipped','unsupported_mask') THEN 'skipped'
