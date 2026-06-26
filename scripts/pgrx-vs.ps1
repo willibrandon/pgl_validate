@@ -1,6 +1,6 @@
 param(
-    [Parameter(ValueFromRemainingArguments = $true)]
-    [string[]] $Command = @('cargo', 'pgrx', 'test', 'pg18')
+    [Parameter(Position = 0, ValueFromRemainingArguments = $true)]
+    [string[]] $Invocation = @('cargo', 'pgrx', 'test', 'pg18')
 )
 
 $ErrorActionPreference = 'Stop'
@@ -9,11 +9,11 @@ $common = Join-Path $PSScriptRoot 'pgrx-common.ps1'
 . $common
 
 if (-not (Test-PglWindows)) {
-    if ($Command.Length -gt 1) {
-        & $Command[0] $Command[1..($Command.Length - 1)]
+    if ($Invocation.Length -gt 1) {
+        & $Invocation[0] $Invocation[1..($Invocation.Length - 1)]
     }
     else {
-        & $Command[0]
+        & $Invocation[0]
     }
     exit $LASTEXITCODE
 }
@@ -65,6 +65,6 @@ if (-not (Test-Path $vcvars)) {
     throw "$vcvarsName was not found at $vcvars"
 }
 
-$argLine = ($Command | ForEach-Object { '"' + ($_ -replace '"', '\"') + '"' }) -join ' '
+$argLine = ($Invocation | ForEach-Object { '"' + ($_ -replace '"', '\"') + '"' }) -join ' '
 & cmd.exe /d /s /c "call `"$vcvars`" >nul && $argLine"
 exit $LASTEXITCODE

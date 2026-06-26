@@ -52,17 +52,27 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
-
-      - name: Select Rust toolchain override
-        if: ${{ matrix.target.rust_toolchain != null }}
+      - name: Install Rust toolchain
         run: |
-          rustup toolchain install ${{ matrix.target.rust_toolchain }}
-          rustup default ${{ matrix.target.rust_toolchain }}
+          $toolchain = '${{ matrix.target.rust_toolchain }}'
+          if ([string]::IsNullOrWhiteSpace($toolchain)) {
+            $toolchain = 'stable'
+          }
+          rustup toolchain install $toolchain --profile minimal
+          rustup default $toolchain
+          rustc --version
+          cargo --version
 
-      - uses: Swatinem/rust-cache@v2
+      - name: Cache cargo artifacts
+        uses: actions/cache@v4
         with:
-          key: pgrx-pg${{ matrix.pg }}-${{ matrix.target.platform }}
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-pgrx-pg${{ matrix.pg }}-${{ matrix.target.platform }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-pgrx-pg${{ matrix.pg }}-${{ matrix.target.platform }}-
 
       - name: Cache source-built PostgreSQL
         if: ${{ matrix.target.postgres_from_source == true }}
@@ -71,41 +81,35 @@ jobs:
           path: ~/.pgrx/postgresql-*
           key: postgres-source-pg${{ matrix.pg }}-${{ matrix.target.platform }}-v1
 
-      - name: Enter MSVC developer environment
-        if: runner.os == 'Windows'
-        uses: ilammy/msvc-dev-cmd@v1
-        with:
-          arch: ${{ matrix.target.msvc_arch }}
-
       - name: Set up PostgreSQL and pgrx
         env:
           PGL_VALIDATE_MSVC_ARCH: ${{ matrix.target.msvc_arch }}
           PGL_VALIDATE_POSTGRES_FROM_SOURCE: ${{ matrix.target.postgres_from_source }}
         run: |
-          $setupArgs = @('-PgMajor', '${{ matrix.pg }}')
+          $setupArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', './scripts/ci-setup.ps1', '-PgMajor', '${{ matrix.pg }}')
           if ($env:PGL_VALIDATE_POSTGRES_FROM_SOURCE -eq 'true') {
             $setupArgs += '-BuildPostgresFromSource'
           }
-          ./scripts/ci-setup.ps1 @setupArgs
+          ./scripts/pgrx-vs.ps1 pwsh @setupArgs
 
       - name: Install pglogical release
         env:
           PGL_VALIDATE_MSVC_ARCH: ${{ matrix.target.msvc_arch }}
-        run: ./scripts/install-pglogical-release.ps1 -PgMajor ${{ matrix.pg }}
+        run: ./scripts/pgrx-vs.ps1 pwsh -NoProfile -ExecutionPolicy Bypass -File ./scripts/install-pglogical-release.ps1 -PgMajor ${{ matrix.pg }}
 
       - name: Run pgrx pg_test suite
         env:
           PGL_VALIDATE_MSVC_ARCH: ${{ matrix.target.msvc_arch }}
-        run: ./scripts/test-pgrx.ps1 -PgMajor ${{ matrix.pg }} -TimeoutSeconds 1800
+        run: ./scripts/pgrx-vs.ps1 pwsh -NoProfile -ExecutionPolicy Bypass -File ./scripts/test-pgrx.ps1 -PgMajor ${{ matrix.pg }} -TimeoutSeconds 1800
 
       - name: Run async worker smoke harness
         env:
           PGL_VALIDATE_MSVC_ARCH: ${{ matrix.target.msvc_arch }}
-        run: ./scripts/test-async-worker.ps1 -PgMajor ${{ matrix.pg }} -TimeoutSeconds 180
+        run: ./scripts/pgrx-vs.ps1 pwsh -NoProfile -ExecutionPolicy Bypass -File ./scripts/test-async-worker.ps1 -PgMajor ${{ matrix.pg }} -TimeoutSeconds 180
 
       - name: Clean test clusters
         if: always()
-        run: ./scripts/stop-pgrx-test-clusters.ps1 -RemoveData
+        run: ./scripts/pgrx-vs.ps1 pwsh -NoProfile -ExecutionPolicy Bypass -File ./scripts/stop-pgrx-test-clusters.ps1 -RemoveData
 
   pglogical:
     name: pglogical pg${{ matrix.pg }} / ${{ matrix.target.platform }}
@@ -140,17 +144,27 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
-
-      - name: Select Rust toolchain override
-        if: ${{ matrix.target.rust_toolchain != null }}
+      - name: Install Rust toolchain
         run: |
-          rustup toolchain install ${{ matrix.target.rust_toolchain }}
-          rustup default ${{ matrix.target.rust_toolchain }}
+          $toolchain = '${{ matrix.target.rust_toolchain }}'
+          if ([string]::IsNullOrWhiteSpace($toolchain)) {
+            $toolchain = 'stable'
+          }
+          rustup toolchain install $toolchain --profile minimal
+          rustup default $toolchain
+          rustc --version
+          cargo --version
 
-      - uses: Swatinem/rust-cache@v2
+      - name: Cache cargo artifacts
+        uses: actions/cache@v4
         with:
-          key: pglogical-pg${{ matrix.pg }}-${{ matrix.target.platform }}
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-pglogical-pg${{ matrix.pg }}-${{ matrix.target.platform }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-pglogical-pg${{ matrix.pg }}-${{ matrix.target.platform }}-
 
       - name: Cache source-built PostgreSQL
         if: ${{ matrix.target.postgres_from_source == true }}
@@ -159,36 +173,30 @@ jobs:
           path: ~/.pgrx/postgresql-*
           key: postgres-source-pg${{ matrix.pg }}-${{ matrix.target.platform }}-v1
 
-      - name: Enter MSVC developer environment
-        if: runner.os == 'Windows'
-        uses: ilammy/msvc-dev-cmd@v1
-        with:
-          arch: ${{ matrix.target.msvc_arch }}
-
       - name: Set up PostgreSQL and pgrx
         env:
           PGL_VALIDATE_MSVC_ARCH: ${{ matrix.target.msvc_arch }}
           PGL_VALIDATE_POSTGRES_FROM_SOURCE: ${{ matrix.target.postgres_from_source }}
         run: |
-          $setupArgs = @('-PgMajor', '${{ matrix.pg }}')
+          $setupArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', './scripts/ci-setup.ps1', '-PgMajor', '${{ matrix.pg }}')
           if ($env:PGL_VALIDATE_POSTGRES_FROM_SOURCE -eq 'true') {
             $setupArgs += '-BuildPostgresFromSource'
           }
-          ./scripts/ci-setup.ps1 @setupArgs
+          ./scripts/pgrx-vs.ps1 pwsh @setupArgs
 
       - name: Install pglogical release
         env:
           PGL_VALIDATE_MSVC_ARCH: ${{ matrix.target.msvc_arch }}
-        run: ./scripts/install-pglogical-release.ps1 -PgMajor ${{ matrix.pg }}
+        run: ./scripts/pgrx-vs.ps1 pwsh -NoProfile -ExecutionPolicy Bypass -File ./scripts/install-pglogical-release.ps1 -PgMajor ${{ matrix.pg }}
 
       - name: Run pglogical fence harness
         env:
           PGL_VALIDATE_MSVC_ARCH: ${{ matrix.target.msvc_arch }}
-        run: ./scripts/test-pglogical-fence.ps1 -PgMajor ${{ matrix.pg }} -TimeoutSeconds 900
+        run: ./scripts/pgrx-vs.ps1 pwsh -NoProfile -ExecutionPolicy Bypass -File ./scripts/test-pglogical-fence.ps1 -PgMajor ${{ matrix.pg }} -TimeoutSeconds 900
 
       - name: Clean test clusters
         if: always()
-        run: ./scripts/stop-pgrx-test-clusters.ps1 -RemoveData
+        run: ./scripts/pgrx-vs.ps1 pwsh -NoProfile -ExecutionPolicy Bypass -File ./scripts/stop-pgrx-test-clusters.ps1 -RemoveData
 
   replication-harnesses:
     name: ${{ matrix.backend }} pg${{ matrix.pg }} / ${{ matrix.target.platform }}
@@ -224,17 +232,27 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
-
-      - name: Select Rust toolchain override
-        if: ${{ matrix.target.rust_toolchain != null }}
+      - name: Install Rust toolchain
         run: |
-          rustup toolchain install ${{ matrix.target.rust_toolchain }}
-          rustup default ${{ matrix.target.rust_toolchain }}
+          $toolchain = '${{ matrix.target.rust_toolchain }}'
+          if ([string]::IsNullOrWhiteSpace($toolchain)) {
+            $toolchain = 'stable'
+          }
+          rustup toolchain install $toolchain --profile minimal
+          rustup default $toolchain
+          rustc --version
+          cargo --version
 
-      - uses: Swatinem/rust-cache@v2
+      - name: Cache cargo artifacts
+        uses: actions/cache@v4
         with:
-          key: ${{ matrix.backend }}-pg${{ matrix.pg }}-${{ matrix.target.platform }}
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ matrix.backend }}-pg${{ matrix.pg }}-${{ matrix.target.platform }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ matrix.backend }}-pg${{ matrix.pg }}-${{ matrix.target.platform }}-
 
       - name: Cache source-built PostgreSQL
         if: ${{ matrix.target.postgres_from_source == true }}
@@ -243,35 +261,29 @@ jobs:
           path: ~/.pgrx/postgresql-*
           key: postgres-source-pg${{ matrix.pg }}-${{ matrix.target.platform }}-v1
 
-      - name: Enter MSVC developer environment
-        if: runner.os == 'Windows'
-        uses: ilammy/msvc-dev-cmd@v1
-        with:
-          arch: ${{ matrix.target.msvc_arch }}
-
       - name: Set up PostgreSQL and pgrx
         env:
           PGL_VALIDATE_MSVC_ARCH: ${{ matrix.target.msvc_arch }}
           PGL_VALIDATE_POSTGRES_FROM_SOURCE: ${{ matrix.target.postgres_from_source }}
         run: |
-          $setupArgs = @('-PgMajor', '${{ matrix.pg }}')
+          $setupArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', './scripts/ci-setup.ps1', '-PgMajor', '${{ matrix.pg }}')
           if ($env:PGL_VALIDATE_POSTGRES_FROM_SOURCE -eq 'true') {
             $setupArgs += '-BuildPostgresFromSource'
           }
-          ./scripts/ci-setup.ps1 @setupArgs
+          ./scripts/pgrx-vs.ps1 pwsh @setupArgs
 
       - name: Run native logical harness
         if: matrix.backend == 'native-logical'
         env:
           PGL_VALIDATE_MSVC_ARCH: ${{ matrix.target.msvc_arch }}
-        run: ./scripts/test-native-logical-fence.ps1 -PgMajor ${{ matrix.pg }} -TimeoutSeconds 900
+        run: ./scripts/pgrx-vs.ps1 pwsh -NoProfile -ExecutionPolicy Bypass -File ./scripts/test-native-logical-fence.ps1 -PgMajor ${{ matrix.pg }} -TimeoutSeconds 900
 
       - name: Run physical standby harness
         if: matrix.backend == 'physical-standby'
         env:
           PGL_VALIDATE_MSVC_ARCH: ${{ matrix.target.msvc_arch }}
-        run: ./scripts/test-physical-standby-fence.ps1 -PgMajor ${{ matrix.pg }} -TimeoutSeconds 900
+        run: ./scripts/pgrx-vs.ps1 pwsh -NoProfile -ExecutionPolicy Bypass -File ./scripts/test-physical-standby-fence.ps1 -PgMajor ${{ matrix.pg }} -TimeoutSeconds 900
 
       - name: Clean test clusters
         if: always()
-        run: ./scripts/stop-pgrx-test-clusters.ps1 -RemoveData
+        run: ./scripts/pgrx-vs.ps1 pwsh -NoProfile -ExecutionPolicy Bypass -File ./scripts/stop-pgrx-test-clusters.ps1 -RemoveData
