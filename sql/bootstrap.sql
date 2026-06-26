@@ -41,7 +41,7 @@ CREATE TABLE pgl_validate.run_participant (
     pg_version int  NOT NULL,
     dsn_ref    text,
     status     text NOT NULL DEFAULT 'pending'
-               CHECK (status IN ('pending','connected','converged','unreachable','done','error')),
+               CHECK (status IN ('pending','connected','converged','skipped','unreachable','done','error')),
     PRIMARY KEY (run_id, node)
 );
 
@@ -793,7 +793,7 @@ BEGIN
     IF sync_status IS NULL THEN
         validated_property := 'skipped';
         exact_comparable := false;
-        reason := format('native subscription % has no sync state for this table', subscription_name);
+        reason := format('native subscription %s has no sync state for this table', subscription_name);
     ELSIF sync_status <> 'r' THEN
         validated_property := 'skipped';
         exact_comparable := false;
@@ -2546,9 +2546,11 @@ DECLARE
     partial_mode boolean := false;
     degraded_mode boolean := false;
     skipped_peers text[] := ARRAY[]::text[];
+    skipped_peer_details text[] := ARRAY[]::text[];
     edge_seq int := 0;
     current_edge_ids int[] := ARRAY[]::int[];
     subscription_rec record;
+    table_sync_rec record;
     fence_rec pgl_validate.fence_attempt;
     peer_names text[];
     missing_peers text[];
@@ -3202,6 +3204,63 @@ BEGIN
                         USING ERRCODE = '57014';
                 END IF;
 
+                SELECT *
+                INTO table_sync_rec
+                FROM pgl_validate.remote_pglogical_table_sync_status(
+                    peer_rec.dsn,
+                    peer_rec.subscription_name::text,
+                    v_schema_name,
+                    v_rel_name,
+                    peer_rec.connect_timeout_seconds,
+                    peer_rec.statement_timeout_ms,
+                    peer_rec.lock_timeout_ms
+                );
+
+                IF COALESCE(table_sync_rec.sync_status, '<missing>') <> 'r' THEN
+                    partial_mode := true;
+                    skipped_peers := skipped_peers || peer_rec.name;
+                    skipped_peer_details := skipped_peer_details || format(
+                        '%s sync_status=%s sync_status_lsn=%s',
+                        peer_rec.name,
+                        COALESCE(table_sync_rec.sync_status, '<missing>'),
+                        COALESCE(table_sync_rec.sync_status_lsn::text, '<none>')
+                    );
+                    peer_names := array_remove(peer_names, peer_rec.name);
+
+                    INSERT INTO pgl_validate.run_participant(
+                        run_id, node, role, backend, pg_version, dsn_ref, status
+                    )
+                    VALUES (
+                        v_run_id, peer_rec.name, 'participant', peer_rec.backend,
+                        0, peer_rec.name, 'skipped'
+                    )
+                    ON CONFLICT (run_id, node) DO UPDATE
+                    SET backend = EXCLUDED.backend,
+                        pg_version = EXCLUDED.pg_version,
+                        dsn_ref = EXCLUDED.dsn_ref,
+                        status = 'skipped';
+
+                    INSERT INTO pgl_validate.schema_issue(
+                        run_id, node, schema_name, table_name, issue_code, detail
+                    )
+                    VALUES (
+                        v_run_id,
+                        peer_rec.name,
+                        v_schema_name,
+                        v_rel_name,
+                        'SYNC_NOT_READY',
+                        format(
+                            'pglogical subscription %s table sync_status=%s sync_status_lsn=%s; peer skipped for this table',
+                            peer_rec.subscription_name,
+                            COALESCE(table_sync_rec.sync_status, '<missing>'),
+                            COALESCE(table_sync_rec.sync_status_lsn::text, '<none>')
+                        )
+                    )
+                    ON CONFLICT DO NOTHING;
+
+                    CONTINUE;
+                END IF;
+
                 IF NOT (subscription_rec.replication_sets_json::jsonb ? 'pgl_validate_barrier') THEN
                     IF NOT allow_degraded_fence THEN
                         RAISE EXCEPTION
@@ -3281,6 +3340,11 @@ BEGIN
 
                 partial_mode := true;
                 skipped_peers := skipped_peers || peer_rec.name;
+                skipped_peer_details := skipped_peer_details || format(
+                    '%s under on_fence_timeout=skip_peer: %s',
+                    peer_rec.name,
+                    SQLERRM
+                );
                 peer_names := array_remove(peer_names, peer_rec.name);
 
                 INSERT INTO pgl_validate.run_participant(
@@ -3372,6 +3436,61 @@ BEGIN
                         USING ERRCODE = '0A000';
                 END IF;
 
+                SELECT *
+                INTO table_sync_rec
+                FROM pgl_validate.remote_native_table_sync_status(
+                    peer_rec.dsn,
+                    peer_rec.subscription_name::text,
+                    v_schema_name,
+                    v_rel_name,
+                    peer_rec.connect_timeout_seconds,
+                    peer_rec.statement_timeout_ms,
+                    peer_rec.lock_timeout_ms
+                );
+
+                IF COALESCE(table_sync_rec.sync_status, '<missing>') <> 'r' THEN
+                    partial_mode := true;
+                    skipped_peers := skipped_peers || peer_rec.name;
+                    skipped_peer_details := skipped_peer_details || format(
+                        '%s sync_status=%s',
+                        peer_rec.name,
+                        COALESCE(table_sync_rec.sync_status, '<missing>')
+                    );
+                    peer_names := array_remove(peer_names, peer_rec.name);
+
+                    INSERT INTO pgl_validate.run_participant(
+                        run_id, node, role, backend, pg_version, dsn_ref, status
+                    )
+                    VALUES (
+                        v_run_id, peer_rec.name, 'participant', peer_rec.backend,
+                        0, peer_rec.name, 'skipped'
+                    )
+                    ON CONFLICT (run_id, node) DO UPDATE
+                    SET backend = EXCLUDED.backend,
+                        pg_version = EXCLUDED.pg_version,
+                        dsn_ref = EXCLUDED.dsn_ref,
+                        status = 'skipped';
+
+                    INSERT INTO pgl_validate.schema_issue(
+                        run_id, node, schema_name, table_name, issue_code, detail
+                    )
+                    VALUES (
+                        v_run_id,
+                        peer_rec.name,
+                        v_schema_name,
+                        v_rel_name,
+                        'SYNC_NOT_READY',
+                        format(
+                            'native subscription %s table sync_status=%s; peer skipped for this table',
+                            peer_rec.subscription_name,
+                            COALESCE(table_sync_rec.sync_status, '<missing>')
+                        )
+                    )
+                    ON CONFLICT DO NOTHING;
+
+                    CONTINUE;
+                END IF;
+
                 IF NOT (subscription_rec.publications_json::jsonb ? 'pgl_validate_barrier') THEN
                     IF NOT allow_degraded_fence THEN
                         RAISE EXCEPTION
@@ -3453,6 +3572,11 @@ BEGIN
 
                 partial_mode := true;
                 skipped_peers := skipped_peers || peer_rec.name;
+                skipped_peer_details := skipped_peer_details || format(
+                    '%s under on_fence_timeout=skip_peer: %s',
+                    peer_rec.name,
+                    SQLERRM
+                );
                 peer_names := array_remove(peer_names, peer_rec.name);
 
                 INSERT INTO pgl_validate.run_participant(
@@ -3545,6 +3669,11 @@ BEGIN
 
                 partial_mode := true;
                 skipped_peers := skipped_peers || peer_rec.name;
+                skipped_peer_details := skipped_peer_details || format(
+                    '%s under on_fence_timeout=skip_peer: %s',
+                    peer_rec.name,
+                    SQLERRM
+                );
                 peer_names := array_remove(peer_names, peer_rec.name);
 
                 INSERT INTO pgl_validate.run_participant(
@@ -4499,9 +4628,14 @@ BEGIN
 
     IF partial_mode THEN
         result_reason := format(
-            '%s; skipped peer(s) under on_fence_timeout=skip_peer: %s',
+            '%s; skipped peer(s): %s',
             result_reason,
-            array_to_string(skipped_peers, ', ')
+            CASE
+                WHEN cardinality(skipped_peer_details) > 0 THEN
+                    array_to_string(skipped_peer_details, ', ')
+                ELSE
+                    array_to_string(skipped_peers, ', ')
+            END
         );
         verdict := 'partial';
     END IF;

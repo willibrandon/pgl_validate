@@ -160,6 +160,7 @@ $patterns = foreach ($target in $targets) {
 $patterns += @(
     'target[/\\]test-pgdata',
     'target[/\\]pglogical-test-pgdata',
+    'target[/\\]native-test-pgdata',
     'target[/\\]diag-pgdata'
 )
 

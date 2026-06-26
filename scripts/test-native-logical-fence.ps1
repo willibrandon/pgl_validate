@@ -511,6 +511,84 @@ SELECT EXISTS (
         throw 'compare_table did not record a native converged fence'
     }
 
+    Write-Step 'Validating native mid-sync table is skipped before fencing'
+    $nativeSyncMarked = Invoke-Sql -Database 'target' -Sql @"
+UPDATE pg_subscription_rel sr
+SET srsubstate = 'd'
+FROM pg_subscription s
+WHERE sr.srsubid = s.oid
+  AND s.subname = 'native_sub'::name
+  AND sr.srrelid = 'public.accounts'::regclass
+RETURNING 1
+"@
+    if ($nativeSyncMarked -ne '1') {
+        throw "could not mark native table sync status as d: $nativeSyncMarked"
+    }
+
+    $midSyncResult = Invoke-Sql -Database 'provider' -Sql @"
+SELECT run_id::text || ';' || verdict || ';' || reason
+FROM pgl_validate.compare_table(
+    'public.accounts'::regclass,
+    ARRAY['target'],
+    jsonb_build_object(
+        'backend', 'native',
+        'provider_dsn', $providerDsnSql,
+        'provider_node', 'provider',
+        'publications', jsonb_build_array('app_pub'),
+        'fence_timeout_ms', 30000,
+        'fence_poll_interval_ms', 100
+    )
+)
+"@
+    $midSyncParts = $midSyncResult.Split(';', 3)
+    if ($midSyncParts.Count -ne 3) {
+        throw "unexpected native mid-sync compare_table result: $midSyncResult"
+    }
+    $midSyncRunId = $midSyncParts[0]
+    $midSyncVerdict = $midSyncParts[1]
+    $midSyncReason = $midSyncParts[2]
+    if ($midSyncVerdict -ne 'partial' -or -not $midSyncReason.Contains('sync_status=d')) {
+        throw "native mid-sync table was not reported as partial/skipped: $midSyncResult"
+    }
+
+    $nativeSyncEvidence = Invoke-Sql -Database 'provider' -Sql @"
+SELECT
+    EXISTS (
+        SELECT 1
+        FROM pgl_validate.run_participant
+        WHERE run_id = $midSyncRunId
+          AND node = 'target'
+          AND status = 'skipped'
+    )::text || ';' ||
+    EXISTS (
+        SELECT 1
+        FROM pgl_validate.schema_issue
+        WHERE run_id = $midSyncRunId
+          AND node = 'target'
+          AND issue_code = 'SYNC_NOT_READY'
+          AND detail LIKE '%sync_status=d%'
+    )::text || ';' ||
+    EXISTS (
+        SELECT 1
+        FROM pgl_validate.table_result
+        WHERE run_id = $midSyncRunId
+          AND verdict = 'partial'
+          AND reason LIKE '%sync_status=d%'
+    )::text
+"@
+    if ($nativeSyncEvidence -ne 'true;true;true') {
+        throw "native mid-sync skip evidence was incomplete: $nativeSyncEvidence"
+    }
+
+    Invoke-Sql -Database 'target' -Sql @"
+UPDATE pg_subscription_rel sr
+SET srsubstate = 'r'
+FROM pg_subscription s
+WHERE sr.srsubid = s.oid
+  AND s.subname = 'native_sub'::name
+  AND sr.srrelid = 'public.accounts'::regclass
+"@ | Out-Null
+
     Write-Step 'Creating subscriber-side drift and confirming native recheck fencing'
     Invoke-Sql -Database 'target' -Sql "UPDATE public.accounts SET value = 'target-drift' WHERE id = 1" | Out-Null
     $driftResult = Invoke-Sql -Database 'provider' -Sql @"

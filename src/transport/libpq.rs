@@ -138,6 +138,15 @@ pub(crate) struct NativeSubscriptionStatus {
     pub(crate) origin_name: String,
 }
 
+/// Per-table synchronization state fetched from a remote subscriber.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) struct TableSyncStatus {
+    /// Subscriber-side table state, such as `r` for ready.
+    pub(crate) sync_status: Option<String>,
+    /// Subscriber-side status LSN when the replication backend records one.
+    pub(crate) sync_status_lsn: Option<u64>,
+}
+
 /// pglogical subscription that would forward an origin-tagged repair.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub(crate) struct ForwardingSubscription {
@@ -614,6 +623,115 @@ pub(crate) fn fetch_native_subscription_status(
         slot_name: result.value_opt(0, 2)?,
         publications_json: result.value(0, 3)?,
         origin_name: result.value(0, 4)?,
+    })
+}
+
+/// Fetch pglogical per-table synchronization state from a remote subscriber.
+pub(crate) fn fetch_pglogical_table_sync_status(
+    dsn: &str,
+    subscription_name: &str,
+    schema_name: &str,
+    table_name: &str,
+    connect_timeout_seconds: i32,
+    statement_timeout_ms: i32,
+    lock_timeout_ms: i32,
+) -> Result<TableSyncStatus, String> {
+    let conn = Connection::connect_with_timeout(dsn, connect_timeout_seconds)?;
+    conn.set_query_timeouts(statement_timeout_ms, lock_timeout_ms)?;
+
+    let subscription_name = sql_literal(subscription_name);
+    let schema_name = sql_literal(schema_name);
+    let table_name = sql_literal(table_name);
+    let result = conn.exec(&format!(
+        "SELECT sync_status::text, sync_statuslsn::text \
+         FROM pglogical.local_sync_status lss \
+         JOIN pglogical.subscription s ON s.sub_id = lss.sync_subid \
+         WHERE s.sub_name = {subscription_name}::name \
+           AND lss.sync_nspname = {schema_name}::name \
+           AND lss.sync_relname = {table_name}::name \
+         ORDER BY lss.sync_statuslsn DESC NULLS LAST \
+         LIMIT 1"
+    ))?;
+    result.require_status(PGRES_TUPLES_OK)?;
+    if result.nfields() != 2 {
+        return Err(format!(
+            "expected two pglogical table sync status columns, got {}",
+            result.nfields()
+        ));
+    }
+    if result.ntuples() == 0 {
+        return Ok(TableSyncStatus {
+            sync_status: Some("r".to_string()),
+            sync_status_lsn: None,
+        });
+    }
+    if result.ntuples() != 1 {
+        return Err(format!(
+            "expected at most one pglogical table sync status row, got {}",
+            result.ntuples()
+        ));
+    }
+
+    Ok(TableSyncStatus {
+        sync_status: result.value_opt(0, 0)?,
+        sync_status_lsn: result
+            .value_opt(0, 1)?
+            .map(|value| parse_lsn(&value))
+            .transpose()?,
+    })
+}
+
+/// Fetch native logical per-table synchronization state from a remote subscriber.
+pub(crate) fn fetch_native_table_sync_status(
+    dsn: &str,
+    subscription_name: &str,
+    schema_name: &str,
+    table_name: &str,
+    connect_timeout_seconds: i32,
+    statement_timeout_ms: i32,
+    lock_timeout_ms: i32,
+) -> Result<TableSyncStatus, String> {
+    let conn = Connection::connect_with_timeout(dsn, connect_timeout_seconds)?;
+    conn.set_query_timeouts(statement_timeout_ms, lock_timeout_ms)?;
+
+    let subscription_name = sql_literal(subscription_name);
+    let schema_name = sql_literal(schema_name);
+    let table_name = sql_literal(table_name);
+    let result = conn.exec(&format!(
+        "WITH rel AS ( \
+             SELECT to_regclass(format('%I.%I', {schema_name}, {table_name})) AS oid \
+         ) \
+         SELECT sr.srsubstate::text \
+         FROM pg_subscription s \
+         JOIN pg_subscription_rel sr ON sr.srsubid = s.oid \
+         JOIN rel ON rel.oid = sr.srrelid \
+         JOIN pg_database d ON d.oid = s.subdbid \
+         WHERE s.subname = {subscription_name}::name \
+           AND d.datname = current_database()"
+    ))?;
+    result.require_status(PGRES_TUPLES_OK)?;
+    if result.nfields() != 1 {
+        return Err(format!(
+            "expected one native table sync status column, got {}",
+            result.nfields()
+        ));
+    }
+    if result.ntuples() == 0 {
+        return Ok(TableSyncStatus {
+            sync_status: None,
+            sync_status_lsn: None,
+        });
+    }
+    if result.ntuples() != 1 {
+        return Err(format!(
+            "expected at most one native table sync status row, got {}",
+            result.ntuples()
+        ));
+    }
+
+    Ok(TableSyncStatus {
+        sync_status: result.value_opt(0, 0)?,
+        sync_status_lsn: None,
     })
 }
 

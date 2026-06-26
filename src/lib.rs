@@ -788,6 +788,120 @@ AS 'MODULE_PATHNAME', 'remote_native_subscription_status_wrapper';
         ))
     }
 
+    /// Fetch pglogical per-table synchronization state from a remote subscriber.
+    #[pg_extern(
+        volatile,
+        parallel_unsafe,
+        sql = r#"
+CREATE FUNCTION pgl_validate.remote_pglogical_table_sync_status(
+    dsn text,
+    subscription_name text,
+    schema_name text,
+    table_name text,
+    connect_timeout_seconds integer DEFAULT 10,
+    statement_timeout_ms integer DEFAULT 600000,
+    lock_timeout_ms integer DEFAULT 30000
+)
+RETURNS TABLE (
+    sync_status text,
+    sync_status_lsn pg_lsn
+)
+LANGUAGE c
+STRICT
+VOLATILE
+PARALLEL UNSAFE
+AS 'MODULE_PATHNAME', 'remote_pglogical_table_sync_status_wrapper';
+"#
+    )]
+    fn remote_pglogical_table_sync_status(
+        dsn: &str,
+        subscription_name: &str,
+        schema_name: &str,
+        table_name: &str,
+        connect_timeout_seconds: default!(i32, 10),
+        statement_timeout_ms: default!(i32, 600000),
+        lock_timeout_ms: default!(i32, 30000),
+    ) -> TableIterator<
+        'static,
+        (
+            name!(sync_status, Option<String>),
+            name!(sync_status_lsn, Option<i64>),
+        ),
+    > {
+        let status = transport::libpq::fetch_pglogical_table_sync_status(
+            dsn,
+            subscription_name,
+            schema_name,
+            table_name,
+            connect_timeout_seconds,
+            statement_timeout_ms,
+            lock_timeout_ms,
+        )
+        .unwrap_or_else(|err| pgrx::error!("{err}"));
+
+        TableIterator::once((
+            status.sync_status,
+            status.sync_status_lsn.map(|lsn| lsn as i64),
+        ))
+    }
+
+    /// Fetch native logical per-table synchronization state from a remote subscriber.
+    #[pg_extern(
+        volatile,
+        parallel_unsafe,
+        sql = r#"
+CREATE FUNCTION pgl_validate.remote_native_table_sync_status(
+    dsn text,
+    subscription_name text,
+    schema_name text,
+    table_name text,
+    connect_timeout_seconds integer DEFAULT 10,
+    statement_timeout_ms integer DEFAULT 600000,
+    lock_timeout_ms integer DEFAULT 30000
+)
+RETURNS TABLE (
+    sync_status text,
+    sync_status_lsn pg_lsn
+)
+LANGUAGE c
+STRICT
+VOLATILE
+PARALLEL UNSAFE
+AS 'MODULE_PATHNAME', 'remote_native_table_sync_status_wrapper';
+"#
+    )]
+    fn remote_native_table_sync_status(
+        dsn: &str,
+        subscription_name: &str,
+        schema_name: &str,
+        table_name: &str,
+        connect_timeout_seconds: default!(i32, 10),
+        statement_timeout_ms: default!(i32, 600000),
+        lock_timeout_ms: default!(i32, 30000),
+    ) -> TableIterator<
+        'static,
+        (
+            name!(sync_status, Option<String>),
+            name!(sync_status_lsn, Option<i64>),
+        ),
+    > {
+        let status = transport::libpq::fetch_native_table_sync_status(
+            dsn,
+            subscription_name,
+            schema_name,
+            table_name,
+            connect_timeout_seconds,
+            statement_timeout_ms,
+            lock_timeout_ms,
+        )
+        .unwrap_or_else(|err| pgrx::error!("{err}"));
+
+        TableIterator::once((
+            status.sync_status,
+            status.sync_status_lsn.map(|lsn| lsn as i64),
+        ))
+    }
+
     /// Fetch enabled downstream subscriptions that would forward all origins.
     #[pg_extern(volatile, parallel_unsafe)]
     fn remote_pglogical_forwarding_subscriptions(

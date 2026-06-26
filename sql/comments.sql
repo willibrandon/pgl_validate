@@ -172,6 +172,10 @@ COMMENT ON FUNCTION pgl_validate.remote_pglogical_subscription_status(text, text
     'Fetch pglogical subscription status from a remote target over libpq with bounded timeouts.';
 COMMENT ON FUNCTION pgl_validate.remote_native_subscription_status(text, text, integer, integer, integer) IS
     'Fetch native logical subscription status from a remote target over libpq with bounded timeouts.';
+COMMENT ON FUNCTION pgl_validate.remote_pglogical_table_sync_status(text, text, text, text, integer, integer, integer) IS
+    'Fetch pglogical subscriber-side per-table synchronization state for a remote subscription.';
+COMMENT ON FUNCTION pgl_validate.remote_native_table_sync_status(text, text, text, text, integer, integer, integer) IS
+    'Fetch native logical subscriber-side per-table synchronization state for a remote subscription.';
 COMMENT ON FUNCTION pgl_validate.remote_pglogical_forwarding_subscriptions(text, text, integer, integer, integer) IS
     'Fetch enabled pglogical subscriptions on a remote subscriber that would forward all origins for the named provider node.';
 COMMENT ON FUNCTION pgl_validate.remote_pglogical_conflict_history(text, text, text, text, text, integer, integer, integer, integer) IS

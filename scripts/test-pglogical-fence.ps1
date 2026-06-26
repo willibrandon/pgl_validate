@@ -541,6 +541,126 @@ SELECT EXISTS (
         throw 'compare_table did not record a converged fence'
     }
 
+    Write-Step 'Validating pglogical mid-sync table is skipped before fencing'
+    $pglogicalOriginalSync = Invoke-Sql -Database 'target' -Sql @"
+SELECT COALESCE((
+    SELECT sync_status::text
+    FROM pglogical.local_sync_status lss
+    JOIN pglogical.subscription s ON s.sub_id = lss.sync_subid
+    WHERE s.sub_name = 'sub'::name
+      AND lss.sync_nspname = 'public'::name
+      AND lss.sync_relname = 'accounts'::name
+), '<missing>')
+"@
+    $pglogicalSyncMarked = Invoke-Sql -Database 'target' -Sql @"
+WITH sub AS (
+    SELECT sub_id
+    FROM pglogical.subscription
+    WHERE sub_name = 'sub'::name
+), upserted AS (
+    INSERT INTO pglogical.local_sync_status(
+        sync_kind,
+        sync_subid,
+        sync_nspname,
+        sync_relname,
+        sync_status,
+        sync_statuslsn
+    )
+    SELECT
+        'd'::"char",
+        sub_id,
+        'public'::name,
+        'accounts'::name,
+        'd'::"char",
+        pg_current_wal_lsn()
+    FROM sub
+    ON CONFLICT (sync_subid, sync_nspname, sync_relname)
+    DO UPDATE
+    SET sync_status = 'd'::"char",
+        sync_statuslsn = EXCLUDED.sync_statuslsn
+    RETURNING 1
+)
+SELECT count(*)::text FROM upserted
+"@
+    if ($pglogicalSyncMarked -ne '1') {
+        throw "could not mark pglogical table sync status as d: $pglogicalSyncMarked"
+    }
+
+    $midSyncResult = Invoke-Sql -Database 'provider' -Sql @"
+SELECT run_id::text || ';' || verdict || ';' || reason
+FROM pgl_validate.compare_table(
+    'public.accounts'::regclass,
+    ARRAY['target'],
+    jsonb_build_object(
+        'provider_dsn', $providerDsnSql,
+        'provider_node', 'provider',
+        'repsets', jsonb_build_array('default'),
+        'fence_timeout_ms', 30000,
+        'fence_poll_interval_ms', 100
+    )
+)
+"@
+    $midSyncParts = $midSyncResult.Split(';', 3)
+    if ($midSyncParts.Count -ne 3) {
+        throw "unexpected pglogical mid-sync compare_table result: $midSyncResult"
+    }
+    $midSyncRunId = $midSyncParts[0]
+    $midSyncVerdict = $midSyncParts[1]
+    $midSyncReason = $midSyncParts[2]
+    if ($midSyncVerdict -ne 'partial' -or -not $midSyncReason.Contains('sync_status=d')) {
+        throw "pglogical mid-sync table was not reported as partial/skipped: $midSyncResult"
+    }
+
+    $pglogicalSyncEvidence = Invoke-Sql -Database 'provider' -Sql @"
+SELECT
+    EXISTS (
+        SELECT 1
+        FROM pgl_validate.run_participant
+        WHERE run_id = $midSyncRunId
+          AND node = 'target'
+          AND status = 'skipped'
+    )::text || ';' ||
+    EXISTS (
+        SELECT 1
+        FROM pgl_validate.schema_issue
+        WHERE run_id = $midSyncRunId
+          AND node = 'target'
+          AND issue_code = 'SYNC_NOT_READY'
+          AND detail LIKE '%sync_status=d%'
+    )::text || ';' ||
+    EXISTS (
+        SELECT 1
+        FROM pgl_validate.table_result
+        WHERE run_id = $midSyncRunId
+          AND verdict = 'partial'
+          AND reason LIKE '%sync_status=d%'
+    )::text
+"@
+    if ($pglogicalSyncEvidence -ne 'true;true;true') {
+        throw "pglogical mid-sync skip evidence was incomplete: $pglogicalSyncEvidence"
+    }
+
+    if ($pglogicalOriginalSync -eq '<missing>') {
+        Invoke-Sql -Database 'target' -Sql @"
+DELETE FROM pglogical.local_sync_status lss
+USING pglogical.subscription s
+WHERE s.sub_id = lss.sync_subid
+  AND s.sub_name = 'sub'::name
+  AND lss.sync_nspname = 'public'::name
+  AND lss.sync_relname = 'accounts'::name
+"@ | Out-Null
+    } else {
+        Invoke-Sql -Database 'target' -Sql @"
+UPDATE pglogical.local_sync_status lss
+SET sync_status = 'r'
+FROM pglogical.subscription s
+WHERE s.sub_id = lss.sync_subid
+  AND s.sub_name = 'sub'::name
+  AND lss.sync_nspname = 'public'::name
+  AND lss.sync_relname = 'accounts'::name
+"@ | Out-Null
+    }
+
     Write-Step 'Validating explicit degraded pglogical fence path'
     Invoke-Sql -Database 'provider' -Sql @"
 INSERT INTO pgl_validate.peer(name, dsn, backend, subscription_name, replication_sets)
