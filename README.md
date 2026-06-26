@@ -72,6 +72,7 @@ SET pgl_validate.localize_threshold = 1000;
 SET pgl_validate.recheck_passes = 3;
 SET pgl_validate.fence_timeout_ms = 300000;
 SET pgl_validate.fence_poll_interval_ms = 100;
+-- compare_table option: "on_fence_timeout": "abort_run" | "skip_peer"
 SET pgl_validate.sequence_buffer_multiplier = 2;
 SET pgl_validate.paranoid_confirm = off;
 SET pgl_validate.paranoid_confirm_max_rows = 1000;

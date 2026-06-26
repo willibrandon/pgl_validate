@@ -2032,6 +2032,9 @@ DECLARE
     provider_node text;
     fence_timeout_ms int;
     fence_poll_interval_ms int;
+    on_fence_timeout text;
+    partial_mode boolean := false;
+    skipped_peers text[] := ARRAY[]::text[];
     edge_seq int := 0;
     current_edge_ids int[] := ARRAY[]::int[];
     subscription_rec record;
@@ -2142,9 +2145,13 @@ BEGIN
         NULLIF(current_setting('pgl_validate.fence_poll_interval_ms', true), '')::int,
         100
     );
+    on_fence_timeout := COALESCE(NULLIF(options->>'on_fence_timeout', ''), 'abort_run');
     contract_subscription := NULLIF(options->>'subscription', '')::name;
     pglogical_available := to_regprocedure('pglogical.show_repset_table_info(regclass,text[])') IS NOT NULL;
 
+    IF on_fence_timeout NOT IN ('abort_run','skip_peer') THEN
+        RAISE EXCEPTION 'on_fence_timeout must be abort_run or skip_peer';
+    END IF;
     IF fence_timeout_ms <= 0 THEN
         RAISE EXCEPTION 'fence_timeout_ms must be greater than zero';
     END IF;
@@ -2647,63 +2654,101 @@ BEGIN
                     USING ERRCODE = '0A000';
             END IF;
 
-            SELECT *
-            INTO subscription_rec
-            FROM pgl_validate.remote_pglogical_subscription_status(
-                peer_rec.dsn,
-                peer_rec.subscription_name::text,
-                peer_rec.connect_timeout_seconds,
-                peer_rec.statement_timeout_ms,
-                peer_rec.lock_timeout_ms
-            );
+            BEGIN
+                SELECT *
+                INTO subscription_rec
+                FROM pgl_validate.remote_pglogical_subscription_status(
+                    peer_rec.dsn,
+                    peer_rec.subscription_name::text,
+                    peer_rec.connect_timeout_seconds,
+                    peer_rec.statement_timeout_ms,
+                    peer_rec.lock_timeout_ms
+                );
 
-            IF subscription_rec.status <> 'replicating' THEN
-                RAISE EXCEPTION
-                    'pglogical peer % subscription % is %, not replicating',
+                IF subscription_rec.status <> 'replicating' THEN
+                    RAISE EXCEPTION
+                        'pglogical peer % subscription % is %, not replicating',
+                        peer_rec.name,
+                        peer_rec.subscription_name,
+                        subscription_rec.status
+                        USING ERRCODE = '57014';
+                END IF;
+
+                IF NOT (subscription_rec.replication_sets_json::jsonb ? 'pgl_validate_barrier') THEN
+                    RAISE EXCEPTION
+                        'pglogical peer % subscription % does not include pgl_validate_barrier',
+                        peer_rec.name,
+                        peer_rec.subscription_name
+                        USING ERRCODE = '0A000';
+                END IF;
+
+                edge_seq := edge_seq + 1;
+                current_edge_ids := current_edge_ids || edge_seq;
+                SELECT *
+                INTO fence_rec
+                FROM pgl_validate.fence_pglogical_edge(
+                    v_run_id,
+                    initial_epoch,
+                    edge_seq,
+                    provider_node,
                     peer_rec.name,
-                    peer_rec.subscription_name,
-                    subscription_rec.status
-                    USING ERRCODE = '57014';
-            END IF;
+                    provider_dsn,
+                    peer_rec.dsn,
+                    peer_rec.subscription_name::text,
+                    subscription_rec.slot_name,
+                    subscription_rec.slot_name,
+                    ARRAY['pgl_validate_barrier'],
+                    peer_rec.connect_timeout_seconds,
+                    peer_rec.statement_timeout_ms,
+                    peer_rec.lock_timeout_ms,
+                    fence_timeout_ms,
+                    fence_poll_interval_ms
+                );
 
-            IF NOT (subscription_rec.replication_sets_json::jsonb ? 'pgl_validate_barrier') THEN
-                RAISE EXCEPTION
-                    'pglogical peer % subscription % does not include pgl_validate_barrier',
+                IF fence_rec.status <> 'converged' THEN
+                    RAISE EXCEPTION
+                        'pglogical peer % failed to converge barrier fence: %',
+                        peer_rec.name,
+                        fence_rec.status
+                        USING ERRCODE = '57014';
+                END IF;
+            EXCEPTION WHEN others THEN
+                IF on_fence_timeout <> 'skip_peer' THEN
+                    RAISE;
+                END IF;
+
+                partial_mode := true;
+                skipped_peers := skipped_peers || peer_rec.name;
+                peer_names := array_remove(peer_names, peer_rec.name);
+
+                INSERT INTO pgl_validate.run_participant(
+                    run_id, node, role, backend, pg_version, dsn_ref, status
+                )
+                VALUES (
+                    v_run_id, peer_rec.name, 'participant', peer_rec.backend,
+                    0, peer_rec.name, 'unreachable'
+                )
+                ON CONFLICT (run_id, node) DO UPDATE
+                SET backend = EXCLUDED.backend,
+                    pg_version = EXCLUDED.pg_version,
+                    dsn_ref = EXCLUDED.dsn_ref,
+                    status = 'unreachable';
+
+                INSERT INTO pgl_validate.schema_issue(
+                    run_id, node, schema_name, table_name, issue_code, detail
+                )
+                VALUES (
+                    v_run_id,
                     peer_rec.name,
-                    peer_rec.subscription_name
-                    USING ERRCODE = '0A000';
-            END IF;
+                    v_schema_name,
+                    v_rel_name,
+                    'PEER_SKIPPED',
+                    SQLERRM
+                )
+                ON CONFLICT DO NOTHING;
 
-            edge_seq := edge_seq + 1;
-            current_edge_ids := current_edge_ids || edge_seq;
-            SELECT *
-            INTO fence_rec
-            FROM pgl_validate.fence_pglogical_edge(
-                v_run_id,
-                initial_epoch,
-                edge_seq,
-                provider_node,
-                peer_rec.name,
-                provider_dsn,
-                peer_rec.dsn,
-                peer_rec.subscription_name::text,
-                subscription_rec.slot_name,
-                subscription_rec.slot_name,
-                ARRAY['pgl_validate_barrier'],
-                peer_rec.connect_timeout_seconds,
-                peer_rec.statement_timeout_ms,
-                peer_rec.lock_timeout_ms,
-                fence_timeout_ms,
-                fence_poll_interval_ms
-            );
-
-            IF fence_rec.status <> 'converged' THEN
-                RAISE EXCEPTION
-                    'pglogical peer % failed to converge barrier fence: %',
-                    peer_rec.name,
-                    fence_rec.status
-                    USING ERRCODE = '57014';
-            END IF;
+                CONTINUE;
+            END;
         END LOOP;
 
         UPDATE pgl_validate.run_participant
@@ -2734,30 +2779,68 @@ BEGIN
             edge_seq := edge_seq + 1;
             current_edge_ids := current_edge_ids || edge_seq;
 
-            SELECT *
-            INTO fence_rec
-            FROM pgl_validate.fence_standby_edge(
-                v_run_id,
-                initial_epoch,
-                edge_seq,
-                provider_node,
-                peer_rec.name,
-                peer_rec.dsn,
-                NULL,
-                peer_rec.connect_timeout_seconds,
-                peer_rec.statement_timeout_ms,
-                peer_rec.lock_timeout_ms,
-                fence_timeout_ms,
-                fence_poll_interval_ms
-            );
-
-            IF fence_rec.status <> 'converged' THEN
-                RAISE EXCEPTION
-                    'standby peer % failed to converge replay fence: %',
+            BEGIN
+                SELECT *
+                INTO fence_rec
+                FROM pgl_validate.fence_standby_edge(
+                    v_run_id,
+                    initial_epoch,
+                    edge_seq,
+                    provider_node,
                     peer_rec.name,
-                    fence_rec.status
-                    USING ERRCODE = '57014';
-            END IF;
+                    peer_rec.dsn,
+                    NULL,
+                    peer_rec.connect_timeout_seconds,
+                    peer_rec.statement_timeout_ms,
+                    peer_rec.lock_timeout_ms,
+                    fence_timeout_ms,
+                    fence_poll_interval_ms
+                );
+
+                IF fence_rec.status <> 'converged' THEN
+                    RAISE EXCEPTION
+                        'standby peer % failed to converge replay fence: %',
+                        peer_rec.name,
+                        fence_rec.status
+                        USING ERRCODE = '57014';
+                END IF;
+            EXCEPTION WHEN others THEN
+                IF on_fence_timeout <> 'skip_peer' THEN
+                    RAISE;
+                END IF;
+
+                partial_mode := true;
+                skipped_peers := skipped_peers || peer_rec.name;
+                peer_names := array_remove(peer_names, peer_rec.name);
+
+                INSERT INTO pgl_validate.run_participant(
+                    run_id, node, role, backend, pg_version, dsn_ref, status
+                )
+                VALUES (
+                    v_run_id, peer_rec.name, 'participant', peer_rec.backend,
+                    0, peer_rec.name, 'unreachable'
+                )
+                ON CONFLICT (run_id, node) DO UPDATE
+                SET backend = EXCLUDED.backend,
+                    pg_version = EXCLUDED.pg_version,
+                    dsn_ref = EXCLUDED.dsn_ref,
+                    status = 'unreachable';
+
+                INSERT INTO pgl_validate.schema_issue(
+                    run_id, node, schema_name, table_name, issue_code, detail
+                )
+                VALUES (
+                    v_run_id,
+                    peer_rec.name,
+                    v_schema_name,
+                    v_rel_name,
+                    'PEER_SKIPPED',
+                    SQLERRM
+                )
+                ON CONFLICT DO NOTHING;
+
+                CONTINUE;
+            END;
         END LOOP;
 
         UPDATE pgl_validate.run_participant
@@ -3593,6 +3676,15 @@ BEGIN
             advisory_count,
             validated_property
         );
+    END IF;
+
+    IF partial_mode THEN
+        result_reason := format(
+            '%s; skipped peer(s) under on_fence_timeout=skip_peer: %s',
+            result_reason,
+            array_to_string(skipped_peers, ', ')
+        );
+        verdict := 'partial';
     END IF;
 
     INSERT INTO pgl_validate.chunk_result(

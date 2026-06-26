@@ -2391,6 +2391,80 @@ mod tests {
     }
 
     #[pg_test]
+    fn compare_table_skip_peer_fence_timeout_returns_partial() {
+        let dsn = local_dsn();
+
+        Spi::run(&format!(
+            "
+            CREATE TABLE skip_peer_timeout_target(id int PRIMARY KEY, value text);
+            INSERT INTO skip_peer_timeout_target VALUES (1, 'same');
+            DELETE FROM pgl_validate.peer;
+            INSERT INTO pgl_validate.peer(
+                name,
+                dsn,
+                backend,
+                subscription_name,
+                connect_timeout_seconds,
+                statement_timeout_ms,
+                lock_timeout_ms
+            )
+            VALUES (
+                'unreachable_pglogical',
+                'host=127.0.0.1 port=1 dbname=postgres',
+                'pglogical',
+                'sub',
+                1,
+                1000,
+                1000
+            );
+            ",
+        ))
+        .unwrap();
+
+        let result = Spi::get_one::<String>(&format!(
+            "
+            SELECT (r).run_id::text || ';' || (r).verdict
+            FROM (
+                SELECT pgl_validate.compare_table(
+                    'skip_peer_timeout_target'::regclass,
+                    ARRAY['unreachable_pglogical'],
+                    jsonb_build_object(
+                        'provider_dsn', {provider_dsn},
+                        'provider_node', 'local',
+                        'on_fence_timeout', 'skip_peer'
+                    )
+                ) AS r
+            ) s
+            ",
+            provider_dsn = sql_literal(&dsn)
+        ))
+        .unwrap()
+        .unwrap();
+        let (run_id, verdict) = result
+            .split_once(';')
+            .expect("compare_table result should include run id and verdict");
+        assert_eq!(verdict, "partial");
+
+        let persisted = Spi::get_one::<String>(&format!(
+            "
+            SELECT rp.status || ';' || si.issue_code || ';' ||
+                   (tr.reason LIKE '%on_fence_timeout=skip_peer%')::text
+            FROM pgl_validate.run_participant rp
+            JOIN pgl_validate.schema_issue si
+              ON si.run_id = rp.run_id
+             AND si.node = rp.node
+            JOIN pgl_validate.table_result tr
+              ON tr.run_id = rp.run_id
+            WHERE rp.run_id = {run_id}
+              AND rp.node = 'unreachable_pglogical'
+            "
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(persisted, "unreachable;PEER_SKIPPED;true");
+    }
+
+    #[pg_test]
     fn compare_table_reports_registered_remote_peer_difference() {
         let backend_pid = Spi::get_one::<i32>("SELECT pg_backend_pid()")
             .unwrap()
