@@ -81,7 +81,7 @@ function Get-PeMachine {
     }
 }
 
-function Normalize-WindowsArchitecture {
+function ConvertTo-WindowsArchitecture {
     param([string] $Architecture)
 
     if ([string]::IsNullOrWhiteSpace($Architecture)) {
@@ -180,7 +180,7 @@ function Install-WindowsLlvm {
 }
 
 function Resolve-WindowsLibclangPath {
-    $architecture = Normalize-WindowsArchitecture -Architecture $env:PGL_VALIDATE_MSVC_ARCH
+    $architecture = ConvertTo-WindowsArchitecture -Architecture $env:PGL_VALIDATE_MSVC_ARCH
 
     $candidateDirs = New-Object System.Collections.Generic.List[string]
     [void] $candidateDirs.Add((Join-Path (Get-PglPgrxHome) "llvm-$LlvmVersion-$architecture\bin"))
@@ -297,7 +297,7 @@ function Install-CargoPgrx {
     }
 }
 
-function Ensure-ChocolateyPackage {
+function Install-ChocolateyPackage {
     param(
         [string] $CommandName,
         [string] $PackageName
@@ -453,8 +453,8 @@ function Initialize-WindowsPostgres {
 }
 
 function Initialize-WindowsSourcePostgres {
-    Ensure-ChocolateyPackage -CommandName 'perl' -PackageName 'strawberryperl'
-    Ensure-ChocolateyPackage -CommandName 'cmake' -PackageName 'cmake'
+    Install-ChocolateyPackage -CommandName 'perl' -PackageName 'strawberryperl'
+    Install-ChocolateyPackage -CommandName 'cmake' -PackageName 'cmake'
 
     $postgresVersion = Get-PostgresSourceVersion -Major $PgMajor
     $architecture = if ($env:PGL_VALIDATE_MSVC_ARCH) {

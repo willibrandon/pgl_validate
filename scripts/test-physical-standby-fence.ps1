@@ -259,7 +259,7 @@ function New-FreePort {
     }
 }
 
-function Sql-Literal {
+function ConvertTo-SqlLiteral {
     param([string] $Value)
     return "'" + $Value.Replace("'", "''") + "'"
 }
@@ -371,9 +371,8 @@ try {
         -FailureLogPaths @($primaryLog) `
         -TimeoutSeconds 45 | Out-Null
 
-    $primaryDsn = "host=127.0.0.1 port=$script:PrimaryPort dbname=postgres user=postgres connect_timeout=5 application_name=pgl_validate_standby_primary"
     $standbyDsn = "host=127.0.0.1 port=$script:StandbyPort dbname=postgres user=postgres connect_timeout=5 application_name=pgl_validate_standby_replica"
-    $standbyDsnSql = Sql-Literal $standbyDsn
+    $standbyDsnSql = ConvertTo-SqlLiteral $standbyDsn
 
     Write-Step 'Creating extension, test table, standby peer metadata, and physical slot on primary'
     Invoke-Sql -Database 'postgres' -Sql @"

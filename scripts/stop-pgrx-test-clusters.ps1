@@ -118,7 +118,14 @@ function Stop-DataDirectoryCluster {
 function Get-RepoClusterDataDirectories {
     $known = @($configuredTargets | Where-Object { Test-Path -LiteralPath $_ })
 
-$discovered = @()
+    $mixedMajorTargets = @()
+    if (Test-Path -LiteralPath $targetRoot) {
+        $mixedMajorTargets = Get-ChildItem -LiteralPath $targetRoot -Directory -Force -Filter 'pglogical-mixed-*-pg*' -ErrorAction SilentlyContinue |
+            Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName 'PG_VERSION') } |
+            ForEach-Object { $_.FullName }
+    }
+
+    $discovered = @()
     if (Test-Path -LiteralPath $targetRoot) {
         $discovered = Get-ChildItem -LiteralPath $targetRoot -Recurse -Force -File -Filter 'postmaster.pid' -ErrorAction SilentlyContinue |
             ForEach-Object {
@@ -131,6 +138,7 @@ $discovered = @()
 
     $allTargets = @()
     $allTargets += @($known)
+    $allTargets += @($mixedMajorTargets)
     $allTargets += @($discovered)
 
     $allTargets |
@@ -152,6 +160,7 @@ $patterns = foreach ($target in $targets) {
 $patterns += @(
     'target[/\\]test-pgdata',
     'target[/\\]pglogical-test-pgdata',
+    'target[/\\]pglogical-mixed-[^/\\]+-pg\d+',
     'target[/\\]native-test-pgdata',
     'target[/\\]standby-primary-pgdata',
     'target[/\\]standby-replica-pgdata',

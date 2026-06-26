@@ -182,7 +182,7 @@ function New-FreePort {
     }
 }
 
-function Sql-Literal {
+function ConvertTo-SqlLiteral {
     param([string] $Value)
     return "'" + $Value.Replace("'", "''") + "'"
 }
@@ -219,7 +219,7 @@ function Wait-NativeSubscriptionReady {
 SELECT COALESCE((
     SELECT subenabled::text || '|' || COALESCE(subslotname::text, '') || '|' || oid::text
     FROM pg_subscription
-    WHERE subname = $(Sql-Literal $SubscriptionName)::name
+    WHERE subname = $(ConvertTo-SqlLiteral $SubscriptionName)::name
 ), '<missing>||')
 "@
         $parts = $status.Split('|', 3)
@@ -231,7 +231,7 @@ SELECT count(*)::text || ':' ||
        COALESCE(bool_and(sr.srsubstate = 'r')::text, 'false')
 FROM pg_subscription s
 JOIN pg_subscription_rel sr ON sr.srsubid = s.oid
-WHERE s.subname = $(Sql-Literal $SubscriptionName)::name
+WHERE s.subname = $(ConvertTo-SqlLiteral $SubscriptionName)::name
 "@
         $slotStatus = '<no-slot>'
         if ($slotName) {
@@ -239,7 +239,7 @@ WHERE s.subname = $(Sql-Literal $SubscriptionName)::name
 SELECT COALESCE((
     SELECT active::text || ':' || confirmed_flush_lsn::text
     FROM pg_replication_slots
-    WHERE slot_name = $(Sql-Literal $slotName)
+    WHERE slot_name = $(ConvertTo-SqlLiteral $slotName)
 ), '<missing>')
 "@
         }
@@ -343,8 +343,8 @@ try {
 
     $providerDsn = "host=localhost port=$script:Port dbname=provider user=postgres connect_timeout=5 application_name=pgl_validate_native"
     $targetDsn = "host=localhost port=$script:Port dbname=target user=postgres connect_timeout=5 application_name=pgl_validate_native"
-    $providerDsnSql = Sql-Literal $providerDsn
-    $targetDsnSql = Sql-Literal $targetDsn
+    $providerDsnSql = ConvertTo-SqlLiteral $providerDsn
+    $targetDsnSql = ConvertTo-SqlLiteral $targetDsn
 
     Write-Step 'Creating native provider publications, including the barrier publication'
     Invoke-Sql -Database 'provider' -Sql 'CREATE EXTENSION pgl_validate' | Out-Null
@@ -374,8 +374,8 @@ WITH (copy_data = false, create_slot = false, slot_name = 'native_sub', enabled 
         -TimeoutSeconds $TimeoutSeconds
     $slotName = $subscription.SlotName
     $originName = $subscription.OriginName
-    $slotNameSql = Sql-Literal $slotName
-    $originNameSql = Sql-Literal $originName
+    $slotNameSql = ConvertTo-SqlLiteral $slotName
+    $originNameSql = ConvertTo-SqlLiteral $originName
 
     Write-Step 'Replicating user table row for native compare_table validation'
     Invoke-Sql -Database 'provider' -Sql "INSERT INTO public.accounts VALUES (1, 'same')" | Out-Null

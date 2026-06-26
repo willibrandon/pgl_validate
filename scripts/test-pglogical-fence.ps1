@@ -184,7 +184,7 @@ function New-FreePort {
     }
 }
 
-function Sql-Literal {
+function ConvertTo-SqlLiteral {
     param([string] $Value)
     return "'" + $Value.Replace("'", "''") + "'"
 }
@@ -276,7 +276,7 @@ function Wait-SubscriptionReady {
         $status = Invoke-Sql -Database $SubscriberDatabase -Sql @"
 SELECT COALESCE((
     SELECT status || '|' || slot_name
-    FROM pglogical.show_subscription_status($(Sql-Literal $SubscriptionName)::name)
+    FROM pglogical.show_subscription_status($(ConvertTo-SqlLiteral $SubscriptionName)::name)
 ), '<missing>|')
 "@
         $parts = $status.Split('|', 2)
@@ -305,7 +305,7 @@ SELECT (NOT EXISTS (
 SELECT COALESCE((
     SELECT active::text || ':' || confirmed_flush_lsn::text
     FROM pg_replication_slots
-    WHERE slot_name = $(Sql-Literal $slotName)
+    WHERE slot_name = $(ConvertTo-SqlLiteral $slotName)
 ), '<missing>')
 "@
         }
@@ -426,12 +426,12 @@ try {
     $cascadeDsn = "host=localhost port=$script:Port dbname=cascade user=postgres connect_timeout=5 application_name=pgl_validate_pglogical"
     $sequenceProviderDsn = "host=localhost port=$script:Port dbname=seq_provider user=postgres connect_timeout=5 application_name=pgl_validate_pglogical"
     $sequenceTargetDsn = "host=localhost port=$script:Port dbname=seq_target user=postgres connect_timeout=5 application_name=pgl_validate_pglogical"
-    $providerDsnSql = Sql-Literal $providerDsn
-    $targetDsnSql = Sql-Literal $targetDsn
-    $degradedDsnSql = Sql-Literal $degradedDsn
-    $cascadeDsnSql = Sql-Literal $cascadeDsn
-    $sequenceProviderDsnSql = Sql-Literal $sequenceProviderDsn
-    $sequenceTargetDsnSql = Sql-Literal $sequenceTargetDsn
+    $providerDsnSql = ConvertTo-SqlLiteral $providerDsn
+    $targetDsnSql = ConvertTo-SqlLiteral $targetDsn
+    $degradedDsnSql = ConvertTo-SqlLiteral $degradedDsn
+    $cascadeDsnSql = ConvertTo-SqlLiteral $cascadeDsn
+    $sequenceProviderDsnSql = ConvertTo-SqlLiteral $sequenceProviderDsn
+    $sequenceTargetDsnSql = ConvertTo-SqlLiteral $sequenceTargetDsn
 
     Write-Step 'Creating pglogical provider node and barrier replication set'
     Invoke-Sql -Database 'provider' -Sql 'CREATE EXTENSION pgl_validate' | Out-Null
@@ -469,7 +469,7 @@ SELECT pglogical.create_subscription(
 
     Write-Step 'Waiting for pglogical subscription readiness'
     $slotName = Wait-SubscriptionReady -TimeoutSeconds $TimeoutSeconds
-    $slotNameSql = Sql-Literal $slotName
+    $slotNameSql = ConvertTo-SqlLiteral $slotName
 
     Write-Step 'Creating degraded pglogical target without the barrier repset'
     Invoke-Sql -Database 'degraded' -Sql 'CREATE EXTENSION pgl_validate' | Out-Null
@@ -486,7 +486,7 @@ SELECT pglogical.create_subscription(
     ARRAY[]::text[]
 )
 "@ | Out-Null
-    $degradedSlotName = Wait-SubscriptionReady `
+    $null = Wait-SubscriptionReady `
         -SubscriberDatabase 'degraded' `
         -SubscriptionName 'sub_degraded' `
         -ProviderDatabase 'provider' `

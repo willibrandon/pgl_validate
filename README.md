@@ -68,12 +68,19 @@ The installer verifies the release checksum and installs a packaged artifact
 when one exists. If a package is not published for the host architecture, it
 builds the source release against the selected `pg_config`.
 
+Mixed-major pglogical coverage runs a real subscription between two PostgreSQL
+majors and checks that validation records both participant versions:
+
+```powershell
+.\scripts\test-pglogical-mixed-major.ps1 -ProviderPgMajor 15 -TargetPgMajor 18
+```
+
 CI runs PostgreSQL 15, 16, 17, and 18 across Linux x64/arm64, Windows x64,
 Windows ARM64-hosted x64, and macOS ARM64 runners. Intel macOS is intentionally
 excluded. Native Windows ARM64 PostgreSQL is not scheduled because PostgreSQL
 15-18 do not ship a supported native Windows ARM64 CI build path here. The pgrx
-pg_test and pglogical integration jobs install the fork release package or
-source release for each target.
+pg_test, pglogical integration, and mixed-major pglogical jobs install the fork
+release package or source release for each target.
 
 Native logical replication coverage uses PostgreSQL's built-in publication and
 subscription machinery:
