@@ -866,6 +866,75 @@ mod tests {
     }
 
     #[pg_test]
+    fn compare_records_table_error_and_continues_parent_run() {
+        let backend_pid = Spi::get_one::<i32>("SELECT pg_backend_pid()")
+            .unwrap()
+            .unwrap();
+        let error_table = identifier(&format!("pgl_validate_error_table_{backend_pid}"));
+        let good_table = identifier(&format!("pgl_validate_good_after_error_{backend_pid}"));
+
+        Spi::run(&format!(
+            "
+            CREATE TABLE public.{error_table}();
+            CREATE TABLE public.{good_table}(id int PRIMARY KEY, value text);
+            INSERT INTO public.{good_table} VALUES (1, 'same');
+            "
+        ))
+        .unwrap();
+
+        let run_id = Spi::get_one::<i64>(&format!(
+            "
+            SELECT pgl_validate.compare(
+                ARRAY[
+                    'public.{error_table}'::regclass,
+                    'public.{good_table}'::regclass
+                ],
+                peers => ARRAY[]::text[]
+            )
+            "
+        ))
+        .unwrap()
+        .unwrap();
+
+        let verdicts = Spi::get_one::<String>(&format!(
+            "
+            SELECT string_agg(table_name || ':' || verdict, ',' ORDER BY table_name)
+            FROM pgl_validate.table_result
+            WHERE run_id = {run_id}
+            "
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(verdicts, format!("{error_table}:error,{good_table}:match"));
+
+        let run_shape = Spi::get_one::<String>(&format!(
+            "
+            SELECT status || ';' || tables_total::text || ';' ||
+                   tables_matched::text || ';' || tables_differ::text
+            FROM pgl_validate.run
+            WHERE run_id = {run_id}
+            "
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(run_shape, "completed;2;1;0");
+
+        let issue = Spi::get_one::<String>(&format!(
+            "
+            SELECT si.issue_code || ';' ||
+                   (si.detail LIKE '%no comparable columns%')::text
+            FROM pgl_validate.schema_issue si
+            WHERE si.run_id = {run_id}
+              AND si.table_name = {error_table}
+            ",
+            error_table = sql_literal(&error_table)
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(issue, "TABLE_COMPARE_FAILED;true");
+    }
+
+    #[pg_test]
     fn compare_skips_schema_drift_table_and_continues_parent_run() {
         let backend_pid = Spi::get_one::<i32>("SELECT pg_backend_pid()")
             .unwrap()

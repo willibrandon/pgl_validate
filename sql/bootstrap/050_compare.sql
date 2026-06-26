@@ -20,6 +20,11 @@ DECLARE
     result_row pgl_validate.table_result;
     table_count int := 0;
     sequence_count int := 0;
+    error_schema_name text;
+    error_table_name text;
+    error_detail text;
+    error_cols text[];
+    error_key_cols text[];
 BEGIN
     IF jsonb_typeof(effective_options) <> 'object' THEN
         RAISE EXCEPTION 'options must be a JSON object'
@@ -99,9 +104,84 @@ BEGIN
         IF table_count > 0 THEN
             FOREACH table_oid IN ARRAY table_list LOOP
                 internal_options := effective_options || jsonb_build_object('_pgl_validate_parent_run_id', v_run_id);
-                SELECT *
-                INTO result_row
-                FROM pgl_validate.compare_table(table_oid, peers, internal_options);
+                BEGIN
+                    SELECT *
+                    INTO result_row
+                    FROM pgl_validate.compare_table(table_oid, peers, internal_options);
+                EXCEPTION WHEN others THEN
+                    error_detail := SQLERRM;
+
+                    IF COALESCE(NULLIF(effective_options->>'on_precondition_fail', ''), 'skip_table') = 'abort_run' THEN
+                        RAISE;
+                    END IF;
+
+                    SELECT n.nspname, c.relname
+                    INTO error_schema_name, error_table_name
+                    FROM pg_class c
+                    JOIN pg_namespace n ON n.oid = c.relnamespace
+                    WHERE c.oid = table_oid;
+
+                    error_schema_name := COALESCE(error_schema_name, '<unknown>');
+                    error_table_name := COALESCE(error_table_name, table_oid::text);
+
+                    SELECT array_agg(a.attname ORDER BY a.attname)
+                    INTO error_cols
+                    FROM pg_attribute a
+                    WHERE a.attrelid = table_oid
+                      AND a.attnum > 0
+                      AND NOT a.attisdropped;
+
+                    BEGIN
+                        error_key_cols := pgl_validate.comparison_key_cols(table_oid);
+                    EXCEPTION WHEN others THEN
+                        error_key_cols := NULL;
+                    END;
+
+                    INSERT INTO pgl_validate.table_plan(
+                        run_id, schema_name, table_name, key_cols, att_list, repsets,
+                        repl_insert, repl_update, repl_delete, repl_truncate,
+                        has_row_filter, sync_status, validated_property
+                    )
+                    VALUES (
+                        v_run_id, error_schema_name, error_table_name,
+                        error_key_cols, error_cols, NULL,
+                        NULL, NULL, NULL, NULL,
+                        false, NULL, 'skipped'
+                    )
+                    ON CONFLICT (run_id, schema_name, table_name) DO UPDATE
+                    SET key_cols = EXCLUDED.key_cols,
+                        att_list = EXCLUDED.att_list,
+                        validated_property = EXCLUDED.validated_property;
+
+                    INSERT INTO pgl_validate.schema_issue(
+                        run_id, node, schema_name, table_name, issue_code, detail
+                    )
+                    VALUES (
+                        v_run_id,
+                        COALESCE(reference, 'local'),
+                        error_schema_name,
+                        error_table_name,
+                        'TABLE_COMPARE_FAILED',
+                        error_detail
+                    )
+                    ON CONFLICT DO NOTHING;
+
+                    INSERT INTO pgl_validate.table_result(
+                        run_id, schema_name, table_name, verdict, reason, finished_at
+                    )
+                    VALUES (
+                        v_run_id,
+                        error_schema_name,
+                        error_table_name,
+                        'error',
+                        format('table comparison failed: %s', error_detail),
+                        now()
+                    )
+                    ON CONFLICT (run_id, schema_name, table_name) DO UPDATE
+                    SET verdict = EXCLUDED.verdict,
+                        reason = EXCLUDED.reason,
+                        finished_at = EXCLUDED.finished_at;
+                END;
             END LOOP;
         END IF;
 
