@@ -317,7 +317,13 @@ try {
         -TimeoutSeconds 120 | Out-Null
 
     Write-Step "Starting async worker test cluster on port $script:Port"
-    $serverOptions = "-p $script:Port -h localhost -c max_worker_processes=20"
+    $socketOption = Get-PglUnixSocketOption -Directory $target
+    $serverOptions = (@(
+        "-p $script:Port",
+        '-h localhost',
+        $socketOption,
+        '-c max_worker_processes=20'
+    ) | Where-Object { $_ }) -join ' '
     Invoke-CheckedProcess `
         -FilePath $script:PgCtl `
         -Arguments @('start', '-D', $data, '-l', $log, '-o', $serverOptions, '-w', '-t', '30') `
@@ -485,6 +491,13 @@ GROUP BY r.run_id;
     }
 
     Write-Output "explicit-table async resume preserved committed progress on pg${PgMajor}: run_id=$partialRunId state=$partialCompleted"
+}
+catch {
+    if (Test-Path -LiteralPath $log) {
+        Write-Output '--- async worker test log tail ---'
+        Get-Content -LiteralPath $log -Tail 120
+    }
+    throw
 }
 finally {
     Stop-TestCluster -Data $data -PgCtl $script:PgCtl
