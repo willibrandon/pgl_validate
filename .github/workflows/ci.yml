@@ -44,10 +44,8 @@ jobs:
             platform: windows-arm64-hosted-x64
             msvc_arch: x64
             rust_toolchain: stable-x86_64-pc-windows-msvc
-          - os: macos-15
+          - os: macos-26
             platform: macos-arm64
-          - os: macos-15-intel
-            platform: macos-x64
     defaults:
       run:
         shell: pwsh
@@ -134,10 +132,8 @@ jobs:
             platform: windows-arm64-hosted-x64
             msvc_arch: x64
             rust_toolchain: stable-x86_64-pc-windows-msvc
-          - os: macos-15
+          - os: macos-26
             platform: macos-arm64
-          - os: macos-15-intel
-            platform: macos-x64
     defaults:
       run:
         shell: pwsh
@@ -220,10 +216,8 @@ jobs:
             platform: windows-arm64-hosted-x64
             msvc_arch: x64
             rust_toolchain: stable-x86_64-pc-windows-msvc
-          - os: macos-15
+          - os: macos-26
             platform: macos-arm64
-          - os: macos-15-intel
-            platform: macos-x64
     defaults:
       run:
         shell: pwsh
