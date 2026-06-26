@@ -904,6 +904,28 @@ mod tests {
                 .unwrap();
         assert_eq!(bounded_count, 2);
 
+        let planned_ranges = Spi::get_one::<String>(
+            r#"
+            SELECT string_agg(
+                       chunk_id::text || ':' ||
+                       COALESCE(convert_from(lo, 'UTF8')::jsonb->>'id', '<null>') || ':' ||
+                       COALESCE(convert_from(hi, 'UTF8')::jsonb->>'id', '<null>') || ':' ||
+                       n_rows::text,
+                       ',' ORDER BY chunk_id
+                   )
+            FROM pgl_validate.plan_key_ranges(
+                'plan_target'::regclass,
+                ARRAY['id'],
+                NULL,
+                NULL,
+                2
+            )
+            "#,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(planned_ranges, "1:<null>:9:2,2:9:<null>:2");
+
         Spi::run(
             r#"
             CREATE TEMP TABLE plan_composite(
@@ -964,6 +986,36 @@ mod tests {
                 .unwrap()
                 .unwrap();
         assert_eq!(localized_count, 2);
+
+        let composite_ranges = Spi::get_one::<String>(
+            r#"
+            WITH ranges AS (
+                SELECT
+                    chunk_id,
+                    convert_from(lo, 'UTF8')::jsonb AS lo_doc,
+                    convert_from(hi, 'UTF8')::jsonb AS hi_doc,
+                    n_rows
+                FROM pgl_validate.plan_key_ranges(
+                    'plan_composite'::regclass,
+                    ARRAY['part','code'],
+                    convert_to('{"part":1,"code":"b"}', 'UTF8'),
+                    convert_to('{"part":2,"code":"b"}', 'UTF8'),
+                    1
+                )
+            )
+            SELECT string_agg(
+                       chunk_id::text || ':' ||
+                       (lo_doc->>'part') || '/' || (lo_doc->>'code') || ':' ||
+                       (hi_doc->>'part') || '/' || (hi_doc->>'code') || ':' ||
+                       n_rows::text,
+                       ',' ORDER BY chunk_id
+                   )
+            FROM ranges
+            "#,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(composite_ranges, "1:1/b:2/a:1,2:2/a:2/b:1");
     }
 
     #[pg_test]

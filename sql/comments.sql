@@ -77,6 +77,8 @@ COMMENT ON FUNCTION pgl_validate.fence_standby_edge(bigint, integer, integer, te
     'Converge one physical standby edge by waiting for replay to reach a primary WAL LSN.';
 COMMENT ON FUNCTION pgl_validate.plan_key_range_predicate(regclass, text[], bytea, bytea) IS
     'Generate an indexable key-column range predicate from UTF-8 JSON boundary bytes.';
+COMMENT ON FUNCTION pgl_validate.plan_key_ranges(regclass, text[], bytea, bytea, integer, text) IS
+    'Plan ordered key ranges as bytea JSON boundaries for Merkle chunk validation.';
 COMMENT ON FUNCTION pgl_validate.plan_chunk_sql(regclass, text[], bytea, bytea, text[], text[], text, boolean) IS
     'Generate planner-visible SQL for a table chunk checksum and optional cryptographic set confirmation.';
 COMMENT ON FUNCTION pgl_validate.plan_localize_sql(regclass, text[], bytea, bytea, text[], text) IS

@@ -1297,6 +1297,152 @@ BEGIN
 END
 $$;
 
+-- Plan exact key ranges from a local participant scan. The returned boundaries
+-- use the same bytea JSON-object representation consumed by
+-- plan_key_range_predicate(), so each range can be fed directly into
+-- plan_chunk_sql() or plan_localize_sql().
+CREATE FUNCTION pgl_validate.plan_key_ranges(
+    rel regclass,
+    key_cols text[],
+    p_lo bytea DEFAULT NULL,
+    p_hi bytea DEFAULT NULL,
+    chunk_target_rows integer DEFAULT 50000,
+    row_filter_sql text DEFAULT NULL
+)
+RETURNS TABLE (
+    chunk_id bigint,
+    lo bytea,
+    hi bytea,
+    n_rows bigint
+)
+LANGUAGE plpgsql
+STABLE
+AS $$
+DECLARE
+    rel_sql text;
+    selected_key_cols text[];
+    key_json_args text;
+    order_args text;
+    filter_sql text;
+    range_sql text;
+    where_sql text;
+BEGIN
+    IF chunk_target_rows IS NULL OR chunk_target_rows <= 0 THEN
+        RAISE EXCEPTION 'chunk_target_rows must be greater than zero';
+    END IF;
+
+    IF key_cols IS NULL OR cardinality(key_cols) = 0 THEN
+        RAISE EXCEPTION 'range planning requires a comparison key';
+    END IF;
+
+    SELECT format('%I.%I', n.nspname, c.relname)
+    INTO rel_sql
+    FROM pg_class c
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE c.oid = rel;
+
+    IF rel_sql IS NULL THEN
+        RAISE EXCEPTION 'relation % does not exist', rel;
+    END IF;
+
+    SELECT array_agg(a.attname ORDER BY ord.ordinality)
+    INTO selected_key_cols
+    FROM unnest(key_cols) WITH ORDINALITY AS ord(col_name, ordinality)
+    JOIN pg_attribute a
+      ON a.attrelid = rel
+     AND a.attname = ord.col_name
+     AND a.attnum > 0
+     AND NOT a.attisdropped;
+
+    IF selected_key_cols IS NULL OR cardinality(selected_key_cols) <> cardinality(key_cols) THEN
+        RAISE EXCEPTION 'one or more key columns are not present on %', rel::text;
+    END IF;
+
+    SELECT
+        string_agg(format('%L, t.%I', a.attname, a.attname), ', ' ORDER BY ord.ordinality),
+        string_agg(format('t.%I', a.attname), ', ' ORDER BY ord.ordinality)
+    INTO key_json_args, order_args
+    FROM unnest(selected_key_cols) WITH ORDINALITY AS ord(col_name, ordinality)
+    JOIN pg_attribute a
+      ON a.attrelid = rel
+     AND a.attname = ord.col_name
+     AND a.attnum > 0
+     AND NOT a.attisdropped;
+
+    filter_sql := CASE
+        WHEN row_filter_sql IS NULL OR btrim(row_filter_sql) = '' THEN 'true'
+        ELSE format('(%s)', row_filter_sql)
+    END;
+    range_sql := pgl_validate.plan_key_range_predicate(rel, key_cols, p_lo, p_hi);
+    where_sql := COALESCE(
+        NULLIF(
+            concat_ws(
+                ' AND ',
+                NULLIF(filter_sql, 'true'),
+                NULLIF(range_sql, 'true')
+            ),
+            ''
+        ),
+        'true'
+    );
+
+    RETURN QUERY EXECUTE format(
+        $range_sql$
+        WITH ordered AS MATERIALIZED (
+            SELECT
+                row_number() OVER (ORDER BY %1$s) AS rn,
+                convert_to(jsonb_build_object(%2$s)::text, 'UTF8') AS boundary
+            FROM %3$s t
+            WHERE %4$s
+        ),
+        starts AS (
+            SELECT
+                (((rn - 1) / %5$s) + 1)::bigint AS planned_chunk_id,
+                min(rn) AS start_rn,
+                count(*)::bigint AS planned_rows
+            FROM ordered
+            GROUP BY 1
+        ),
+        ranges AS (
+            SELECT
+                s.planned_chunk_id,
+                s.start_rn,
+                s.planned_rows,
+                lead(s.start_rn) OVER (ORDER BY s.planned_chunk_id) AS next_start_rn
+            FROM starts s
+        )
+        SELECT
+            r.planned_chunk_id,
+            CASE
+                WHEN r.planned_chunk_id = 1 THEN $1::bytea
+                ELSE (
+                    SELECT o.boundary
+                    FROM ordered o
+                    WHERE o.rn = r.start_rn
+                )
+            END AS lo,
+            COALESCE(
+                (
+                    SELECT o.boundary
+                    FROM ordered o
+                    WHERE o.rn = r.next_start_rn
+                ),
+                $2::bytea
+            ) AS hi,
+            r.planned_rows
+        FROM ranges r
+        ORDER BY r.planned_chunk_id
+        $range_sql$,
+        order_args,
+        key_json_args,
+        rel_sql,
+        where_sql,
+        chunk_target_rows
+    )
+    USING p_lo, p_hi;
+END
+$$;
+
 -- Generate the planner-visible SQL used to checksum a table chunk. Columns are
 -- sorted by name before they are passed as heterogeneous VARIADIC row_digest
 -- arguments; callers may EXPLAIN the returned SQL directly on a participant.
