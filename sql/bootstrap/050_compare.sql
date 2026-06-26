@@ -61,12 +61,18 @@ DECLARE
     existing_sequence_error_count int;
     existing_sequence_result_count int;
     parent_run_id bigint := NULLIF(effective_options->>'_pgl_validate_parent_run_id', '')::bigint;
+    keep_parent_open boolean := false;
     stored_options jsonb;
 BEGIN
     IF jsonb_typeof(effective_options) <> 'object' THEN
         RAISE EXCEPTION 'options must be a JSON object'
             USING ERRCODE = '22023';
     END IF;
+
+    keep_parent_open := COALESCE(
+        (NULLIF(effective_options->>'_pgl_validate_keep_parent_open', ''))::boolean,
+        false
+    );
 
     IF tables IS NOT NULL AND cardinality(tables) > 0 THEN
         SELECT array_agg(dedup.table_oid ORDER BY dedup.first_ordinal)
@@ -132,7 +138,10 @@ BEGIN
     IF reference IS NOT NULL THEN
         effective_options := effective_options || jsonb_build_object('provider_node', reference);
     END IF;
-    stored_options := effective_options - '_pgl_validate_parent_run_id';
+    stored_options :=
+        effective_options
+        - '_pgl_validate_parent_run_id'
+        - '_pgl_validate_keep_parent_open';
 
     IF parent_run_id IS NULL THEN
         INSERT INTO pgl_validate.run(status, options, reference_node, tables_total)
@@ -155,7 +164,10 @@ BEGIN
         SET status = 'planning',
             options = stored_options,
             reference_node = reference,
-            tables_total = table_count,
+            tables_total = CASE
+                WHEN keep_parent_open THEN COALESCE(pgl_validate.run.tables_total, table_count)
+                ELSE table_count
+            END,
             tables_matched = NULL,
             tables_differ = NULL,
             finished_at = NULL,
@@ -309,28 +321,36 @@ BEGIN
             END LOOP;
         END IF;
 
-        UPDATE pgl_validate.run
-        SET status = 'completed',
-            finished_at = now(),
-            tables_total = table_count,
-            tables_matched = (
-                SELECT count(*)::int
-                FROM pgl_validate.table_result tr
-                WHERE tr.run_id = v_run_id
-                  AND tr.verdict = 'match'
-            ),
-            tables_differ = (
-                SELECT count(*)::int
-                FROM pgl_validate.table_result tr
-                WHERE tr.run_id = v_run_id
-                  AND tr.verdict = 'differ'
-            )
-        WHERE pgl_validate.run.run_id = v_run_id;
+        IF keep_parent_open THEN
+            UPDATE pgl_validate.run
+            SET status = 'running',
+                finished_at = NULL,
+                error = NULL
+            WHERE pgl_validate.run.run_id = v_run_id;
+        ELSE
+            UPDATE pgl_validate.run
+            SET status = 'completed',
+                finished_at = now(),
+                tables_total = table_count,
+                tables_matched = (
+                    SELECT count(*)::int
+                    FROM pgl_validate.table_result tr
+                    WHERE tr.run_id = v_run_id
+                      AND tr.verdict = 'match'
+                ),
+                tables_differ = (
+                    SELECT count(*)::int
+                    FROM pgl_validate.table_result tr
+                    WHERE tr.run_id = v_run_id
+                      AND tr.verdict = 'differ'
+                )
+            WHERE pgl_validate.run.run_id = v_run_id;
 
-        UPDATE pgl_validate.run_participant
-        SET status = 'done'
-        WHERE pgl_validate.run_participant.run_id = v_run_id
-          AND status NOT IN ('unreachable','error');
+            UPDATE pgl_validate.run_participant
+            SET status = 'done'
+            WHERE pgl_validate.run_participant.run_id = v_run_id
+              AND status NOT IN ('unreachable','error');
+        END IF;
     EXCEPTION WHEN others THEN
         UPDATE pgl_validate.run
         SET status = 'failed',

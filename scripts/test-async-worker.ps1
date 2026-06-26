@@ -234,6 +234,51 @@ WHERE r.run_id = $RunId::bigint;
     throw "timed out waiting for async validation run ${RunId}; last state: $last"
 }
 
+function Wait-AsyncRunStatus {
+    param(
+        [string] $RunId,
+        [string] $ExpectedStatus,
+        [int] $TimeoutSeconds
+    )
+
+    $deadline = [DateTimeOffset]::Now.AddSeconds($TimeoutSeconds)
+    $last = ''
+
+    while ([DateTimeOffset]::Now -lt $deadline) {
+        $last = Invoke-Sql -Quiet -Sql @"
+SELECT r.status || '|' ||
+       wt.status || '|' ||
+       COALESCE(wt.error, '') || '|' ||
+       (
+           SELECT count(*)::text
+           FROM pgl_validate.table_result tr
+           WHERE tr.run_id = r.run_id
+             AND tr.verdict = 'match'
+       )
+FROM pgl_validate.run r
+JOIN pgl_validate.worker_task wt USING (run_id)
+WHERE r.run_id = $RunId::bigint;
+"@
+
+        if ($last -like "$ExpectedStatus|*") {
+            return $last
+        }
+
+        if ($ExpectedStatus -ne 'failed' -and $last -like 'failed|*') {
+            throw "async validation failed for run ${RunId}: $last"
+        }
+
+        Start-Sleep -Milliseconds 100
+    }
+
+    if (Test-Path -LiteralPath $log) {
+        $tail = (Get-Content -LiteralPath $log -Tail 120) -join [Environment]::NewLine
+        throw "timed out waiting for async validation run ${RunId} to reach ${ExpectedStatus}; last state: $last$([Environment]::NewLine)PostgreSQL log tail:$([Environment]::NewLine)$tail"
+    }
+
+    throw "timed out waiting for async validation run ${RunId} to reach ${ExpectedStatus}; last state: $last"
+}
+
 $pgConfig = Get-PglPgrxPgConfig -PgMajor $PgMajor
 $script:InitDb = Get-PglToolPath -PgConfig $pgConfig -Name 'initdb'
 $script:PgCtl = Get-PglToolPath -PgConfig $pgConfig -Name 'pg_ctl'
@@ -364,6 +409,82 @@ FROM task;
     Write-Step "Waiting for resumed async run $resumeRunId to complete"
     $resumedState = Wait-AsyncRunComplete -RunId $resumeRunId -TimeoutSeconds $TimeoutSeconds
     Write-Output "resumed async validation passed on pg${PgMajor}: run_id=$resumeRunId state=$resumedState"
+
+    Write-Step 'Validating explicit-table async resume preserves committed table progress'
+    Invoke-Sql -Quiet -Sql @"
+CREATE TABLE public.async_resume_a(id int PRIMARY KEY, value text);
+CREATE TABLE public.async_resume_b(id int PRIMARY KEY, value text);
+INSERT INTO public.async_resume_a VALUES (1, 'same');
+INSERT INTO public.async_resume_b VALUES (1, 'same');
+"@ | Out-Null
+
+    $partialRunId = Invoke-Sql -Quiet -Sql @"
+SELECT pgl_validate.compare_async(
+    ARRAY[
+        'public.async_resume_a'::regclass,
+        'public.async_resume_b'::regclass
+    ],
+    NULL,
+    NULL,
+    NULL,
+    '{"_pgl_validate_worker_fail_once_after_tables":1}'::jsonb
+)::text;
+"@
+    if (-not $partialRunId) {
+        throw 'partial explicit-table compare_async did not return a run id.'
+    }
+
+    $failedState = Wait-AsyncRunStatus -RunId $partialRunId -ExpectedStatus 'failed' -TimeoutSeconds $TimeoutSeconds
+    if ($failedState -notlike 'failed|failed|worker task execution failed after committing 1 table(s)|1') {
+        throw "unexpected failed explicit-table async state: $failedState"
+    }
+
+    $partialShape = Invoke-Sql -Quiet -Sql @"
+SELECT
+    (SELECT count(*)::text
+     FROM pgl_validate.table_result tr
+     WHERE tr.run_id = $partialRunId::bigint
+       AND tr.table_name = 'async_resume_a'
+       AND tr.verdict = 'match') || ';' ||
+    (SELECT count(*)::text
+     FROM pgl_validate.table_result tr
+     WHERE tr.run_id = $partialRunId::bigint
+       AND tr.table_name = 'async_resume_b') || ';' ||
+    (
+        SELECT (wt.request->'options' ? '_pgl_validate_worker_fail_once_after_tables')::text
+        FROM pgl_validate.worker_task wt
+        WHERE wt.run_id = $partialRunId::bigint
+    );
+"@
+    if ($partialShape -ne '1;0;false') {
+        throw "unexpected partial explicit-table async shape: $partialShape"
+    }
+
+    $partialResumed = Invoke-Sql -Quiet -Sql "SELECT pgl_validate.resume($partialRunId::bigint)::text;"
+    if ($partialResumed -ne 'true') {
+        throw "resume returned $partialResumed for interrupted explicit-table async run $partialRunId."
+    }
+
+    $partialCompleted = Wait-AsyncRunStatus -RunId $partialRunId -ExpectedStatus 'completed' -TimeoutSeconds $TimeoutSeconds
+    if ($partialCompleted -notlike 'completed|completed||2') {
+        throw "unexpected completed explicit-table async state: $partialCompleted"
+    }
+
+    $finalShape = Invoke-Sql -Quiet -Sql @"
+SELECT r.tables_total::text || ';' ||
+       r.tables_matched::text || ';' ||
+       r.tables_differ::text || ';' ||
+       string_agg(tr.table_name || ':' || tr.verdict, ',' ORDER BY tr.table_name)
+FROM pgl_validate.run r
+JOIN pgl_validate.table_result tr USING (run_id)
+WHERE r.run_id = $partialRunId::bigint
+GROUP BY r.run_id;
+"@
+    if ($finalShape -ne '2;2;0;async_resume_a:match,async_resume_b:match') {
+        throw "unexpected resumed explicit-table async final shape: $finalShape"
+    }
+
+    Write-Output "explicit-table async resume preserved committed progress on pg${PgMajor}: run_id=$partialRunId state=$partialCompleted"
 }
 finally {
     Stop-TestCluster -Data $data -PgCtl $script:PgCtl

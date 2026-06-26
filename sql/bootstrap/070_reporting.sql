@@ -302,7 +302,8 @@ BEGIN
     INSERT INTO pgl_validate.run(status, options, reference_node, tables_total)
     VALUES (
         'planning',
-        effective_options || jsonb_build_object('async', true),
+        (effective_options - '_pgl_validate_worker_fail_once_after_tables')
+            || jsonb_build_object('async', true),
         reference,
         CASE WHEN tables IS NULL THEN NULL ELSE cardinality(tables) END
     )
@@ -471,7 +472,11 @@ BEGIN
             request_repset,
             peer_list,
             request_reference,
-            request_options || jsonb_build_object('_pgl_validate_parent_run_id', task.run_id)
+            (request_options - '_pgl_validate_worker_fail_once_after_tables')
+                || jsonb_build_object(
+                    'async', true,
+                    '_pgl_validate_parent_run_id', task.run_id
+                )
         );
 
         UPDATE pgl_validate.worker_task
