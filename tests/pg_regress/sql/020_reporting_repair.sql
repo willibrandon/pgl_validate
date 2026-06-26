@@ -1,5 +1,6 @@
 \set ON_ERROR_STOP on
 \pset null '<null>'
+\pset format unaligned
 
 DROP TABLE IF EXISTS public.pgl_validate_regress_repair;
 DROP SEQUENCE IF EXISTS public.pgl_validate_regress_seq;
@@ -40,13 +41,19 @@ epoch AS (
 ),
 plan AS (
     INSERT INTO pgl_validate.table_plan(
-        run_id, schema_name, table_name, key_cols, att_list, validated_property
+        run_id, schema_name, table_name, key_cols, att_list,
+        repl_insert, repl_update, repl_delete, repl_truncate,
+        validated_property
     )
     SELECT run_id,
            'public',
            'pgl_validate_regress_repair',
            ARRAY['id'],
            ARRAY['id','value'],
+           true,
+           true,
+           true,
+           true,
            'full'
     FROM run
 ),
@@ -122,6 +129,172 @@ FROM pgl_validate.generate_repair(
     'local'
 ) AS stmt
 ORDER BY stmt;
+
+CREATE TEMP TABLE pgl_validate_regress_action_case(
+    label text PRIMARY KEY,
+    validated_property text NOT NULL,
+    repl_insert boolean NOT NULL,
+    repl_update boolean NOT NULL,
+    repl_delete boolean NOT NULL,
+    repl_truncate boolean NOT NULL,
+    classification text NOT NULL,
+    key_id int NOT NULL,
+    tuple_doc jsonb NOT NULL
+);
+
+INSERT INTO pgl_validate_regress_action_case
+VALUES
+    (
+        'keys_only_delete',
+        'keys_only',
+        true,
+        false,
+        true,
+        true,
+        'extra_on',
+        2,
+        '{"local":null,"peer":{"id":2,"value":"target-only"}}'
+    ),
+    (
+        'keys_only_differs',
+        'keys_only',
+        true,
+        false,
+        true,
+        true,
+        'differs',
+        3,
+        '{"local":{"id":3,"value":"local"},"peer":{"id":3,"value":"target"}}'
+    ),
+    (
+        'superset_extra',
+        'superset',
+        true,
+        true,
+        false,
+        false,
+        'extra_on',
+        4,
+        '{"local":null,"peer":{"id":4,"value":"target-only"}}'
+    ),
+    (
+        'superset_missing',
+        'superset',
+        true,
+        true,
+        false,
+        false,
+        'missing_on',
+        5,
+        '{"local":{"id":5,"value":"local"},"peer":null}'
+    );
+
+CREATE TEMP TABLE pgl_validate_regress_action_seed(
+    label text PRIMARY KEY,
+    run_id bigint NOT NULL
+);
+
+WITH run AS (
+    INSERT INTO pgl_validate.run(status, started_at, finished_at, tables_total, tables_differ)
+    VALUES ('completed', '2026-01-01 00:00:00+00', '2026-01-01 00:00:01+00', 1, 1)
+    RETURNING run_id
+)
+INSERT INTO pgl_validate_regress_action_seed
+SELECT 'keys_only_delete', run_id
+FROM run;
+
+WITH run AS (
+    INSERT INTO pgl_validate.run(status, started_at, finished_at, tables_total, tables_differ)
+    VALUES ('completed', '2026-01-01 00:00:00+00', '2026-01-01 00:00:01+00', 1, 1)
+    RETURNING run_id
+)
+INSERT INTO pgl_validate_regress_action_seed
+SELECT 'keys_only_differs', run_id
+FROM run;
+
+WITH run AS (
+    INSERT INTO pgl_validate.run(status, started_at, finished_at, tables_total, tables_differ)
+    VALUES ('completed', '2026-01-01 00:00:00+00', '2026-01-01 00:00:01+00', 1, 1)
+    RETURNING run_id
+)
+INSERT INTO pgl_validate_regress_action_seed
+SELECT 'superset_extra', run_id
+FROM run;
+
+WITH run AS (
+    INSERT INTO pgl_validate.run(status, started_at, finished_at, tables_total, tables_differ)
+    VALUES ('completed', '2026-01-01 00:00:00+00', '2026-01-01 00:00:01+00', 1, 1)
+    RETURNING run_id
+)
+INSERT INTO pgl_validate_regress_action_seed
+SELECT 'superset_missing', run_id
+FROM run;
+
+INSERT INTO pgl_validate.run_participant(run_id, node, role, backend, pg_version, status)
+SELECT s.run_id, 'local', 'reference', 'native', current_setting('server_version_num')::int, 'done'
+FROM pgl_validate_regress_action_seed s
+UNION ALL
+SELECT s.run_id, 'target', 'participant', 'native', current_setting('server_version_num')::int, 'done'
+FROM pgl_validate_regress_action_seed s;
+
+INSERT INTO pgl_validate.fence_epoch(run_id, epoch_seq)
+SELECT s.run_id, 1
+FROM pgl_validate_regress_action_seed s;
+
+INSERT INTO pgl_validate.table_plan(
+    run_id, schema_name, table_name, key_cols, att_list,
+    repl_insert, repl_update, repl_delete, repl_truncate,
+    validated_property
+)
+SELECT s.run_id,
+       'public',
+       'pgl_validate_regress_repair',
+       ARRAY['id'],
+       ARRAY['id','value'],
+       c.repl_insert,
+       c.repl_update,
+       c.repl_delete,
+       c.repl_truncate,
+       c.validated_property
+FROM pgl_validate_regress_action_seed s
+JOIN pgl_validate_regress_action_case c USING (label);
+
+INSERT INTO pgl_validate.divergence(
+    run_id, schema_name, table_name, key_text, key_bytes,
+    classification, node, status, detected_epoch, tuple, detected_at
+)
+SELECT s.run_id,
+       'public',
+       'pgl_validate_regress_repair',
+       format('{"id": %s}', c.key_id),
+       convert_to(format('{"id":%s}', c.key_id), 'UTF8'),
+       c.classification,
+       'target',
+       'confirmed',
+       1,
+       c.tuple_doc,
+       '2026-01-01 00:00:01+00'
+FROM pgl_validate_regress_action_seed s
+JOIN pgl_validate_regress_action_case c USING (label);
+
+SELECT c.label,
+       COALESCE(
+           string_agg(
+               CASE
+                   WHEN g.stmt LIKE '% INSERT INTO %' THEN 'insert'
+                   WHEN g.stmt LIKE '% UPDATE %' THEN 'update'
+                   WHEN g.stmt LIKE '% DELETE FROM %' THEN 'delete'
+                   ELSE 'other'
+               END,
+               ',' ORDER BY g.stmt
+           ) FILTER (WHERE g.stmt IS NOT NULL),
+           '<none>'
+       ) AS repair_actions
+FROM pgl_validate_regress_action_case c
+JOIN pgl_validate_regress_action_seed s USING (label)
+LEFT JOIN LATERAL pgl_validate.generate_repair(s.run_id, 'local') AS g(stmt) ON true
+GROUP BY c.label
+ORDER BY c.label;
 
 SELECT report.doc->'run'->>'status' AS run_status,
        jsonb_array_length(report.doc->'tables') AS table_count,

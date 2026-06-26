@@ -208,7 +208,8 @@ BEGIN
 
     FOR rec IN
         SELECT d.run_id, d.schema_name, d.table_name, d.key_text, d.key_bytes, d.classification,
-               d.node, d.tuple, tp.key_cols, tp.att_list, tp.validated_property
+               d.node, d.tuple, tp.key_cols, tp.att_list, tp.validated_property,
+               tp.repl_insert, tp.repl_update, tp.repl_delete, tp.repl_truncate
         FROM pgl_validate.divergence d
         JOIN pgl_validate.table_plan tp
           ON tp.run_id = d.run_id
@@ -362,6 +363,17 @@ BEGIN
             RAISE EXCEPTION 'confirmed divergence %.% key % lacks key tuple data for delete repair',
                 rec.schema_name, rec.table_name, encode(rec.key_bytes, 'hex')
                 USING ERRCODE = '22023';
+        END IF;
+
+        IF action = 'insert' AND NOT COALESCE(rec.repl_insert, false) THEN
+            CONTINUE;
+        END IF;
+        IF action = 'update' AND NOT COALESCE(rec.repl_update, false) THEN
+            CONTINUE;
+        END IF;
+        IF action = 'delete'
+           AND NOT (COALESCE(rec.repl_delete, false) AND COALESCE(rec.repl_truncate, false)) THEN
+            CONTINUE;
         END IF;
 
         IF action = 'insert' THEN
