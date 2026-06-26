@@ -874,6 +874,85 @@ SELECT EXISTS (
         throw 'pglogical filtered-table presence difference was not recorded as advisory'
     }
 
+    Write-Step 'Validating pglogical non-replicated TRUNCATE semantics'
+    Invoke-Sql -Database 'provider' -Sql @"
+CREATE TABLE public.truncate_accounts(id int PRIMARY KEY, value text);
+SELECT pglogical.create_replication_set('pgl_validate_no_truncate', true, true, true, false);
+SELECT pglogical.replication_set_add_table(
+    'pgl_validate_no_truncate',
+    'public.truncate_accounts'::regclass,
+    false
+);
+"@ | Out-Null
+    Invoke-Sql -Database 'target' -Sql @"
+CREATE TABLE public.truncate_accounts(id int PRIMARY KEY, value text);
+SELECT pglogical.alter_subscription_add_replication_set('sub', 'pgl_validate_no_truncate');
+SELECT pglogical.alter_subscription_resynchronize_table('sub', 'public.truncate_accounts'::regclass, false);
+"@ | Out-Null
+    Wait-SqlEquals `
+        -Database 'target' `
+        -Sql "SELECT COALESCE((SELECT left(status, 1) FROM pglogical.show_subscription_table('sub'::name, 'public.truncate_accounts'::regclass)), '<missing>')" `
+        -Expected 'r' `
+        -TimeoutSeconds $TimeoutSeconds
+
+    Invoke-Sql -Database 'provider' -Sql "INSERT INTO public.truncate_accounts VALUES (1, 'left-behind')" | Out-Null
+    Wait-SqlEquals `
+        -Database 'target' `
+        -Sql "SELECT count(*)::text FROM public.truncate_accounts WHERE id = 1 AND value = 'left-behind'" `
+        -Expected '1' `
+        -TimeoutSeconds $TimeoutSeconds
+    Invoke-Sql -Database 'provider' -Sql 'TRUNCATE public.truncate_accounts' | Out-Null
+    Wait-SqlEquals `
+        -Database 'provider' `
+        -Sql 'SELECT count(*)::text FROM public.truncate_accounts' `
+        -Expected '0' `
+        -TimeoutSeconds $TimeoutSeconds
+    Wait-SqlEquals `
+        -Database 'target' `
+        -Sql 'SELECT count(*)::text FROM public.truncate_accounts' `
+        -Expected '1' `
+        -TimeoutSeconds $TimeoutSeconds
+
+    $truncateResult = Invoke-Sql -Database 'provider' -Sql @"
+SELECT run_id::text || ';' || verdict
+FROM pgl_validate.compare_table(
+    'public.truncate_accounts'::regclass,
+    ARRAY['target'],
+    jsonb_build_object(
+        'provider_dsn', $providerDsnSql,
+        'provider_node', 'provider',
+        'repsets', jsonb_build_array('pgl_validate_no_truncate'),
+        'fence_timeout_ms', 30000,
+        'fence_poll_interval_ms', 100
+    )
+)
+"@
+    $truncateParts = $truncateResult.Split(';', 2)
+    if ($truncateParts.Count -ne 2) {
+        throw "unexpected no-truncate compare_table result: $truncateResult"
+    }
+    $truncateRunId = $truncateParts[0]
+    $truncateVerdict = $truncateParts[1]
+    if ($truncateVerdict -ne 'match') {
+        throw "unexpected no-truncate compare_table verdict: $truncateVerdict"
+    }
+
+    $truncateAdvisory = Invoke-Sql -Database 'provider' -Sql @"
+SELECT tp.validated_property || ';' ||
+       tp.repl_truncate::text || ';' ||
+       d.classification || ';' ||
+       d.status || ';' ||
+       tr.verdict
+FROM pgl_validate.table_plan tp
+JOIN pgl_validate.table_result tr USING (run_id, schema_name, table_name)
+JOIN pgl_validate.divergence d USING (run_id, schema_name, table_name)
+WHERE tp.run_id = $truncateRunId
+  AND d.node = 'target'
+"@
+    if ($truncateAdvisory -ne 'superset;false;extra_on;advisory;match') {
+        throw "pglogical non-replicated TRUNCATE extra row was not advisory: $truncateAdvisory"
+    }
+
     Write-Step 'Validating pglogical sequence buffer-window semantics'
     Invoke-Sql -Database 'provider' -Sql @"
 CREATE SEQUENCE public.account_seq CACHE 5;

@@ -4402,6 +4402,96 @@ mod tests {
     }
 
     #[pg_test]
+    fn compare_table_marks_non_replicated_truncate_extras_advisory() {
+        let backend_pid = Spi::get_one::<i32>("SELECT pg_backend_pid()")
+            .unwrap()
+            .unwrap();
+        let peer_db = identifier(&format!("pgl_validate_truncate_peer_{backend_pid}"));
+        let table_name = identifier(&format!("pglogical_truncate_target_{backend_pid}"));
+        let repset_name = identifier(&format!("pgl_validate_truncate_{backend_pid}"));
+        let node_name = identifier(&format!("pgl_validate_truncate_node_{backend_pid}"));
+        let local_dsn = local_dsn();
+        let remote_dsn = peer_dsn(&peer_db);
+
+        let _ = crate::transport::libpq::execute_command(
+            &local_dsn,
+            &format!("DROP DATABASE IF EXISTS {peer_db} WITH (FORCE)"),
+        );
+        crate::transport::libpq::execute_command(&local_dsn, &format!("CREATE DATABASE {peer_db}"))
+            .unwrap();
+        crate::transport::libpq::execute_command(
+            &remote_dsn,
+            &format!(
+                "CREATE EXTENSION pgl_validate;
+                 CREATE TABLE public.{table_name}(id int PRIMARY KEY, value text);
+                 INSERT INTO public.{table_name} VALUES (1, 'left-behind-by-nonreplicated-truncate');"
+            ),
+        )
+        .unwrap();
+
+        Spi::run(&format!(
+            "
+            CREATE EXTENSION pglogical;
+            SELECT pglogical.create_node({node}, 'dbname=' || current_database());
+            CREATE TABLE public.{table_name}(id int PRIMARY KEY, value text);
+            SELECT pglogical.create_replication_set({repset}, true, true, true, false);
+            SELECT pglogical.replication_set_add_table(
+                {repset},
+                'public.{table_name}'::regclass,
+                false
+            );
+            INSERT INTO pgl_validate.peer(name, dsn, backend, replication_sets)
+            VALUES ('remote_truncate_extra', {remote_dsn}, 'native', ARRAY[{repset}]);
+            ",
+            node = sql_literal(&node_name),
+            repset = sql_literal(&repset_name),
+            remote_dsn = sql_literal(&remote_dsn)
+        ))
+        .unwrap();
+
+        let result_sql = format!(
+            "
+            SELECT (r).run_id::text || ';' || (r).verdict
+            FROM (
+                SELECT pgl_validate.compare_table(
+                    'public.{table_name}'::regclass,
+                    ARRAY['remote_truncate_extra'],
+                    '{{\"repsets\":[{repset_json}]}}'::jsonb
+                ) AS r
+            ) s
+            ",
+            repset_json = sql_literal(&repset_name).replace('\'', "\"")
+        );
+        let result = Spi::get_one::<String>(&result_sql).unwrap().unwrap();
+        let (run_id, verdict) = result
+            .split_once(';')
+            .expect("compare_table result should include run id and verdict");
+        assert_eq!(verdict, "match");
+
+        let contract = Spi::get_one::<String>(&format!(
+            "
+            SELECT tp.validated_property || ';' ||
+                   tp.repl_truncate::text || ';' ||
+                   d.classification || ';' ||
+                   d.status || ';' ||
+                   (tr.reason LIKE '%advisory differences=1%validated_property=superset')::text
+            FROM pgl_validate.table_plan tp
+            JOIN pgl_validate.table_result tr USING (run_id, schema_name, table_name)
+            JOIN pgl_validate.divergence d USING (run_id, schema_name, table_name)
+            WHERE tp.run_id = {run_id}
+            "
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(contract, "superset;false;extra_on;advisory;true");
+
+        let _ = crate::transport::libpq::execute_command(
+            &local_dsn,
+            &format!("DROP DATABASE IF EXISTS {peer_db} WITH (FORCE)"),
+        );
+    }
+
+    #[pg_test]
     fn compare_sequence_applies_pglogical_buffer_window() {
         let backend_pid = Spi::get_one::<i32>("SELECT pg_backend_pid()")
             .unwrap()
