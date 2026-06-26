@@ -866,6 +866,116 @@ mod tests {
     }
 
     #[pg_test]
+    fn compare_skips_schema_drift_table_and_continues_parent_run() {
+        let backend_pid = Spi::get_one::<i32>("SELECT pg_backend_pid()")
+            .unwrap()
+            .unwrap();
+        let peer_db = identifier(&format!("pgl_validate_schema_peer_{backend_pid}"));
+        let bad_table = identifier(&format!("schema_drift_bad_{backend_pid}"));
+        let good_table = identifier(&format!("schema_drift_good_{backend_pid}"));
+        let peer_name = identifier(&format!("schema_drift_peer_{backend_pid}"));
+        let local_dsn = local_dsn();
+        let remote_dsn = peer_dsn(&peer_db);
+
+        let _ = crate::transport::libpq::execute_command(
+            &local_dsn,
+            &format!("DROP DATABASE IF EXISTS {peer_db} WITH (FORCE)"),
+        );
+        crate::transport::libpq::execute_command(&local_dsn, &format!("CREATE DATABASE {peer_db}"))
+            .unwrap();
+        crate::transport::libpq::execute_command(
+            &remote_dsn,
+            &format!(
+                "CREATE EXTENSION pgl_validate;
+                 CREATE TABLE public.{bad_table}(id int PRIMARY KEY, value int);
+                 CREATE TABLE public.{good_table}(id int PRIMARY KEY, value text);
+                 INSERT INTO public.{bad_table} VALUES (1, 10);
+                 INSERT INTO public.{good_table} VALUES (1, 'same');"
+            ),
+        )
+        .unwrap();
+
+        Spi::run(&format!(
+            "
+            DELETE FROM pgl_validate.peer;
+            CREATE TABLE public.{bad_table}(id int PRIMARY KEY, value text);
+            CREATE TABLE public.{good_table}(id int PRIMARY KEY, value text);
+            INSERT INTO public.{bad_table} VALUES (1, '10');
+            INSERT INTO public.{good_table} VALUES (1, 'same');
+            INSERT INTO pgl_validate.peer(name, dsn, backend)
+            VALUES ({peer_name}, {remote_dsn}, 'native');
+            ",
+            peer_name = sql_literal(&peer_name),
+            remote_dsn = sql_literal(&remote_dsn)
+        ))
+        .unwrap();
+
+        let run_id = Spi::get_one::<i64>(&format!(
+            "
+            SELECT pgl_validate.compare(
+                ARRAY[
+                    'public.{bad_table}'::regclass,
+                    'public.{good_table}'::regclass
+                ],
+                peers => ARRAY[{peer_name}]
+            )
+            ",
+            peer_name = sql_literal(&peer_name)
+        ))
+        .unwrap()
+        .unwrap();
+
+        let verdicts = Spi::get_one::<String>(&format!(
+            "
+            SELECT string_agg(table_name || ':' || verdict, ',' ORDER BY table_name)
+            FROM pgl_validate.table_result
+            WHERE run_id = {run_id}
+            "
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(verdicts, format!("{bad_table}:skipped,{good_table}:match"));
+
+        let run_shape = Spi::get_one::<String>(&format!(
+            "
+            SELECT status || ';' || tables_total::text || ';' ||
+                   tables_matched::text || ';' || tables_differ::text
+            FROM pgl_validate.run
+            WHERE run_id = {run_id}
+            "
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(run_shape, "completed;2;1;0");
+
+        let issue = Spi::get_one::<String>(&format!(
+            "
+            SELECT si.issue_code || ';' ||
+                   (si.detail LIKE '%type_name%')::text || ';' ||
+                   (SELECT count(*)::text
+                    FROM pgl_validate.table_node_result tnr
+                    WHERE tnr.run_id = si.run_id
+                      AND tnr.schema_name = si.schema_name
+                      AND tnr.table_name = si.table_name)
+            FROM pgl_validate.schema_issue si
+            WHERE si.run_id = {run_id}
+              AND si.table_name = {bad_table}
+              AND si.node = {peer_name}
+            ",
+            bad_table = sql_literal(&bad_table),
+            peer_name = sql_literal(&peer_name)
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(issue, "SCHEMA_SIGNATURE_MISMATCH;true;0");
+
+        let _ = crate::transport::libpq::execute_command(
+            &local_dsn,
+            &format!("DROP DATABASE IF EXISTS {peer_db} WITH (FORCE)"),
+        );
+    }
+
+    #[pg_test]
     fn remote_checksum_reads_over_libpq() {
         let dsn = local_dsn();
         let checksum_sql = "SELECT 7::bigint AS n_rows, decode('010203', 'hex') AS lthash, decode('040506', 'hex') AS set_hash";

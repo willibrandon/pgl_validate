@@ -215,6 +215,7 @@ DECLARE
     fence_timeout_ms int;
     fence_poll_interval_ms int;
     on_fence_timeout text;
+    on_precondition_fail text;
     partial_mode boolean := false;
     degraded_mode boolean := false;
     skipped_peers text[] := ARRAY[]::text[];
@@ -244,6 +245,11 @@ DECLARE
     checksum_sql text;
     remote_checksum_sql text;
     remote_set_hash_sql text;
+    local_schema_signature text;
+    remote_schema_sql text;
+    remote_schema_rec record;
+    schema_mismatch_count int := 0;
+    schema_error_details text[] := ARRAY[]::text[];
     localize_sql text;
     remote_localize_sql text;
     n_rows bigint;
@@ -337,11 +343,15 @@ BEGIN
         100
     );
     on_fence_timeout := COALESCE(NULLIF(options->>'on_fence_timeout', ''), 'abort_run');
+    on_precondition_fail := COALESCE(NULLIF(options->>'on_precondition_fail', ''), 'skip_table');
     contract_subscription := NULLIF(options->>'subscription', '')::name;
     pglogical_available := to_regprocedure('pglogical.show_repset_table_info(regclass,text[])') IS NOT NULL;
 
     IF on_fence_timeout NOT IN ('abort_run','skip_peer') THEN
         RAISE EXCEPTION 'on_fence_timeout must be abort_run or skip_peer';
+    END IF;
+    IF on_precondition_fail NOT IN ('skip_table','abort_run') THEN
+        RAISE EXCEPTION 'on_precondition_fail must be skip_table or abort_run';
     END IF;
     IF fence_timeout_ms <= 0 THEN
         RAISE EXCEPTION 'fence_timeout_ms must be greater than zero';
@@ -1607,6 +1617,153 @@ BEGIN
         SET status = 'converged'
         WHERE pgl_validate.run_participant.run_id = v_run_id
           AND node = 'local';
+    END IF;
+
+    IF peer_names IS NOT NULL AND cardinality(peer_names) > 0 THEN
+        local_schema_signature :=
+            pgl_validate.schema_signature(v_schema_name, v_rel_name, cols, key_cols)::text;
+        remote_schema_sql :=
+            pgl_validate.plan_schema_signature_sql(v_schema_name, v_rel_name, cols, key_cols);
+
+        FOR peer_rec IN
+            SELECT p.name, p.dsn, p.backend,
+                   p.connect_timeout_seconds,
+                   p.statement_timeout_ms,
+                   p.lock_timeout_ms
+            FROM pgl_validate.peer p
+            WHERE p.name = ANY (peer_names)
+            ORDER BY p.name
+        LOOP
+            BEGIN
+                SELECT rss.pg_version, rss.signature
+                INTO remote_schema_rec
+                FROM pgl_validate.remote_schema_signature(
+                    peer_rec.dsn,
+                    remote_schema_sql,
+                    peer_rec.connect_timeout_seconds,
+                    peer_rec.statement_timeout_ms,
+                    peer_rec.lock_timeout_ms
+                ) AS rss;
+
+                INSERT INTO pgl_validate.run_participant(
+                    run_id, node, role, backend, pg_version, dsn_ref, status
+                )
+                VALUES (
+                    v_run_id, peer_rec.name, 'participant', peer_rec.backend,
+                    remote_schema_rec.pg_version, peer_rec.name, 'connected'
+                )
+                ON CONFLICT (run_id, node) DO UPDATE
+                SET backend = EXCLUDED.backend,
+                    pg_version = EXCLUDED.pg_version,
+                    dsn_ref = EXCLUDED.dsn_ref,
+                    status = CASE
+                        WHEN pgl_validate.run_participant.status IN ('converged','done') THEN
+                            pgl_validate.run_participant.status
+                        ELSE EXCLUDED.status
+                    END;
+
+                IF remote_schema_rec.signature IS DISTINCT FROM local_schema_signature THEN
+                    schema_mismatch_count := schema_mismatch_count + 1;
+                    schema_error_details := schema_error_details || format(
+                        '%s:SCHEMA_SIGNATURE_MISMATCH',
+                        peer_rec.name
+                    );
+
+                    UPDATE pgl_validate.run_participant
+                    SET status = 'error'
+                    WHERE pgl_validate.run_participant.run_id = v_run_id
+                      AND node = peer_rec.name;
+
+                    INSERT INTO pgl_validate.schema_issue(
+                        run_id, node, schema_name, table_name, issue_code, detail
+                    )
+                    VALUES (
+                        v_run_id,
+                        peer_rec.name,
+                        v_schema_name,
+                        v_rel_name,
+                        'SCHEMA_SIGNATURE_MISMATCH',
+                        format(
+                            'schema precondition failed for compared columns=%s keys=%s; local=%s; remote=%s',
+                            COALESCE(cols::text, '<all>'),
+                            COALESCE(key_cols::text, '<none>'),
+                            local_schema_signature,
+                            remote_schema_rec.signature
+                        )
+                    )
+                    ON CONFLICT DO NOTHING;
+                END IF;
+            EXCEPTION WHEN others THEN
+                schema_mismatch_count := schema_mismatch_count + 1;
+                schema_error_details := schema_error_details || format(
+                    '%s:SCHEMA_CHECK_FAILED',
+                    peer_rec.name
+                );
+
+                INSERT INTO pgl_validate.run_participant(
+                    run_id, node, role, backend, pg_version, dsn_ref, status
+                )
+                VALUES (
+                    v_run_id, peer_rec.name, 'participant', peer_rec.backend,
+                    0, peer_rec.name, 'error'
+                )
+                ON CONFLICT (run_id, node) DO UPDATE
+                SET backend = EXCLUDED.backend,
+                    pg_version = EXCLUDED.pg_version,
+                    dsn_ref = EXCLUDED.dsn_ref,
+                    status = 'error';
+
+                INSERT INTO pgl_validate.schema_issue(
+                    run_id, node, schema_name, table_name, issue_code, detail
+                )
+                VALUES (
+                    v_run_id,
+                    peer_rec.name,
+                    v_schema_name,
+                    v_rel_name,
+                    'SCHEMA_CHECK_FAILED',
+                    SQLERRM
+                )
+                ON CONFLICT DO NOTHING;
+            END;
+        END LOOP;
+
+        IF schema_mismatch_count > 0 THEN
+            result_reason := format(
+                'schema precondition failed for %s peer(s): %s',
+                schema_mismatch_count,
+                array_to_string(schema_error_details, '; ')
+            );
+
+            IF on_precondition_fail = 'abort_run' THEN
+                RAISE EXCEPTION '%', result_reason
+                    USING ERRCODE = '0A000';
+            END IF;
+
+            INSERT INTO pgl_validate.table_result(
+                run_id, schema_name, table_name, verdict, reason, finished_at
+            )
+            VALUES (
+                v_run_id, v_schema_name, v_rel_name, 'skipped', result_reason, now()
+            )
+            RETURNING * INTO result_row;
+
+            IF NOT append_to_parent THEN
+                UPDATE pgl_validate.run
+                SET status = 'completed',
+                    finished_at = now(),
+                    tables_matched = 0,
+                    tables_differ = 0
+                WHERE pgl_validate.run.run_id = v_run_id;
+
+                UPDATE pgl_validate.run_participant
+                SET status = 'done'
+                WHERE pgl_validate.run_participant.run_id = v_run_id
+                  AND node = 'local';
+            END IF;
+
+            RETURN result_row;
+        END IF;
     END IF;
 
     UPDATE pgl_validate.run

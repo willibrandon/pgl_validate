@@ -245,6 +245,181 @@ BEGIN
 END
 $$;
 
+-- Build a deterministic signature for the compared relation contract. The
+-- signature intentionally covers only the selected comparison columns and key
+-- columns, because pglogical and native logical replication can validly project
+-- a narrower column contract than the physical table definition.
+CREATE FUNCTION pgl_validate.schema_signature(
+    schema_name text,
+    table_name text,
+    cols text[] DEFAULT NULL,
+    key_cols text[] DEFAULT NULL
+)
+RETURNS jsonb
+LANGUAGE plpgsql
+STABLE
+AS $$
+DECLARE
+    relid oid := to_regclass(format('%I.%I', $1, $2));
+    columns_json jsonb := '[]'::jsonb;
+    missing_columns_json jsonb := '[]'::jsonb;
+    key_columns_json jsonb := '[]'::jsonb;
+    missing_key_columns_json jsonb := '[]'::jsonb;
+BEGIN
+    SELECT COALESCE(jsonb_agg(col_doc ORDER BY attname), '[]'::jsonb)
+    INTO columns_json
+    FROM (
+        SELECT
+            a.attname,
+            jsonb_build_object(
+                'name', a.attname,
+                'type_schema', tn.nspname,
+                'type_name', t.typname,
+                'type_kind', t.typtype::text,
+                'type_category', t.typcategory::text,
+                'typmod', a.atttypmod,
+                'not_null', a.attnotnull,
+                'encoding_mode', pgl_validate.column_encoding_mode(a.atttypid),
+                'collation', CASE
+                    WHEN a.attcollation = 0::oid THEN NULL::jsonb
+                    ELSE jsonb_build_object(
+                        'schema', cn.nspname,
+                        'name', co.collname,
+                        'provider', co.collprovider::text,
+                        'collate', co.collcollate,
+                        'ctype', co.collctype,
+                        'deterministic', co.collisdeterministic,
+                        'version', co.collversion
+                    )
+                END,
+                'enum_labels', (
+                    SELECT COALESCE(jsonb_agg(to_jsonb(enum_label) ORDER BY enum_ordinal), '[]'::jsonb)
+                    FROM (
+                        SELECT e.enumlabel::text AS enum_label,
+                               e.enumsortorder AS enum_ordinal
+                        FROM pg_enum e
+                        WHERE e.enumtypid = t.oid
+                    ) ordered_enum
+                ),
+                'domain', CASE
+                    WHEN t.typtype = 'd' THEN jsonb_build_object(
+                        'base_schema', btn.nspname,
+                        'base_name', bt.typname,
+                        'base_typmod', t.typtypmod,
+                        'not_null', t.typnotnull,
+                        'constraints', (
+                            SELECT COALESCE(jsonb_agg(to_jsonb(definition) ORDER BY constraint_name), '[]'::jsonb)
+                            FROM (
+                                SELECT c.conname AS constraint_name,
+                                       pg_get_constraintdef(c.oid, true) AS definition
+                                FROM pg_constraint c
+                                WHERE c.contypid = t.oid
+                            ) ordered_constraints
+                        )
+                    )
+                    ELSE NULL::jsonb
+                END
+            ) AS col_doc
+        FROM pg_attribute a
+        JOIN pg_type t ON t.oid = a.atttypid
+        JOIN pg_namespace tn ON tn.oid = t.typnamespace
+        LEFT JOIN pg_type bt ON bt.oid = t.typbasetype
+        LEFT JOIN pg_namespace btn ON btn.oid = bt.typnamespace
+        LEFT JOIN pg_collation co ON co.oid = a.attcollation
+        LEFT JOIN pg_namespace cn ON cn.oid = co.collnamespace
+        WHERE a.attrelid = relid
+          AND a.attnum > 0
+          AND NOT a.attisdropped
+          AND (
+              cols IS NULL
+              OR cardinality(cols) = 0
+              OR a.attname = ANY (cols)
+          )
+    ) ordered_columns;
+
+    IF cols IS NOT NULL AND cardinality(cols) > 0 THEN
+        SELECT COALESCE(jsonb_agg(to_jsonb(col_name) ORDER BY ordinality), '[]'::jsonb)
+        INTO missing_columns_json
+        FROM (
+            SELECT requested.col_name, requested.ordinality
+            FROM unnest(cols) WITH ORDINALITY AS requested(col_name, ordinality)
+            LEFT JOIN pg_attribute a
+              ON a.attrelid = relid
+             AND a.attname = requested.col_name
+             AND a.attnum > 0
+             AND NOT a.attisdropped
+            WHERE a.attname IS NULL
+        ) missing;
+    END IF;
+
+    SELECT COALESCE(jsonb_agg(to_jsonb(col_name) ORDER BY ordinality), '[]'::jsonb)
+    INTO key_columns_json
+    FROM unnest(COALESCE(key_cols, ARRAY[]::text[]))
+         WITH ORDINALITY AS requested(col_name, ordinality);
+
+    IF key_cols IS NOT NULL AND cardinality(key_cols) > 0 THEN
+        SELECT COALESCE(jsonb_agg(to_jsonb(col_name) ORDER BY ordinality), '[]'::jsonb)
+        INTO missing_key_columns_json
+        FROM (
+            SELECT requested.col_name, requested.ordinality
+            FROM unnest(key_cols) WITH ORDINALITY AS requested(col_name, ordinality)
+            LEFT JOIN pg_attribute a
+              ON a.attrelid = relid
+             AND a.attname = requested.col_name
+             AND a.attnum > 0
+             AND NOT a.attisdropped
+            WHERE a.attname IS NULL
+        ) missing;
+    END IF;
+
+    RETURN jsonb_build_object(
+        'schema', $1,
+        'table', $2,
+        'exists', relid IS NOT NULL,
+        'columns', columns_json,
+        'missing_columns', missing_columns_json,
+        'key_columns', key_columns_json,
+        'missing_key_columns', missing_key_columns_json
+    );
+END
+$$;
+
+-- Generate remote SQL that returns one schema_signature text column. It uses
+-- schema/table names instead of a regclass literal so a missing remote relation
+-- is reported as a signature mismatch rather than aborting SQL generation.
+CREATE FUNCTION pgl_validate.plan_schema_signature_sql(
+    schema_name text,
+    table_name text,
+    cols text[] DEFAULT NULL,
+    key_cols text[] DEFAULT NULL
+)
+RETURNS text
+LANGUAGE plpgsql
+STABLE
+AS $$
+DECLARE
+    cols_sql text;
+    key_cols_sql text;
+BEGIN
+    cols_sql := CASE
+        WHEN cols IS NULL THEN 'NULL::text[]'
+        ELSE format('%L::text[]', cols::text)
+    END;
+    key_cols_sql := CASE
+        WHEN key_cols IS NULL THEN 'NULL::text[]'
+        ELSE format('%L::text[]', key_cols::text)
+    END;
+
+    RETURN format(
+        'SELECT pgl_validate.schema_signature(%L, %L, %s, %s)::text AS signature',
+        schema_name,
+        table_name,
+        cols_sql,
+        key_cols_sql
+    );
+END
+$$;
+
 -- Generate the planner-visible SQL used to checksum a table chunk. Columns are
 -- sorted by name before they are passed as heterogeneous VARIADIC row_digest
 -- arguments; callers may EXPLAIN the returned SQL directly on a participant.

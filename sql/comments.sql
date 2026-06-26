@@ -89,6 +89,10 @@ COMMENT ON FUNCTION pgl_validate.plan_key_range_predicate(regclass, text[], byte
     'Generate an indexable key-column range predicate from UTF-8 JSON boundary bytes.';
 COMMENT ON FUNCTION pgl_validate.plan_key_ranges(regclass, text[], bytea, bytea, integer, text) IS
     'Plan ordered key ranges as bytea JSON boundaries for Merkle chunk validation.';
+COMMENT ON FUNCTION pgl_validate.schema_signature(text, text, text[], text[]) IS
+    'Build a deterministic JSON signature for the compared relation columns, key columns, type identity, and collation metadata.';
+COMMENT ON FUNCTION pgl_validate.plan_schema_signature_sql(text, text, text[], text[]) IS
+    'Generate remote SQL that returns a relation contract schema_signature without failing on a missing remote relation.';
 COMMENT ON FUNCTION pgl_validate.plan_chunk_sql(regclass, text[], bytea, bytea, text[], text[], text, boolean) IS
     'Generate planner-visible SQL for a table chunk checksum and optional cryptographic set confirmation.';
 COMMENT ON FUNCTION pgl_validate.plan_pglogical_filtered_sql(regclass, text[], text[], boolean) IS
@@ -152,6 +156,8 @@ COMMENT ON FUNCTION pgl_validate.row_filter_tree_is_immutable(text) IS
     'Return whether a serialized PostgreSQL row-filter expression tree contains only immutable functions.';
 COMMENT ON FUNCTION pgl_validate.remote_checksum(text, text, integer, integer, integer) IS
     'Execute generated checksum SQL on a named peer DSN via libpq, returning row count, LtHash, and optional set hash.';
+COMMENT ON FUNCTION pgl_validate.remote_schema_signature(text, text, integer, integer, integer) IS
+    'Execute generated schema-signature SQL on a named peer DSN via libpq, returning remote server version and signature text.';
 COMMENT ON FUNCTION pgl_validate.remote_localize_rows(text, text, integer, integer, integer) IS
     'Execute generated row-localization SQL on a named peer DSN via libpq with bounded connect, statement, and lock timeouts, returning key, digest, and row JSON.';
 COMMENT ON FUNCTION pgl_validate.remote_sequence_value(text, text, integer, integer, integer) IS

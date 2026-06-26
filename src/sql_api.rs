@@ -176,6 +176,27 @@ mod pgl_validate {
         ))
     }
 
+    /// Execute generated schema-signature SQL on a remote peer over libpq.
+    #[pg_extern(volatile, parallel_unsafe)]
+    fn remote_schema_signature(
+        dsn: &str,
+        signature_sql: &str,
+        connect_timeout_seconds: default!(i32, 10),
+        statement_timeout_ms: default!(i32, 600000),
+        lock_timeout_ms: default!(i32, 30000),
+    ) -> TableIterator<'static, (name!(pg_version, i32), name!(signature, String))> {
+        let signature = transport::libpq::fetch_schema_signature(
+            dsn,
+            signature_sql,
+            connect_timeout_seconds,
+            statement_timeout_ms,
+            lock_timeout_ms,
+        )
+        .unwrap_or_else(|err| pgrx::error!("{err}"));
+
+        TableIterator::once((signature.pg_version, signature.signature))
+    }
+
     /// Execute generated row-localization SQL on a remote peer over libpq.
     #[pg_extern(volatile, parallel_unsafe)]
     fn remote_localize_rows(

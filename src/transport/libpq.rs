@@ -44,6 +44,15 @@ pub(crate) struct RemoteChecksum {
     pub(crate) set_hash: Option<Vec<u8>>,
 }
 
+/// Schema-contract signature fetched from a remote participant.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) struct RemoteSchemaSignature {
+    /// Remote server_version_num.
+    pub(crate) pg_version: i32,
+    /// Deterministic JSON signature for the compared relation contract.
+    pub(crate) signature: String,
+}
+
 /// Key and row digest fetched while localizing a divergent chunk.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub(crate) struct LocalizedRowDigest {
@@ -923,6 +932,45 @@ pub(crate) fn fetch_checksum(
         n_rows,
         lthash,
         set_hash,
+    })
+}
+
+/// Run generated schema-signature SQL on a remote participant.
+pub(crate) fn fetch_schema_signature(
+    dsn: &str,
+    signature_sql: &str,
+    connect_timeout_seconds: i32,
+    statement_timeout_ms: i32,
+    lock_timeout_ms: i32,
+) -> Result<RemoteSchemaSignature, String> {
+    let conn = Connection::connect_with_timeout(dsn, connect_timeout_seconds)?;
+    conn.set_query_timeouts(statement_timeout_ms, lock_timeout_ms)?;
+    let wrapped_sql = format!(
+        "SELECT current_setting('server_version_num')::int::text, \
+                q.signature::text \
+         FROM ({signature_sql}) AS q"
+    );
+
+    let result = conn.exec(&wrapped_sql)?;
+    result.require_status(PGRES_TUPLES_OK)?;
+
+    if result.ntuples() != 1 || result.nfields() != 2 {
+        return Err(format!(
+            "remote schema signature returned {} row(s) and {} column(s), expected 1 row and 2 columns",
+            result.ntuples(),
+            result.nfields()
+        ));
+    }
+
+    let pg_version = result
+        .value(0, 0)?
+        .parse::<i32>()
+        .map_err(|err| format!("invalid remote server_version_num: {err}"))?;
+    let signature = result.value(0, 1)?;
+
+    Ok(RemoteSchemaSignature {
+        pg_version,
+        signature,
     })
 }
 
