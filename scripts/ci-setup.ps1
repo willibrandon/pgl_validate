@@ -183,11 +183,14 @@ function Resolve-WindowsLibclangPath {
     $architecture = Normalize-WindowsArchitecture -Architecture $env:PGL_VALIDATE_MSVC_ARCH
 
     $candidateDirs = New-Object System.Collections.Generic.List[string]
-    foreach ($candidate in Get-VisualStudioLibclangCandidates -Architecture $architecture) {
-        [void] $candidateDirs.Add($candidate)
-    }
+    [void] $candidateDirs.Add((Join-Path (Get-PglPgrxHome) "llvm-$LlvmVersion-$architecture\bin"))
     foreach ($candidate in @('C:\Program Files\LLVM\bin', 'C:\Program Files (x86)\LLVM\bin')) {
         [void] $candidateDirs.Add($candidate)
+    }
+    if ($architecture -ne 'x64') {
+        foreach ($candidate in Get-VisualStudioLibclangCandidates -Architecture $architecture) {
+            [void] $candidateDirs.Add($candidate)
+        }
     }
 
     foreach ($candidate in $candidateDirs) {
@@ -198,7 +201,7 @@ function Resolve-WindowsLibclangPath {
 
     Install-WindowsLlvm -Architecture $architecture
 
-    foreach ($candidate in $candidateDirs + @((Join-Path (Get-PglPgrxHome) "llvm-$LlvmVersion-$architecture\bin"))) {
+    foreach ($candidate in $candidateDirs) {
         if (Test-LibclangArchitecture -Directory $candidate -Architecture $architecture) {
             return $candidate
         }
