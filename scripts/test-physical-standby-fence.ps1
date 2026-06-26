@@ -109,35 +109,53 @@ function ConvertTo-EncodedCommand {
 
 <#
 .SYNOPSIS
-Waits until a file can be opened for read/write access without sharing.
+Writes Windows ACL and attribute diagnostics for a filesystem path.
 #>
-function Wait-FileReadWriteReady {
-    param(
-        [string] $Path,
-        [int] $TimeoutSeconds = 60
-    )
+function Write-WindowsPathAccess {
+    param([string] $Path)
 
-    $deadline = [DateTimeOffset]::Now.AddSeconds($TimeoutSeconds)
-    $lastError = ''
-
-    while ([DateTimeOffset]::Now -lt $deadline) {
-        try {
-            $stream = [System.IO.File]::Open(
-                $Path,
-                [System.IO.FileMode]::Open,
-                [System.IO.FileAccess]::ReadWrite,
-                [System.IO.FileShare]::None
-            )
-            $stream.Dispose()
-            return
-        }
-        catch {
-            $lastError = $_.Exception.Message
-            Start-Sleep -Milliseconds 250
-        }
+    if (-not (Test-PglWindows)) {
+        return
     }
 
-    throw "timed out waiting for $Path to be read/write accessible; last error: $lastError"
+    $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+    Write-Host "--- Windows path access: $Path ---"
+    Write-Host "identity: $($identity.Name)"
+    Write-Host "sid: $($identity.User.Value)"
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        Write-Host 'path does not exist'
+        return
+    }
+
+    & icacls $Path
+    & attrib $Path
+}
+
+<#
+.SYNOPSIS
+Grants the current Windows identity explicit access to a PostgreSQL data directory.
+#>
+function Grant-WindowsPostgresDataAccess {
+    param([string] $Data)
+
+    if (-not (Test-PglWindows)) {
+        return
+    }
+
+    $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    $grant = "*$($sid):(OI)(CI)F"
+
+    Write-Step "Granting current Windows identity explicit access to $Data"
+    & icacls $Data /inheritance:e /grant:r $grant /T /C /Q
+    if ($LASTEXITCODE -ne 0) {
+        throw "icacls failed while granting access to $Data."
+    }
+
+    & attrib -R (Join-Path $Data '*') /S /D
+    if ($LASTEXITCODE -ne 0) {
+        throw "attrib failed while clearing read-only attributes under $Data."
+    }
 }
 
 function Get-PgrxPgConfig {
@@ -382,9 +400,9 @@ SELECT pg_create_physical_replication_slot('pgl_validate_standby_slot');
         ) `
         -TimeoutSeconds 180 | Out-Null
 
-    Write-Step 'Waiting for standby control file readiness'
     $standbyPgControl = Join-Path (Join-Path $standbyData 'global') 'pg_control'
-    Wait-FileReadWriteReady -Path $standbyPgControl -TimeoutSeconds 60
+    Grant-WindowsPostgresDataAccess -Data $standbyData
+    Write-WindowsPathAccess -Path $standbyPgControl
 
     Write-Step "Starting physical standby on port $script:StandbyPort"
     $standbyOptions = (@(
