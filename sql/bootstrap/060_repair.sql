@@ -207,7 +207,7 @@ BEGIN
     END IF;
 
     FOR rec IN
-        SELECT d.run_id, d.schema_name, d.table_name, d.key_bytes, d.classification,
+        SELECT d.run_id, d.schema_name, d.table_name, d.key_text, d.key_bytes, d.classification,
                d.node, d.tuple, tp.key_cols, tp.att_list, tp.validated_property
         FROM pgl_validate.divergence d
         JOIN pgl_validate.table_plan tp
@@ -334,6 +334,21 @@ BEGIN
                 action := 'delete';
                 key_row := rec.tuple->'peer';
             END IF;
+        END IF;
+
+        IF action IN ('insert','update')
+           AND source_row IS NOT NULL
+           AND jsonb_typeof(source_row) = 'object'
+           AND source_row ? '_pgl_validate_tuple_truncated' THEN
+            RAISE EXCEPTION 'confirmed divergence %.% key % has capped authoritative tuple data; rerun validation with larger max_reported_tuple_bytes before repair',
+                rec.schema_name, rec.table_name, encode(rec.key_bytes, 'hex')
+                USING ERRCODE = '22023';
+        END IF;
+        IF action = 'delete'
+           AND key_row IS NOT NULL
+           AND jsonb_typeof(key_row) = 'object'
+           AND key_row ? '_pgl_validate_tuple_truncated' THEN
+            key_row := rec.key_text::jsonb;
         END IF;
 
         IF action IN ('insert','update')

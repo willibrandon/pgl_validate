@@ -64,6 +64,7 @@ extension_sql_file!("../sql/comments.sql", name = "comments", finalize);
 
 static PARANOID_CONFIRM: GucSetting<bool> = GucSetting::<bool>::new(false);
 static PARANOID_CONFIRM_MAX_ROWS: GucSetting<i32> = GucSetting::<i32>::new(1000);
+static MAX_REPORTED_TUPLE_BYTES: GucSetting<i32> = GucSetting::<i32>::new(8192);
 static HASH_ALGORITHM: GucSetting<Option<CString>> =
     GucSetting::<Option<CString>>::new(Some(c"blake3_256"));
 static ALLOW_APPROXIMATE_FILTERS: GucSetting<bool> = GucSetting::<bool>::new(false);
@@ -104,6 +105,16 @@ pub extern "C-unwind" fn _PG_init() {
         c"Rows per paranoid set confirmation.",
         c"Bounds the sorted hash_digest_array input used for cryptographic clean-chunk confirmation.",
         &PARANOID_CONFIRM_MAX_ROWS,
+        1,
+        i32::MAX,
+        GucContext::Userset,
+        flags,
+    );
+    GucRegistry::define_int_guc(
+        c"pgl_validate.max_reported_tuple_bytes",
+        c"Maximum captured divergent tuple bytes.",
+        c"Caps each captured divergent tuple body stored in pgl_validate.divergence.tuple.",
+        &MAX_REPORTED_TUPLE_BYTES,
         1,
         i32::MAX,
         GucContext::Userset,

@@ -532,6 +532,7 @@ mod tests {
             "
             SET LOCAL pgl_validate.chunk_target_rows = 2;
             SET LOCAL pgl_validate.recheck_passes = 2;
+            SET LOCAL pgl_validate.max_reported_tuple_bytes = 8192;
             SET LOCAL pgl_validate.hash_algorithm = 'blake3_256';
             SET LOCAL pgl_validate.chunk_max_duration = '2s';
             SET LOCAL pgl_validate.max_parallel_chunks = 4;
@@ -601,6 +602,11 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(recheck_setting, "2");
+        let tuple_bytes_setting =
+            Spi::get_one::<String>("SHOW pgl_validate.max_reported_tuple_bytes")
+                .unwrap()
+                .unwrap();
+        assert_eq!(tuple_bytes_setting, "8192");
         let statement_timeout_setting =
             Spi::get_one::<String>("SHOW pgl_validate.statement_timeout_per_chunk")
                 .unwrap()
@@ -633,6 +639,25 @@ mod tests {
 
                 IF NOT rejected THEN
                     RAISE EXCEPTION 'expected compare_table to reject recheck_passes=0';
+                END IF;
+
+                rejected := false;
+                BEGIN
+                    PERFORM pgl_validate.compare_table(
+                        'public.{table_name}'::regclass,
+                        ARRAY['remote_guc'],
+                        '{{"max_reported_tuple_bytes":0}}'::jsonb
+                    );
+                EXCEPTION WHEN others THEN
+                    IF SQLERRM = 'max_reported_tuple_bytes must be greater than zero' THEN
+                        rejected := true;
+                    ELSE
+                        RAISE;
+                    END IF;
+                END;
+
+                IF NOT rejected THEN
+                    RAISE EXCEPTION 'expected compare_table to reject max_reported_tuple_bytes=0';
                 END IF;
 
                 rejected := false;
@@ -2310,6 +2335,112 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(local_repaired_verdict, "match");
+
+        let _ = crate::transport::libpq::execute_command(
+            &local_dsn,
+            &format!("DROP DATABASE IF EXISTS {peer_db} WITH (FORCE)"),
+        );
+    }
+
+    #[pg_test]
+    fn compare_table_caps_reported_divergent_tuple_payloads() {
+        let backend_pid = Spi::get_one::<i32>("SELECT pg_backend_pid()")
+            .unwrap()
+            .unwrap();
+        let peer_db = identifier(&format!("pgl_validate_tuple_cap_peer_{backend_pid}"));
+        let table_name = identifier(&format!("tuple_cap_target_{backend_pid}"));
+        let local_dsn = local_dsn();
+        let remote_dsn = peer_dsn(&peer_db);
+
+        let _ = crate::transport::libpq::execute_command(
+            &local_dsn,
+            &format!("DROP DATABASE IF EXISTS {peer_db} WITH (FORCE)"),
+        );
+        crate::transport::libpq::execute_command(&local_dsn, &format!("CREATE DATABASE {peer_db}"))
+            .unwrap();
+        crate::transport::libpq::execute_command(
+            &remote_dsn,
+            &format!(
+                "CREATE EXTENSION pgl_validate;
+                 CREATE TABLE public.{table_name}(id int PRIMARY KEY, value text);
+                 INSERT INTO public.{table_name}
+                 VALUES (1, repeat('remote-value-', 200));"
+            ),
+        )
+        .unwrap();
+
+        Spi::run(&format!(
+            "CREATE TABLE public.{table_name}(id int PRIMARY KEY, value text);
+             INSERT INTO public.{table_name}
+             VALUES (1, repeat('local-value-', 200));
+             INSERT INTO pgl_validate.peer(name, dsn, backend)
+             VALUES ('remote_tuple_cap', {}, 'native');",
+            sql_literal(&remote_dsn)
+        ))
+        .unwrap();
+
+        let run_id = Spi::get_one::<i64>(&format!(
+            "
+            SELECT (pgl_validate.compare_table(
+                {}::regclass,
+                ARRAY['remote_tuple_cap'],
+                '{{\"max_reported_tuple_bytes\":128}}'::jsonb
+            )).run_id
+            ",
+            sql_literal(&format!("public.{table_name}"))
+        ))
+        .unwrap()
+        .unwrap();
+
+        let cap_summary = Spi::get_one::<String>(&format!(
+            "
+            SELECT
+                verdict || ';' ||
+                status || ';' ||
+                (tuple->'local'->>'_pgl_validate_tuple_truncated') || ';' ||
+                (tuple->'peer'->>'_pgl_validate_tuple_truncated') || ';' ||
+                ((tuple->'local'->>'original_bytes')::int > 128)::text || ';' ||
+                ((tuple->'peer'->>'original_bytes')::int > 128)::text || ';' ||
+                (tuple->'local' ? 'value')::text || ';' ||
+                (tuple->'peer' ? 'value')::text
+            FROM pgl_validate.table_result tr
+            JOIN pgl_validate.divergence d USING (run_id, schema_name, table_name)
+            WHERE tr.run_id = {run_id}
+              AND d.node = 'remote_tuple_cap'
+              AND d.classification = 'differs'
+            "
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            cap_summary,
+            "differ;confirmed;true;true;true;true;false;false"
+        );
+
+        Spi::run(&format!(
+            r#"
+            DO $pgl_validate_tuple_cap$
+            DECLARE
+                rejected boolean := false;
+            BEGIN
+                BEGIN
+                    PERFORM pgl_validate.generate_repair({run_id}, 'local');
+                EXCEPTION WHEN others THEN
+                    IF SQLERRM LIKE 'confirmed divergence % has capped authoritative tuple data;%' THEN
+                        rejected := true;
+                    ELSE
+                        RAISE;
+                    END IF;
+                END;
+
+                IF NOT rejected THEN
+                    RAISE EXCEPTION 'expected capped tuple data to block repair generation';
+                END IF;
+            END
+            $pgl_validate_tuple_cap$;
+            "#
+        ))
+        .unwrap();
 
         let _ = crate::transport::libpq::execute_command(
             &local_dsn,

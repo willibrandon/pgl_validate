@@ -1,3 +1,33 @@
+CREATE FUNCTION pgl_validate.reported_tuple_json(row_json jsonb, max_bytes integer)
+RETURNS jsonb
+LANGUAGE plpgsql
+IMMUTABLE
+PARALLEL SAFE
+AS $$
+DECLARE
+    tuple_bytes integer;
+BEGIN
+    IF row_json IS NULL THEN
+        RETURN NULL;
+    END IF;
+    IF max_bytes IS NULL OR max_bytes <= 0 THEN
+        RAISE EXCEPTION 'max_reported_tuple_bytes must be greater than zero'
+            USING ERRCODE = '22023';
+    END IF;
+
+    tuple_bytes := octet_length(row_json::text);
+    IF tuple_bytes <= max_bytes THEN
+        RETURN row_json;
+    END IF;
+
+    RETURN jsonb_build_object(
+        '_pgl_validate_tuple_truncated', true,
+        'original_bytes', tuple_bytes,
+        'max_reported_tuple_bytes', max_bytes
+    );
+END
+$$;
+
 CREATE FUNCTION pgl_validate.compare(
     tables regclass[] DEFAULT NULL,
     repset text DEFAULT NULL,
@@ -385,6 +415,11 @@ DECLARE
         NULLIF(current_setting('pgl_validate.paranoid_confirm_max_rows', true), '')::int,
         1000
     );
+    max_reported_tuple_bytes int := COALESCE(
+        (NULLIF(options->>'max_reported_tuple_bytes', ''))::int,
+        NULLIF(current_setting('pgl_validate.max_reported_tuple_bytes', true), '')::int,
+        8192
+    );
     hash_algorithm text := COALESCE(
         NULLIF(options->>'hash_algorithm', ''),
         NULLIF(current_setting('pgl_validate.hash_algorithm', true), ''),
@@ -502,6 +537,9 @@ BEGIN
     END IF;
     IF paranoid_confirm_max_rows <= 0 THEN
         RAISE EXCEPTION 'paranoid_confirm_max_rows must be greater than zero';
+    END IF;
+    IF max_reported_tuple_bytes <= 0 THEN
+        RAISE EXCEPTION 'max_reported_tuple_bytes must be greater than zero';
     END IF;
     IF hash_algorithm <> 'blake3_256' THEN
         RAISE EXCEPTION 'hash_algorithm % is not implemented; only blake3_256 is currently available', hash_algorithm
@@ -2397,8 +2435,14 @@ BEGIN
                 END,
                 initial_epoch,
                 jsonb_build_object(
-                    'local', classified.local_row_json,
-                    'peer', classified.peer_row_json
+                    'local', pgl_validate.reported_tuple_json(
+                        classified.local_row_json,
+                        max_reported_tuple_bytes
+                    ),
+                    'peer', pgl_validate.reported_tuple_json(
+                        classified.peer_row_json,
+                        max_reported_tuple_bytes
+                    )
                 )
             FROM (
                 SELECT
