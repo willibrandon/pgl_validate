@@ -55,6 +55,11 @@ DECLARE
     error_detail text;
     error_cols text[];
     error_key_cols text[];
+    existing_table_verdict text;
+    sequence_schema_name text;
+    sequence_rel_name text;
+    existing_sequence_error_count int;
+    existing_sequence_result_count int;
     parent_run_id bigint := NULLIF(effective_options->>'_pgl_validate_parent_run_id', '')::bigint;
     stored_options jsonb;
 BEGIN
@@ -161,6 +166,41 @@ BEGIN
     BEGIN
         IF table_count > 0 THEN
             FOREACH table_oid IN ARRAY table_list LOOP
+                SELECT n.nspname, c.relname
+                INTO error_schema_name, error_table_name
+                FROM pg_class c
+                JOIN pg_namespace n ON n.oid = c.relnamespace
+                WHERE c.oid = table_oid;
+
+                error_schema_name := COALESCE(error_schema_name, '<unknown>');
+                error_table_name := COALESCE(error_table_name, table_oid::text);
+
+                IF parent_run_id IS NOT NULL THEN
+                    SELECT tr.verdict
+                    INTO existing_table_verdict
+                    FROM pgl_validate.table_result tr
+                    WHERE tr.run_id = v_run_id
+                      AND tr.schema_name = error_schema_name
+                      AND tr.table_name = error_table_name;
+
+                    IF existing_table_verdict IS NOT NULL
+                       AND existing_table_verdict NOT IN ('error','fence_timeout') THEN
+                        CONTINUE;
+                    END IF;
+
+                    IF existing_table_verdict IN ('error','fence_timeout') THEN
+                        DELETE FROM pgl_validate.schema_issue si
+                        WHERE si.run_id = v_run_id
+                          AND si.schema_name = error_schema_name
+                          AND si.table_name = error_table_name;
+
+                        DELETE FROM pgl_validate.table_plan tp
+                        WHERE tp.run_id = v_run_id
+                          AND tp.schema_name = error_schema_name
+                          AND tp.table_name = error_table_name;
+                    END IF;
+                END IF;
+
                 internal_options := effective_options || jsonb_build_object('_pgl_validate_parent_run_id', v_run_id);
                 BEGIN
                     SELECT *
@@ -172,15 +212,6 @@ BEGIN
                     IF COALESCE(NULLIF(effective_options->>'on_precondition_fail', ''), 'skip_table') = 'abort_run' THEN
                         RAISE;
                     END IF;
-
-                    SELECT n.nspname, c.relname
-                    INTO error_schema_name, error_table_name
-                    FROM pg_class c
-                    JOIN pg_namespace n ON n.oid = c.relnamespace
-                    WHERE c.oid = table_oid;
-
-                    error_schema_name := COALESCE(error_schema_name, '<unknown>');
-                    error_table_name := COALESCE(error_table_name, table_oid::text);
 
                     SELECT array_agg(a.attname ORDER BY a.attname)
                     INTO error_cols
@@ -245,6 +276,34 @@ BEGIN
 
         IF sequence_count > 0 THEN
             FOREACH sequence_oid IN ARRAY sequence_list LOOP
+                SELECT n.nspname, c.relname
+                INTO sequence_schema_name, sequence_rel_name
+                FROM pg_class c
+                JOIN pg_namespace n ON n.oid = c.relnamespace
+                WHERE c.oid = sequence_oid;
+
+                IF parent_run_id IS NOT NULL THEN
+                    SELECT count(*)::int,
+                           count(*) FILTER (WHERE sr.verdict = 'error')::int
+                    INTO existing_sequence_result_count, existing_sequence_error_count
+                    FROM pgl_validate.sequence_result sr
+                    WHERE sr.run_id = v_run_id
+                      AND sr.schema_name = sequence_schema_name
+                      AND sr.seq_name = sequence_rel_name;
+
+                    IF existing_sequence_result_count > 0
+                       AND existing_sequence_error_count = 0 THEN
+                        CONTINUE;
+                    END IF;
+
+                    IF existing_sequence_result_count > 0 THEN
+                        DELETE FROM pgl_validate.sequence_result sr
+                        WHERE sr.run_id = v_run_id
+                          AND sr.schema_name = sequence_schema_name
+                          AND sr.seq_name = sequence_rel_name;
+                    END IF;
+                END IF;
+
                 internal_options := effective_options || jsonb_build_object('_pgl_validate_parent_run_id', v_run_id);
                 PERFORM pgl_validate.compare_sequence(sequence_oid, peers, internal_options);
             END LOOP;
@@ -841,7 +900,18 @@ BEGIN
         v_run_id, v_schema_name, v_rel_name, key_cols, cols, plan_repsets,
         repl_insert, repl_update, repl_delete, repl_truncate,
         has_row_filter, sync_status, validated_property
-    );
+    )
+    ON CONFLICT (run_id, schema_name, table_name) DO UPDATE
+    SET key_cols = EXCLUDED.key_cols,
+        att_list = EXCLUDED.att_list,
+        repsets = EXCLUDED.repsets,
+        repl_insert = EXCLUDED.repl_insert,
+        repl_update = EXCLUDED.repl_update,
+        repl_delete = EXCLUDED.repl_delete,
+        repl_truncate = EXCLUDED.repl_truncate,
+        has_row_filter = EXCLUDED.has_row_filter,
+        sync_status = EXCLUDED.sync_status,
+        validated_property = EXCLUDED.validated_property;
 
     IF current_setting('track_commit_timestamp', true) = 'off' THEN
         INSERT INTO pgl_validate.schema_issue(
@@ -911,7 +981,11 @@ BEGIN
         INSERT INTO pgl_validate.table_node_result(
             run_id, schema_name, table_name, node, n_rows, lthash, set_hash
         )
-        VALUES (v_run_id, v_schema_name, v_rel_name, 'local', n_rows, lthash, set_hash);
+        VALUES (v_run_id, v_schema_name, v_rel_name, 'local', n_rows, lthash, set_hash)
+        ON CONFLICT (run_id, schema_name, table_name, node) DO UPDATE
+        SET n_rows = EXCLUDED.n_rows,
+            lthash = EXCLUDED.lthash,
+            set_hash = EXCLUDED.set_hash;
 
         remote_checksum_sql := pgl_validate.plan_chunk_sql(
             p_table_name,
@@ -966,7 +1040,11 @@ BEGIN
             VALUES (
                 v_run_id, v_schema_name, v_rel_name, peer_rec.name,
                 remote_rec.n_rows, remote_rec.lthash, remote_rec.set_hash
-            );
+            )
+            ON CONFLICT (run_id, schema_name, table_name, node) DO UPDATE
+            SET n_rows = EXCLUDED.n_rows,
+                lthash = EXCLUDED.lthash,
+                set_hash = EXCLUDED.set_hash;
 
             IF remote_rec.n_rows IS DISTINCT FROM n_rows
                OR remote_rec.lthash IS DISTINCT FROM lthash THEN
@@ -2106,7 +2184,11 @@ BEGIN
     INSERT INTO pgl_validate.table_node_result(
         run_id, schema_name, table_name, node, n_rows, lthash, set_hash
     )
-    VALUES (v_run_id, v_schema_name, v_rel_name, 'local', n_rows, lthash, set_hash);
+    VALUES (v_run_id, v_schema_name, v_rel_name, 'local', n_rows, lthash, set_hash)
+    ON CONFLICT (run_id, schema_name, table_name, node) DO UPDATE
+    SET n_rows = EXCLUDED.n_rows,
+        lthash = EXCLUDED.lthash,
+        set_hash = EXCLUDED.set_hash;
 
     FOR peer_rec IN
         SELECT p.name, p.dsn, p.backend,
@@ -2173,7 +2255,11 @@ BEGIN
         VALUES (
             v_run_id, v_schema_name, v_rel_name, peer_rec.name,
             remote_rec.n_rows, remote_rec.lthash, remote_rec.set_hash
-        );
+        )
+        ON CONFLICT (run_id, schema_name, table_name, node) DO UPDATE
+        SET n_rows = EXCLUDED.n_rows,
+            lthash = EXCLUDED.lthash,
+            set_hash = EXCLUDED.set_hash;
 
         IF remote_rec.n_rows IS DISTINCT FROM n_rows
            OR remote_rec.lthash IS DISTINCT FROM lthash
@@ -2251,6 +2337,13 @@ BEGIN
             set_hash bytea
         ) ON COMMIT DROP;
 
+        SELECT COALESCE(max(cr.chunk_id), 1)
+        INTO next_chunk_id
+        FROM pgl_validate.chunk_result cr
+        WHERE cr.run_id = v_run_id
+          AND cr.schema_name = v_schema_name
+          AND cr.table_name = v_rel_name;
+
         FOR range_rec IN
             SELECT *
             FROM pgl_validate.plan_key_ranges(
@@ -2263,6 +2356,20 @@ BEGIN
             )
             ORDER BY chunk_id
         LOOP
+            IF EXISTS (
+                SELECT 1
+                FROM pgl_validate.chunk_result cr
+                WHERE cr.run_id = v_run_id
+                  AND cr.schema_name = v_schema_name
+                  AND cr.table_name = v_rel_name
+                  AND cr.state = 'clean'
+                  AND cr.lo IS NOT DISTINCT FROM range_rec.lo
+                  AND cr.hi IS NOT DISTINCT FROM range_rec.hi
+            ) THEN
+                planned_chunk_count := planned_chunk_count + 1;
+                CONTINUE;
+            END IF;
+
             next_chunk_id := next_chunk_id + 1;
             INSERT INTO pg_temp.pgl_validate_chunk_queue(
                 chunk_id, parent_id, lo, hi, target_rows, attempt
@@ -2293,6 +2400,20 @@ BEGIN
             chunk_differ_count := 0;
             split_count := 0;
             chunk_started_at := clock_timestamp();
+
+            IF EXISTS (
+                SELECT 1
+                FROM pgl_validate.chunk_result cr
+                WHERE cr.run_id = v_run_id
+                  AND cr.schema_name = v_schema_name
+                  AND cr.table_name = v_rel_name
+                  AND cr.state = 'clean'
+                  AND cr.lo IS NOT DISTINCT FROM range_rec.lo
+                  AND cr.hi IS NOT DISTINCT FROM range_rec.hi
+            ) THEN
+                planned_chunk_count := planned_chunk_count + 1;
+                CONTINUE;
+            END IF;
 
             IF COALESCE(cardinality(current_edge_ids), 0) > 0
                AND clock_timestamp() - last_re_fence_at >= max_snapshot_age THEN
@@ -2473,6 +2594,19 @@ BEGIN
                         FROM pg_temp.pgl_validate_chunk_split s
                         ORDER BY s.planned_chunk_id
                     LOOP
+                        IF EXISTS (
+                            SELECT 1
+                            FROM pgl_validate.chunk_result cr
+                            WHERE cr.run_id = v_run_id
+                              AND cr.schema_name = v_schema_name
+                              AND cr.table_name = v_rel_name
+                              AND cr.state = 'clean'
+                              AND cr.lo IS NOT DISTINCT FROM split_rec.lo
+                              AND cr.hi IS NOT DISTINCT FROM split_rec.hi
+                        ) THEN
+                            CONTINUE;
+                        END IF;
+
                         next_chunk_id := next_chunk_id + 1;
                         INSERT INTO pg_temp.pgl_validate_chunk_queue(
                             chunk_id, parent_id, lo, hi, target_rows, attempt

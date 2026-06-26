@@ -1312,6 +1312,228 @@ mod tests {
     }
 
     #[pg_test]
+    fn compare_parent_resume_skips_completed_tables_and_retries_failed_tables() {
+        let backend_pid = Spi::get_one::<i32>("SELECT pg_backend_pid()")
+            .unwrap()
+            .unwrap();
+        let completed_table = identifier(&format!("pgl_validate_resume_done_{backend_pid}"));
+        let retry_table = identifier(&format!("pgl_validate_resume_retry_{backend_pid}"));
+
+        Spi::run(&format!(
+            "
+            CREATE TABLE public.{completed_table}(id int PRIMARY KEY, value text);
+            CREATE TABLE public.{retry_table}(id int PRIMARY KEY, value text);
+            INSERT INTO public.{completed_table} VALUES (1, 'same');
+            INSERT INTO public.{retry_table} VALUES (1, 'same');
+            "
+        ))
+        .unwrap();
+
+        let run_id = Spi::get_one::<i64>(
+            "
+            INSERT INTO pgl_validate.run(status, options, tables_total)
+            VALUES ('paused', '{}', 2)
+            RETURNING run_id
+            ",
+        )
+        .unwrap()
+        .unwrap();
+
+        Spi::run(&format!(
+            "
+            INSERT INTO pgl_validate.table_plan(
+                run_id, schema_name, table_name, key_cols, att_list, validated_property
+            )
+            VALUES
+                (
+                    {run_id}, 'public', {completed_table},
+                    ARRAY['id'], ARRAY['id','value'], 'full'
+                ),
+                (
+                    {run_id}, 'public', {retry_table},
+                    ARRAY['id'], ARRAY['id','value'], 'skipped'
+                );
+
+            INSERT INTO pgl_validate.table_result(
+                run_id, schema_name, table_name, verdict, reason, finished_at
+            )
+            VALUES
+                ({run_id}, 'public', {completed_table}, 'match', 'already complete', now()),
+                ({run_id}, 'public', {retry_table}, 'error', 'stale failure', now());
+
+            INSERT INTO pgl_validate.schema_issue(
+                run_id, node, schema_name, table_name, issue_code, detail
+            )
+            VALUES (
+                {run_id}, 'local', 'public', {retry_table},
+                'TABLE_COMPARE_FAILED', 'stale failure'
+            );
+            ",
+            completed_table = sql_literal(&completed_table),
+            retry_table = sql_literal(&retry_table)
+        ))
+        .unwrap();
+
+        let resumed_id = Spi::get_one::<i64>(&format!(
+            "
+            SELECT pgl_validate.compare(
+                ARRAY[
+                    'public.{completed_table}'::regclass,
+                    'public.{retry_table}'::regclass
+                ],
+                NULL,
+                ARRAY[]::text[],
+                NULL::text,
+                jsonb_build_object('_pgl_validate_parent_run_id', {run_id})
+            )
+            "
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(resumed_id, run_id);
+
+        let verdicts = Spi::get_one::<String>(&format!(
+            "
+            SELECT string_agg(table_name || ':' || verdict, ',' ORDER BY table_name)
+            FROM pgl_validate.table_result
+            WHERE run_id = {run_id}
+            "
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            verdicts,
+            format!("{completed_table}:match,{retry_table}:match")
+        );
+
+        let resume_shape = Spi::get_one::<String>(&format!(
+            "
+            SELECT
+                r.status || ';' ||
+                r.tables_total::text || ';' ||
+                r.tables_matched::text || ';' ||
+                r.tables_differ::text || ';' ||
+                COALESCE(done.reason, '<null>') || ';' ||
+                (SELECT count(*)::text
+                 FROM pgl_validate.schema_issue si
+                 WHERE si.run_id = r.run_id
+                   AND si.table_name = {retry_table}
+                   AND si.issue_code = 'TABLE_COMPARE_FAILED')
+            FROM pgl_validate.run r
+            JOIN pgl_validate.table_result done
+              ON done.run_id = r.run_id
+             AND done.schema_name = 'public'
+             AND done.table_name = {completed_table}
+            WHERE r.run_id = {run_id}
+            ",
+            completed_table = sql_literal(&completed_table),
+            retry_table = sql_literal(&retry_table)
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(resume_shape, "completed;2;2;0;already complete;0");
+    }
+
+    #[pg_test]
+    fn compare_table_parent_resume_reuses_clean_chunk_ranges() {
+        Spi::run(
+            r#"
+            DELETE FROM pgl_validate.peer;
+            CREATE TEMP TABLE range_resume_target(
+                id int PRIMARY KEY,
+                value text
+            );
+            INSERT INTO range_resume_target
+            SELECT g, 'value-' || g::text
+            FROM generate_series(1, 5) AS g;
+            "#,
+        )
+        .unwrap();
+
+        let run_id = Spi::get_one::<i64>(
+            r#"
+            SELECT (pgl_validate.compare_table(
+                'range_resume_target'::regclass,
+                ARRAY[]::text[],
+                '{"chunk_target_rows":2}'::jsonb
+            )).run_id
+            "#,
+        )
+        .unwrap()
+        .unwrap();
+
+        Spi::run(&format!(
+            "
+            DELETE FROM pgl_validate.table_result
+            WHERE run_id = {run_id}
+              AND table_name = 'range_resume_target';
+
+            UPDATE pgl_validate.run
+            SET status = 'paused',
+                finished_at = NULL,
+                tables_matched = NULL,
+                tables_differ = NULL
+            WHERE run_id = {run_id};
+            "
+        ))
+        .unwrap();
+
+        let resumed_id = Spi::get_one::<i64>(&format!(
+            r#"
+            SELECT (pgl_validate.compare_table(
+                'range_resume_target'::regclass,
+                ARRAY[]::text[],
+                jsonb_build_object(
+                    '_pgl_validate_parent_run_id', {run_id},
+                    'chunk_target_rows', 2
+                )
+            )).run_id
+            "#
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(resumed_id, run_id);
+
+        let chunk_shape = Spi::get_one::<String>(&format!(
+            "
+            SELECT count(*)::text || ';' ||
+                   max(chunk_id)::text || ';' ||
+                   count(*) FILTER (WHERE state = 'clean')::text || ';' ||
+                   (
+                       SELECT count(*)::text
+                       FROM (
+                           SELECT lo, hi, count(*)
+                           FROM pgl_validate.chunk_result cr
+                           WHERE cr.run_id = {run_id}
+                             AND cr.table_name = 'range_resume_target'
+                             AND cr.state = 'clean'
+                           GROUP BY lo, hi
+                           HAVING count(*) > 1
+                       ) dup
+                   )
+            FROM pgl_validate.chunk_result
+            WHERE run_id = {run_id}
+              AND table_name = 'range_resume_target'
+            "
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(chunk_shape, "4;4;3;0");
+
+        let verdict = Spi::get_one::<String>(&format!(
+            "
+            SELECT verdict
+            FROM pgl_validate.table_result
+            WHERE run_id = {run_id}
+              AND table_name = 'range_resume_target'
+            "
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(verdict, "match");
+    }
+
+    #[pg_test]
     fn compare_skips_schema_drift_table_and_continues_parent_run() {
         let backend_pid = Spi::get_one::<i32>("SELECT pg_backend_pid()")
             .unwrap()
