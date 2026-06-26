@@ -3315,18 +3315,76 @@ mod tests {
         assert!(repair_batch.contains("/* target: 'remote_diff' */ INSERT"));
         assert!(repair_batch.contains("/* target: 'remote_diff' */ DELETE"));
 
+        let repair_count_before_replicate_ack =
+            Spi::get_one::<i64>("SELECT count(*) FROM pgl_validate.repair_run")
+                .unwrap()
+                .unwrap();
+        Spi::run(&format!(
+            "
+            DO $$
+            BEGIN
+                PERFORM pgl_validate.apply_repair(
+                    {run_id},
+                    'local',
+                    'remote_diff',
+                    'remote_diff',
+                    'replicate',
+                    false
+                );
+                RAISE EXCEPTION 'expected unacknowledged replicate repair to fail';
+            EXCEPTION WHEN invalid_parameter_value THEN
+                IF SQLERRM <> 'replicate repair requires acknowledge_conflict_policy = true' THEN
+                    RAISE;
+                END IF;
+            END
+            $$
+            "
+        ))
+        .unwrap();
+        let repair_count_after_replicate_ack =
+            Spi::get_one::<i64>("SELECT count(*) FROM pgl_validate.repair_run")
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            repair_count_before_replicate_ack,
+            repair_count_after_replicate_ack
+        );
+
         let repair_status = Spi::get_one::<String>(&format!(
             "
-            SELECT repair_id::text || ';' || status
-            FROM pgl_validate.apply_repair({run_id}, 'local', 'remote_diff', 'remote_diff')
+            SELECT repair_id::text || ';' || status || ';' || propagation || ';' || (origin_name IS NULL)::text
+            FROM pgl_validate.apply_repair(
+                {run_id},
+                'local',
+                'remote_diff',
+                'remote_diff',
+                'replicate',
+                true
+            )
             "
         ))
         .unwrap()
         .unwrap();
-        let (repair_id, repair_status) = repair_status
-            .split_once(';')
+        let mut repair_status_parts = repair_status.split(';');
+        let repair_id = repair_status_parts
+            .next()
             .expect("repair status should include id");
+        let repair_status = repair_status_parts
+            .next()
+            .expect("repair status should include status");
+        let propagation = repair_status_parts
+            .next()
+            .expect("repair status should include propagation");
+        let origin_is_null = repair_status_parts
+            .next()
+            .expect("repair status should include origin null flag");
         assert_eq!(repair_status, "revalidated");
+        assert_eq!(propagation, "replicate");
+        assert_eq!(origin_is_null, "true");
+        assert!(
+            repair_status_parts.next().is_none(),
+            "repair status should not include extra fields"
+        );
 
         let repair_actions = Spi::get_one::<String>(&format!(
             "
