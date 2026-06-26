@@ -216,6 +216,14 @@ function Invoke-Logged {
         [string[]] $Arguments
     )
 
+    if ($env:PGL_VALIDATE_RUST_TOOLCHAIN) {
+        $commandName = [IO.Path]::GetFileNameWithoutExtension($FilePath)
+        if (($commandName -eq 'cargo' -or $commandName -eq 'rustc') -and
+            ($Arguments.Count -eq 0 -or -not $Arguments[0].StartsWith('+', [StringComparison]::Ordinal))) {
+            $Arguments = @("+$env:PGL_VALIDATE_RUST_TOOLCHAIN") + $Arguments
+        }
+    }
+
     Write-Host "+ $FilePath $($Arguments -join ' ')"
     & $FilePath @Arguments
     if ($LASTEXITCODE -ne 0) {

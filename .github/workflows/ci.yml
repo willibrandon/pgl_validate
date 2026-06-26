@@ -54,6 +54,7 @@ jobs:
       - name: Install Rust toolchain
         run: |
           $toolchain = '${{ matrix.target.rust_toolchain }}'
+          $explicitToolchain = -not [string]::IsNullOrWhiteSpace($toolchain)
           if ([string]::IsNullOrWhiteSpace($toolchain)) {
             $toolchain = 'stable'
           }
@@ -63,12 +64,19 @@ jobs:
           }
           rustup @installArgs
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          $env:RUSTUP_TOOLCHAIN = $toolchain
-          if ($env:GITHUB_ENV) {
-            "RUSTUP_TOOLCHAIN=$toolchain" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          if ($explicitToolchain -and $env:GITHUB_ENV) {
+            "PGL_VALIDATE_RUST_TOOLCHAIN=$toolchain" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           }
-          rustc --version
-          cargo --version
+          if ($explicitToolchain) {
+            & rustc "+$toolchain" --version
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            & cargo "+$toolchain" --version
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+          else {
+            rustc --version
+            cargo --version
+          }
 
       - name: Cache cargo artifacts
         uses: actions/cache@v5
@@ -139,6 +147,7 @@ jobs:
       - name: Install Rust toolchain
         run: |
           $toolchain = '${{ matrix.target.rust_toolchain }}'
+          $explicitToolchain = -not [string]::IsNullOrWhiteSpace($toolchain)
           if ([string]::IsNullOrWhiteSpace($toolchain)) {
             $toolchain = 'stable'
           }
@@ -148,12 +157,19 @@ jobs:
           }
           rustup @installArgs
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          $env:RUSTUP_TOOLCHAIN = $toolchain
-          if ($env:GITHUB_ENV) {
-            "RUSTUP_TOOLCHAIN=$toolchain" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          if ($explicitToolchain -and $env:GITHUB_ENV) {
+            "PGL_VALIDATE_RUST_TOOLCHAIN=$toolchain" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           }
-          rustc --version
-          cargo --version
+          if ($explicitToolchain) {
+            & rustc "+$toolchain" --version
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            & cargo "+$toolchain" --version
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+          else {
+            rustc --version
+            cargo --version
+          }
 
       - name: Cache cargo artifacts
         uses: actions/cache@v5
@@ -220,6 +236,7 @@ jobs:
       - name: Install Rust toolchain
         run: |
           $toolchain = '${{ matrix.target.rust_toolchain }}'
+          $explicitToolchain = -not [string]::IsNullOrWhiteSpace($toolchain)
           if ([string]::IsNullOrWhiteSpace($toolchain)) {
             $toolchain = 'stable'
           }
@@ -229,12 +246,19 @@ jobs:
           }
           rustup @installArgs
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          $env:RUSTUP_TOOLCHAIN = $toolchain
-          if ($env:GITHUB_ENV) {
-            "RUSTUP_TOOLCHAIN=$toolchain" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          if ($explicitToolchain -and $env:GITHUB_ENV) {
+            "PGL_VALIDATE_RUST_TOOLCHAIN=$toolchain" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           }
-          rustc --version
-          cargo --version
+          if ($explicitToolchain) {
+            & rustc "+$toolchain" --version
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            & cargo "+$toolchain" --version
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+          else {
+            rustc --version
+            cargo --version
+          }
 
       - name: Cache cargo artifacts
         uses: actions/cache@v5

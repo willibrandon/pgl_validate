@@ -8,12 +8,41 @@ $ErrorActionPreference = 'Stop'
 $common = Join-Path $PSScriptRoot 'pgrx-common.ps1'
 . $common
 
+<#
+.SYNOPSIS
+Adds an explicit rustup toolchain argument to Rust proxy commands when CI requests one.
+#>
+function Resolve-RustupInvocation {
+    param([string[]] $Command)
+
+    if (-not $env:PGL_VALIDATE_RUST_TOOLCHAIN -or $Command.Length -eq 0) {
+        return $Command
+    }
+
+    $commandName = [IO.Path]::GetFileNameWithoutExtension($Command[0])
+    if ($commandName -ne 'cargo' -and $commandName -ne 'rustc') {
+        return $Command
+    }
+
+    if ($Command.Length -gt 1 -and $Command[1].StartsWith('+', [StringComparison]::Ordinal)) {
+        return $Command
+    }
+
+    if ($Command.Length -eq 1) {
+        return @($Command[0], "+$env:PGL_VALIDATE_RUST_TOOLCHAIN")
+    }
+
+    return @($Command[0], "+$env:PGL_VALIDATE_RUST_TOOLCHAIN") + $Command[1..($Command.Length - 1)]
+}
+
+$effectiveInvocation = Resolve-RustupInvocation -Command $Invocation
+
 if (-not (Test-PglWindows)) {
-    if ($Invocation.Length -gt 1) {
-        & $Invocation[0] $Invocation[1..($Invocation.Length - 1)]
+    if ($effectiveInvocation.Length -gt 1) {
+        & $effectiveInvocation[0] $effectiveInvocation[1..($effectiveInvocation.Length - 1)]
     }
     else {
-        & $Invocation[0]
+        & $effectiveInvocation[0]
     }
     exit $LASTEXITCODE
 }
@@ -65,6 +94,6 @@ if (-not (Test-Path $vcvars)) {
     throw "$vcvarsName was not found at $vcvars"
 }
 
-$argLine = ($Invocation | ForEach-Object { '"' + ($_ -replace '"', '\"') + '"' }) -join ' '
+$argLine = ($effectiveInvocation | ForEach-Object { '"' + ($_ -replace '"', '\"') + '"' }) -join ' '
 & cmd.exe /d /s /c "call `"$vcvars`" >nul && $argLine"
 exit $LASTEXITCODE

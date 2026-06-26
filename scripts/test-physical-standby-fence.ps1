@@ -107,6 +107,39 @@ function ConvertTo-EncodedCommand {
     return [Convert]::ToBase64String($bytes)
 }
 
+<#
+.SYNOPSIS
+Waits until a file can be opened for read/write access without sharing.
+#>
+function Wait-FileReadWriteReady {
+    param(
+        [string] $Path,
+        [int] $TimeoutSeconds = 60
+    )
+
+    $deadline = [DateTimeOffset]::Now.AddSeconds($TimeoutSeconds)
+    $lastError = ''
+
+    while ([DateTimeOffset]::Now -lt $deadline) {
+        try {
+            $stream = [System.IO.File]::Open(
+                $Path,
+                [System.IO.FileMode]::Open,
+                [System.IO.FileAccess]::ReadWrite,
+                [System.IO.FileShare]::None
+            )
+            $stream.Dispose()
+            return
+        }
+        catch {
+            $lastError = $_.Exception.Message
+            Start-Sleep -Milliseconds 250
+        }
+    }
+
+    throw "timed out waiting for $Path to be read/write accessible; last error: $lastError"
+}
+
 function Get-PgrxPgConfig {
     param([int] $PgMajor)
 
@@ -348,6 +381,10 @@ SELECT pg_create_physical_replication_slot('pgl_validate_standby_slot');
             '-S', 'pgl_validate_standby_slot'
         ) `
         -TimeoutSeconds 180 | Out-Null
+
+    Write-Step 'Waiting for standby control file readiness'
+    $standbyPgControl = Join-Path (Join-Path $standbyData 'global') 'pg_control'
+    Wait-FileReadWriteReady -Path $standbyPgControl -TimeoutSeconds 60
 
     Write-Step "Starting physical standby on port $script:StandbyPort"
     $standbyOptions = (@(
