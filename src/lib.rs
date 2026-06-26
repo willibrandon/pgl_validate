@@ -101,6 +101,8 @@ static FENCE_POLL_INTERVAL_MS: GucSetting<i32> = GucSetting::<i32>::new(100);
 static SEQUENCE_BUFFER_MULTIPLIER: GucSetting<i32> = GucSetting::<i32>::new(2);
 static CORRELATE_CONFLICT_HISTORY: GucSetting<bool> = GucSetting::<bool>::new(true);
 static CONFLICT_HISTORY_MAX_ROWS: GucSetting<i32> = GucSetting::<i32>::new(1000);
+static SCHEDULER_DATABASE: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(None);
+static SCHEDULER_INTERVAL_MS: GucSetting<i32> = GucSetting::<i32>::new(60000);
 
 /// Return the active row/set digest algorithm.
 pub(crate) fn current_hash_algorithm() -> digest::algorithm::HashAlgorithm {
@@ -122,6 +124,22 @@ pub(crate) fn float_signed_zero_distinct() -> bool {
 /// Return whether row digests should preserve distinct NaN bit patterns.
 pub(crate) fn float_nan_distinct() -> bool {
     FLOAT_NAN_DISTINCT.get()
+}
+
+/// Return the scheduler worker polling interval in milliseconds.
+pub(crate) fn scheduler_interval_ms() -> i32 {
+    SCHEDULER_INTERVAL_MS.get()
+}
+
+fn scheduler_database_name() -> Option<String> {
+    let database = SCHEDULER_DATABASE.get()?;
+    let name = database
+        .to_str()
+        .unwrap_or_else(|_| pgrx::error!("pgl_validate.scheduler_database must be valid UTF-8"))
+        .trim()
+        .to_owned();
+
+    if name.is_empty() { None } else { Some(name) }
 }
 
 /// Register `pgl_validate.*` settings with PostgreSQL.
@@ -345,6 +363,29 @@ pub extern "C-unwind" fn _PG_init() {
         GucContext::Userset,
         flags,
     );
+    GucRegistry::define_string_guc(
+        c"pgl_validate.scheduler_database",
+        c"Configured database for the optional pgl_validate scheduler worker.",
+        c"Set in server configuration and preload pgl_validate to register the scheduler worker for this database.",
+        &SCHEDULER_DATABASE,
+        GucContext::Sighup,
+        flags,
+    );
+    GucRegistry::define_int_guc(
+        c"pgl_validate.scheduler_interval_ms",
+        c"Scheduler worker polling interval in milliseconds.",
+        c"How often the static scheduler worker checks pgl_validate.schedule for due rows.",
+        &SCHEDULER_INTERVAL_MS,
+        1000,
+        i32::MAX,
+        GucContext::Sighup,
+        flags,
+    );
+
+    if unsafe { pg_sys::process_shared_preload_libraries_in_progress } {
+        let scheduler_database = scheduler_database_name();
+        worker::register_scheduler_worker(scheduler_database.as_deref());
+    }
 }
 
 #[cfg(any(test, feature = "pg_test"))]

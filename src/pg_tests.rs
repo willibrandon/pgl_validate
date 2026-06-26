@@ -4316,6 +4316,101 @@ mod tests {
     }
 
     #[pg_test]
+    fn schedule_cron_matching_supports_ranges_steps_and_sunday_7() {
+        Spi::run("SET LOCAL TimeZone = 'UTC'").unwrap();
+
+        let matches = Spi::get_one::<String>(
+            "
+            SELECT pgl_validate._cron_matches('*/15 1-3 * 1 1', '2026-01-05 02:30:00+00'::timestamptz)::text || ';' ||
+                   pgl_validate._cron_matches('*/15 1-3 * 1 1', '2026-01-05 02:31:00+00'::timestamptz)::text || ';' ||
+                   pgl_validate._cron_matches('0 0 15 * 1', '2026-01-05 00:00:00+00'::timestamptz)::text || ';' ||
+                   pgl_validate._cron_matches('0 0 * * 7', '2026-01-04 00:00:00+00'::timestamptz)::text
+            ",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(matches, "true;false;true;true");
+
+        Spi::run(
+            "
+            DO $$
+            BEGIN
+                PERFORM pgl_validate.put_schedule('bad_cron', '* * *', NULL, NULL, NULL, '{}'::jsonb, true);
+                RAISE EXCEPTION 'expected invalid cron to fail';
+            EXCEPTION WHEN invalid_parameter_value THEN
+                -- expected
+            END
+            $$
+            ",
+        )
+        .unwrap();
+        let rejected = Spi::get_one::<bool>(
+            "SELECT NOT EXISTS (SELECT 1 FROM pgl_validate.schedule WHERE name = 'bad_cron')",
+        )
+        .unwrap()
+        .unwrap();
+        assert!(rejected);
+    }
+
+    #[pg_test]
+    fn dispatch_due_schedules_skips_disabled_and_duplicate_minutes() {
+        let backend_pid = Spi::get_one::<i32>("SELECT pg_backend_pid()")
+            .unwrap()
+            .unwrap();
+        let schedule_name = format!("dispatch_guard_{backend_pid}");
+        let table_name = identifier(&format!("pgl_validate_dispatch_target_{backend_pid}"));
+
+        Spi::run(&format!(
+            "
+            CREATE TABLE public.{table_name}(id int PRIMARY KEY, value text);
+            INSERT INTO public.{table_name} VALUES (1, 'same');
+            SELECT pgl_validate.put_schedule(
+                {schedule_name},
+                '* * * * *',
+                ARRAY['public.{table_name}'],
+                NULL,
+                ARRAY['local'],
+                '{{\"chunk_target_rows\":5}}'::jsonb,
+                false
+            );
+            ",
+            schedule_name = sql_literal(&schedule_name)
+        ))
+        .unwrap();
+
+        let disabled_count = Spi::get_one::<i32>(
+            "SELECT pgl_validate.dispatch_due_schedules('2026-01-05 02:30:00+00'::timestamptz)",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(disabled_count, 0);
+
+        Spi::run(&format!(
+            "
+            WITH inserted_run AS (
+                INSERT INTO pgl_validate.run(status, started_at, options)
+                VALUES ('completed', '2026-01-05 02:30:10+00'::timestamptz, '{{}}'::jsonb)
+                RETURNING run_id
+            )
+            UPDATE pgl_validate.schedule
+            SET enabled = true,
+                last_run_id = inserted_run.run_id
+            FROM inserted_run
+            WHERE name = {schedule_name}
+            ",
+            schedule_name = sql_literal(&schedule_name)
+        ))
+        .unwrap();
+
+        let duplicate_minute_count = Spi::get_one::<i32>(
+            "SELECT pgl_validate.dispatch_due_schedules('2026-01-05 02:30:59+00'::timestamptz)",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(duplicate_minute_count, 0);
+    }
+
+    #[pg_test]
     fn worker_task_claim_and_run_executes_parent_compare() {
         let backend_pid = Spi::get_one::<i32>("SELECT pg_backend_pid()")
             .unwrap()

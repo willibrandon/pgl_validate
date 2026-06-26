@@ -134,6 +134,11 @@ SET pgl_validate.conflict_history_max_rows = 1000;
 For bidirectional pglogical validation, set `pgl_validate.peer.reverse_subscription_name`
 to the local subscription that replicates from that peer back to the coordinator.
 
+Durable schedules can be dispatched manually with `pgl_validate.run_schedule`.
+To dispatch due schedules automatically, preload `pgl_validate` and set
+`pgl_validate.scheduler_database` to the database that owns the schedule rows.
+`pgl_validate.scheduler_interval_ms` controls the polling interval.
+
 ## Security
 
 The extension installs four NOLOGIN tier roles: `pgl_validate_validate`,
@@ -154,6 +159,7 @@ whole-relation validation, multi-table and replication-set compare
 orchestration, structured JSON reports, reviewable repair generation, audited
 repair application, conflict-history evidence correlation, run-control and
 retention APIs, durable schedule definitions with explicit async dispatch,
-dynamic-worker async run orchestration with durable paused-task resume, and
+optional automatic schedule dispatch, dynamic-worker async run orchestration
+with durable paused-task resume, and
 fenced paths exercised against real pglogical, native logical, and physical
 standby replication.

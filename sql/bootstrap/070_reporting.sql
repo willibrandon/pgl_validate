@@ -132,6 +132,141 @@ BEGIN
 END
 $$;
 
+CREATE FUNCTION pgl_validate._cron_field_matches(
+    field text,
+    value integer,
+    min_value integer,
+    max_value integer,
+    allow_sunday_7 boolean DEFAULT false
+)
+RETURNS boolean
+LANGUAGE plpgsql
+STABLE
+AS $$
+DECLARE
+    token text;
+    range_part text;
+    step_part integer;
+    start_value integer;
+    end_value integer;
+    pieces text[];
+    candidate integer;
+    candidates integer[] := ARRAY[value];
+BEGIN
+    IF field IS NULL OR btrim(field) = '' THEN
+        RAISE EXCEPTION 'cron field is empty'
+            USING ERRCODE = '22023';
+    END IF;
+
+    IF allow_sunday_7 AND value = 0 THEN
+        candidates := ARRAY[0, 7];
+    END IF;
+
+    FOREACH token IN ARRAY string_to_array(field, ',')
+    LOOP
+        token := btrim(token);
+        IF token = '' THEN
+            RAISE EXCEPTION 'cron field % contains an empty list item', field
+                USING ERRCODE = '22023';
+        END IF;
+
+        pieces := regexp_split_to_array(token, '/');
+        IF cardinality(pieces) = 1 THEN
+            range_part := pieces[1];
+            step_part := 1;
+        ELSIF cardinality(pieces) = 2 AND pieces[2] ~ '^[0-9]+$' THEN
+            range_part := pieces[1];
+            step_part := pieces[2]::integer;
+        ELSE
+            RAISE EXCEPTION 'invalid cron field item %', token
+                USING ERRCODE = '22023';
+        END IF;
+
+        IF step_part < 1 THEN
+            RAISE EXCEPTION 'cron step must be greater than zero in %', token
+                USING ERRCODE = '22023';
+        END IF;
+
+        IF range_part = '*' THEN
+            start_value := min_value;
+            end_value := max_value;
+        ELSIF range_part ~ '^[0-9]+$' THEN
+            start_value := range_part::integer;
+            end_value := start_value;
+        ELSIF range_part ~ '^[0-9]+-[0-9]+$' THEN
+            pieces := regexp_split_to_array(range_part, '-');
+            start_value := pieces[1]::integer;
+            end_value := pieces[2]::integer;
+        ELSE
+            RAISE EXCEPTION 'invalid cron field item %', token
+                USING ERRCODE = '22023';
+        END IF;
+
+        IF start_value < min_value OR start_value > max_value
+           OR end_value < min_value OR end_value > max_value
+           OR start_value > end_value THEN
+            RAISE EXCEPTION 'cron field item % is outside %..%', token, min_value, max_value
+                USING ERRCODE = '22023';
+        END IF;
+
+        FOREACH candidate IN ARRAY candidates
+        LOOP
+            IF candidate BETWEEN start_value AND end_value
+               AND mod(candidate - start_value, step_part) = 0 THEN
+                RETURN true;
+            END IF;
+        END LOOP;
+    END LOOP;
+
+    RETURN false;
+END
+$$;
+
+CREATE FUNCTION pgl_validate._cron_matches(cron text, at_time timestamptz DEFAULT clock_timestamp())
+RETURNS boolean
+LANGUAGE plpgsql
+STABLE
+AS $$
+DECLARE
+    parts text[];
+    minute_matches boolean;
+    hour_matches boolean;
+    day_matches boolean;
+    month_matches boolean;
+    dow_matches boolean;
+    day_restricted boolean;
+    dow_restricted boolean;
+BEGIN
+    IF cron IS NULL OR btrim(cron) = '' THEN
+        RAISE EXCEPTION 'cron expression is required'
+            USING ERRCODE = '22023';
+    END IF;
+
+    parts := regexp_split_to_array(btrim(cron), '\s+');
+    IF cardinality(parts) <> 5 THEN
+        RAISE EXCEPTION 'cron expression must have five fields: minute hour day-of-month month day-of-week'
+            USING ERRCODE = '22023';
+    END IF;
+
+    minute_matches := pgl_validate._cron_field_matches(parts[1], extract(minute FROM at_time)::integer, 0, 59);
+    hour_matches := pgl_validate._cron_field_matches(parts[2], extract(hour FROM at_time)::integer, 0, 23);
+    day_matches := pgl_validate._cron_field_matches(parts[3], extract(day FROM at_time)::integer, 1, 31);
+    month_matches := pgl_validate._cron_field_matches(parts[4], extract(month FROM at_time)::integer, 1, 12);
+    dow_matches := pgl_validate._cron_field_matches(parts[5], extract(dow FROM at_time)::integer, 0, 7, true);
+
+    day_restricted := parts[3] <> '*';
+    dow_restricted := parts[5] <> '*';
+
+    RETURN minute_matches
+       AND hour_matches
+       AND month_matches
+       AND CASE
+               WHEN day_restricted AND dow_restricted THEN day_matches OR dow_matches
+               ELSE day_matches AND dow_matches
+           END;
+END
+$$;
+
 CREATE FUNCTION pgl_validate.put_schedule(
     p_name text,
     p_cron text,
@@ -156,6 +291,8 @@ BEGIN
         RAISE EXCEPTION 'schedule cron expression is required'
             USING ERRCODE = '22023';
     END IF;
+    PERFORM pgl_validate._cron_matches(p_cron, clock_timestamp());
+
     IF p_options IS NULL OR jsonb_typeof(p_options) <> 'object' THEN
         RAISE EXCEPTION 'schedule options must be a JSON object'
             USING ERRCODE = '22023';
@@ -274,6 +411,37 @@ BEGIN
     WHERE s.name = schedule_row.name;
 
     RETURN v_run_id;
+END
+$$;
+
+CREATE FUNCTION pgl_validate.dispatch_due_schedules(at_time timestamptz DEFAULT clock_timestamp())
+RETURNS integer
+LANGUAGE plpgsql
+VOLATILE
+AS $$
+DECLARE
+    schedule_row pgl_validate.schedule;
+    dispatched integer := 0;
+BEGIN
+    FOR schedule_row IN
+        SELECT s.*
+        FROM pgl_validate.schedule s
+        LEFT JOIN pgl_validate.run last_run
+          ON last_run.run_id = s.last_run_id
+        WHERE s.enabled
+          AND pgl_validate._cron_matches(s.cron, at_time)
+          AND (
+              last_run.run_id IS NULL
+              OR date_trunc('minute', last_run.started_at) < date_trunc('minute', at_time)
+          )
+        ORDER BY s.name
+        FOR UPDATE OF s SKIP LOCKED
+    LOOP
+        PERFORM pgl_validate.run_schedule(schedule_row.name);
+        dispatched := dispatched + 1;
+    END LOOP;
+
+    RETURN dispatched;
 END
 $$;
 

@@ -8,6 +8,21 @@ fn sql_literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 
+/// Register the optional postmaster-start scheduler worker.
+pub(crate) fn register_scheduler_worker(database_name: Option<&str>) {
+    let Some(database_name) = database_name.filter(|name| !name.trim().is_empty()) else {
+        return;
+    };
+
+    BackgroundWorkerBuilder::new("pgl_validate scheduler")
+        .set_library("pgl_validate")
+        .set_function("pgl_validate_scheduler_main")
+        .set_extra(database_name)
+        .enable_spi_access()
+        .set_restart_time(Some(Duration::from_secs(10)))
+        .load();
+}
+
 /// Launch a dynamic PostgreSQL background worker for one queued task.
 pub(crate) fn launch_worker_task(task_id: i32) -> i32 {
     if task_id <= 0 {
@@ -60,6 +75,50 @@ pub extern "C-unwind" fn pgl_validate_worker_main(arg: pg_sys::Datum) {
     if let Err(err) = result {
         mark_task_failed(task_id, &err);
     }
+}
+
+/// Entry point for the optional static scheduler worker.
+#[pg_guard]
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn pgl_validate_scheduler_main(_arg: pg_sys::Datum) {
+    BackgroundWorker::attach_signal_handlers(SignalWakeFlags::SIGHUP | SignalWakeFlags::SIGTERM);
+    BackgroundWorker::connect_worker_to_spi(Some(BackgroundWorker::get_extra()), None);
+
+    loop {
+        if BackgroundWorker::sighup_received() {
+            unsafe {
+                pg_sys::ProcessConfigFile(pg_sys::GucContext::PGC_SIGHUP);
+            }
+        }
+
+        let interval = Duration::from_millis(crate::scheduler_interval_ms() as u64);
+        if !BackgroundWorker::wait_latch(Some(interval)) {
+            return;
+        }
+
+        if let Err(err) = dispatch_due_schedules() {
+            log!("pgl_validate scheduler dispatch failed: {err}");
+        }
+    }
+}
+
+fn dispatch_due_schedules() -> Result<(), String> {
+    let available = BackgroundWorker::transaction(|| {
+        Spi::get_one::<bool>(
+            "SELECT to_regprocedure('pgl_validate.dispatch_due_schedules(timestamptz)') IS NOT NULL",
+        )
+    })
+    .map_err(|err| format!("could not check pgl_validate scheduler availability: {err}"))?
+    .unwrap_or(false);
+
+    if !available {
+        return Ok(());
+    }
+
+    BackgroundWorker::transaction(|| {
+        Spi::run("SELECT pgl_validate.dispatch_due_schedules(clock_timestamp())")
+    })
+    .map_err(|err| format!("could not dispatch due schedules: {err}"))
 }
 
 fn run_worker_task(task_id: i32) -> Result<(), String> {

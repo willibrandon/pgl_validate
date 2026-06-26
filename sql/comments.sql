@@ -125,6 +125,10 @@ COMMENT ON FUNCTION pgl_validate.pause(bigint) IS
     'Move an active validation run into paused state for later resume.';
 COMMENT ON FUNCTION pgl_validate.resume(bigint) IS
     'Resume a paused run; when a durable async worker task is paused, failed, or stale, requeue it and launch a replacement dynamic worker.';
+COMMENT ON FUNCTION pgl_validate._cron_field_matches(text, integer, integer, integer, boolean) IS
+    'Evaluate one numeric cron field with list, range, and step support.';
+COMMENT ON FUNCTION pgl_validate._cron_matches(text, timestamptz) IS
+    'Return whether a five-field cron expression matches a timestamp in the current session time zone.';
 COMMENT ON FUNCTION pgl_validate.put_schedule(text, text, text[], text, text[], jsonb, boolean) IS
     'Create or replace a durable validation schedule definition without launching it.';
 COMMENT ON FUNCTION pgl_validate.set_schedule_enabled(text, boolean) IS
@@ -133,6 +137,8 @@ COMMENT ON FUNCTION pgl_validate.delete_schedule(text) IS
     'Delete a durable validation schedule definition and leave any historical runs intact.';
 COMMENT ON FUNCTION pgl_validate.run_schedule(text, boolean) IS
     'Dispatch a durable validation schedule through compare_async, record the launched run id, and return it.';
+COMMENT ON FUNCTION pgl_validate.dispatch_due_schedules(timestamptz) IS
+    'Dispatch enabled schedules whose cron expression is due at the given timestamp, at most once per matching minute.';
 COMMENT ON FUNCTION pgl_validate.compare_async(regclass[], text, text[], text, jsonb) IS
     'Create a durable validation run, enqueue a compare task, launch a dynamic background worker, and return the run id immediately.';
 COMMENT ON FUNCTION pgl_validate._claim_worker_task(integer) IS
