@@ -355,7 +355,7 @@ SELECT
     r.run_id,
     r.status,
     count(cr.*) FILTER (WHERE cr.state IN ('clean','divergent')) AS chunks_done,
-    count(cr.*) AS chunks_total,
+    count(cr.*) FILTER (WHERE cr.state <> 'split') AS chunks_total,
     r.started_at,
     r.finished_at
 FROM pgl_validate.run r
@@ -1928,6 +1928,10 @@ DECLARE
     pglogical_peer_count int := 0;
     peer_rec record;
     remote_rec record;
+    range_rec record;
+    child_chunk_id bigint;
+    planned_chunk_count int := 0;
+    chunk_differ_count int := 0;
     checksum_sql text;
     remote_checksum_sql text;
     localize_sql text;
@@ -1935,6 +1939,9 @@ DECLARE
     n_rows bigint;
     lthash bytea;
     set_hash bytea;
+    chunk_n_rows bigint;
+    chunk_lthash bytea;
+    chunk_set_hash bytea;
     differ_count int := 0;
     confirmed_count int := 0;
     advisory_count int := 0;
@@ -1944,6 +1951,7 @@ DECLARE
     result_reason text;
     result_row pgl_validate.table_result;
     paranoid_confirm boolean := COALESCE((options->>'paranoid_confirm')::boolean, false);
+    chunk_target_rows int := COALESCE((NULLIF(options->>'chunk_target_rows', ''))::int, 50000);
     correlate_conflict_history boolean := COALESCE((options->>'correlate_conflict_history')::boolean, true);
     conflict_history_lookback interval := COALESCE((NULLIF(options->>'conflict_history_lookback', ''))::interval, interval '24 hours');
     conflict_history_max_rows int := COALESCE((NULLIF(options->>'conflict_history_max_rows', ''))::int, 1000);
@@ -1985,6 +1993,9 @@ BEGIN
     END IF;
     IF fence_poll_interval_ms <= 0 THEN
         RAISE EXCEPTION 'fence_poll_interval_ms must be greater than zero';
+    END IF;
+    IF chunk_target_rows <= 0 THEN
+        RAISE EXCEPTION 'chunk_target_rows must be greater than zero';
     END IF;
 
     IF peers IS NULL OR cardinality(peers) = 0 THEN
@@ -2483,6 +2494,137 @@ BEGIN
         END IF;
     END LOOP;
 
+    IF key_cols IS NOT NULL
+       AND cardinality(key_cols) > 0
+       AND n_rows > chunk_target_rows THEN
+        FOR range_rec IN
+            SELECT *
+            FROM pgl_validate.plan_key_ranges(
+                p_table_name,
+                key_cols,
+                NULL,
+                NULL,
+                chunk_target_rows,
+                row_filter_sql
+            )
+            ORDER BY chunk_id
+        LOOP
+            planned_chunk_count := planned_chunk_count + 1;
+            child_chunk_id := range_rec.chunk_id + 1;
+            chunk_differ_count := 0;
+
+            INSERT INTO pgl_validate.chunk_result(
+                run_id, schema_name, table_name, chunk_id, parent_id, lo, hi, state, updated_at
+            )
+            VALUES (
+                v_run_id,
+                v_schema_name,
+                v_rel_name,
+                child_chunk_id,
+                1,
+                range_rec.lo,
+                range_rec.hi,
+                'running',
+                now()
+            )
+            ON CONFLICT (run_id, schema_name, table_name, chunk_id) DO UPDATE
+            SET parent_id = EXCLUDED.parent_id,
+                lo = EXCLUDED.lo,
+                hi = EXCLUDED.hi,
+                state = EXCLUDED.state,
+                updated_at = EXCLUDED.updated_at;
+
+            checksum_sql := pgl_validate.plan_chunk_sql(
+                p_table_name,
+                key_cols,
+                range_rec.lo,
+                range_rec.hi,
+                cols,
+                NULL,
+                row_filter_sql,
+                paranoid_confirm
+            );
+            EXECUTE checksum_sql INTO chunk_n_rows, chunk_lthash, chunk_set_hash;
+
+            INSERT INTO pgl_validate.chunk_node_result(
+                run_id, schema_name, table_name, chunk_id, node, n_rows, lthash
+            )
+            VALUES (
+                v_run_id,
+                v_schema_name,
+                v_rel_name,
+                child_chunk_id,
+                'local',
+                chunk_n_rows,
+                chunk_lthash
+            )
+            ON CONFLICT (run_id, schema_name, table_name, chunk_id, node) DO UPDATE
+            SET n_rows = EXCLUDED.n_rows,
+                lthash = EXCLUDED.lthash;
+
+            remote_checksum_sql := pgl_validate.plan_chunk_sql(
+                p_table_name,
+                key_cols,
+                range_rec.lo,
+                range_rec.hi,
+                cols,
+                NULL,
+                NULL,
+                paranoid_confirm
+            );
+
+            FOR peer_rec IN
+                SELECT p.name, p.dsn, p.backend,
+                       p.connect_timeout_seconds,
+                       p.statement_timeout_ms,
+                       p.lock_timeout_ms
+                FROM pgl_validate.peer p
+                WHERE p.name = ANY (peer_names)
+                ORDER BY p.name
+            LOOP
+                SELECT rc.pg_version, rc.n_rows, rc.lthash, rc.set_hash
+                INTO remote_rec
+                FROM pgl_validate.remote_checksum(
+                    peer_rec.dsn,
+                    remote_checksum_sql,
+                    peer_rec.connect_timeout_seconds,
+                    peer_rec.statement_timeout_ms,
+                    peer_rec.lock_timeout_ms
+                ) AS rc;
+
+                INSERT INTO pgl_validate.chunk_node_result(
+                    run_id, schema_name, table_name, chunk_id, node, n_rows, lthash
+                )
+                VALUES (
+                    v_run_id,
+                    v_schema_name,
+                    v_rel_name,
+                    child_chunk_id,
+                    peer_rec.name,
+                    remote_rec.n_rows,
+                    remote_rec.lthash
+                )
+                ON CONFLICT (run_id, schema_name, table_name, chunk_id, node) DO UPDATE
+                SET n_rows = EXCLUDED.n_rows,
+                    lthash = EXCLUDED.lthash;
+
+                IF remote_rec.n_rows IS DISTINCT FROM chunk_n_rows
+                   OR remote_rec.lthash IS DISTINCT FROM chunk_lthash
+                   OR (paranoid_confirm AND remote_rec.set_hash IS DISTINCT FROM chunk_set_hash) THEN
+                    chunk_differ_count := chunk_differ_count + 1;
+                END IF;
+            END LOOP;
+
+            UPDATE pgl_validate.chunk_result cr
+            SET state = CASE WHEN chunk_differ_count = 0 THEN 'clean' ELSE 'divergent' END,
+                updated_at = now()
+            WHERE cr.run_id = v_run_id
+              AND cr.schema_name = v_schema_name
+              AND cr.table_name = v_rel_name
+              AND cr.chunk_id = child_chunk_id;
+        END LOOP;
+    END IF;
+
     IF differ_count > 0
        AND key_cols IS NOT NULL
        AND cardinality(key_cols) > 0 THEN
@@ -2906,6 +3048,7 @@ BEGIN
         NULL,
         NULL,
         CASE
+            WHEN planned_chunk_count > 0 THEN 'split'
             WHEN verdict = 'match' THEN 'clean'
             WHEN verdict = 'differ' THEN 'divergent'
             ELSE 'candidate'

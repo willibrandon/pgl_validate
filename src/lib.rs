@@ -1072,6 +1072,79 @@ mod tests {
     }
 
     #[pg_test]
+    fn compare_table_persists_planned_key_range_chunks() {
+        Spi::run(
+            r#"
+            DELETE FROM pgl_validate.peer;
+            CREATE TEMP TABLE range_compare_target(
+                id int PRIMARY KEY,
+                value text
+            );
+            INSERT INTO range_compare_target
+            SELECT g, 'value-' || g::text
+            FROM generate_series(1, 5) AS g;
+            "#,
+        )
+        .unwrap();
+
+        let run_id = Spi::get_one::<i64>(
+            r#"
+            SELECT (pgl_validate.compare_table(
+                'range_compare_target'::regclass,
+                ARRAY[]::text[],
+                '{"chunk_target_rows":2}'::jsonb
+            )).run_id
+            "#,
+        )
+        .unwrap()
+        .unwrap();
+
+        let chunk_shape = Spi::get_one::<String>(&format!(
+            "
+            SELECT string_agg(
+                       chunk_id::text || ':' || state || ':' ||
+                       COALESCE(convert_from(lo, 'UTF8')::jsonb->>'id', '<null>') || ':' ||
+                       COALESCE(convert_from(hi, 'UTF8')::jsonb->>'id', '<null>'),
+                       ',' ORDER BY chunk_id
+                   )
+            FROM pgl_validate.chunk_result
+            WHERE run_id = {run_id}
+              AND table_name = 'range_compare_target'
+            "
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            chunk_shape,
+            "1:split:<null>:<null>,2:clean:<null>:3,3:clean:3:5,4:clean:5:<null>"
+        );
+
+        let node_rows = Spi::get_one::<String>(&format!(
+            "
+            SELECT string_agg(chunk_id::text || ':' || n_rows::text, ',' ORDER BY chunk_id)
+            FROM pgl_validate.chunk_node_result
+            WHERE run_id = {run_id}
+              AND table_name = 'range_compare_target'
+              AND node = 'local'
+            "
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(node_rows, "1:5,2:2,3:2,4:1");
+
+        let progress = Spi::get_one::<String>(&format!(
+            "
+            SELECT chunks_done::text || '/' || chunks_total::text
+            FROM pgl_validate.run_progress
+            WHERE run_id = {run_id}
+            "
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(progress, "3/3");
+    }
+
+    #[pg_test]
     fn comparison_key_cols_prefers_replica_identity_and_safe_unique_indexes() {
         let backend_pid = Spi::get_one::<i32>("SELECT pg_backend_pid()")
             .unwrap()
