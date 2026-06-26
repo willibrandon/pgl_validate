@@ -836,6 +836,47 @@ mod tests {
     }
 
     #[pg_test]
+    fn comparison_key_cols_prefers_replica_identity_and_safe_unique_indexes() {
+        let backend_pid = Spi::get_one::<i32>("SELECT pg_backend_pid()")
+            .unwrap()
+            .unwrap();
+        let identity_table = identifier(&format!("pgl_validate_identity_key_{backend_pid}"));
+        let identity_index = identifier(&format!("pgl_validate_identity_idx_{backend_pid}"));
+        let unique_table = identifier(&format!("pgl_validate_unique_key_{backend_pid}"));
+        let unique_index = identifier(&format!("pgl_validate_unique_idx_{backend_pid}"));
+
+        Spi::run(&format!(
+            "
+            CREATE TABLE public.{identity_table}(
+                id int PRIMARY KEY,
+                code text NOT NULL,
+                value text
+            );
+            CREATE UNIQUE INDEX {identity_index} ON public.{identity_table}(code);
+            ALTER TABLE public.{identity_table} REPLICA IDENTITY USING INDEX {identity_index};
+
+            CREATE TABLE public.{unique_table}(
+                code text NOT NULL,
+                payload text
+            );
+            CREATE UNIQUE INDEX {unique_index} ON public.{unique_table}(code) INCLUDE (payload);
+            "
+        ))
+        .unwrap();
+
+        let key_summary = Spi::get_one::<String>(&format!(
+            "
+            SELECT array_to_string(pgl_validate.comparison_key_cols('public.{identity_table}'::regclass), ',') ||
+                   ';' ||
+                   array_to_string(pgl_validate.comparison_key_cols('public.{unique_table}'::regclass), ',')
+            "
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(key_summary, "code;code");
+    }
+
+    #[pg_test]
     fn compare_records_multiple_tables_under_one_parent_run() {
         let backend_pid = Spi::get_one::<i32>("SELECT pg_backend_pid()")
             .unwrap()
@@ -1169,6 +1210,94 @@ mod tests {
         .unwrap()
         .unwrap();
         assert!(waiting);
+    }
+
+    #[pg_test]
+    fn native_contract_uses_publication_columns_filters_and_actions() {
+        let backend_pid = Spi::get_one::<i32>("SELECT pg_backend_pid()")
+            .unwrap()
+            .unwrap();
+        let table_name = identifier(&format!("native_contract_target_{backend_pid}"));
+        let publication_name = identifier(&format!("pgl_validate_native_pub_{backend_pid}"));
+
+        Spi::run(&format!(
+            "
+            CREATE TABLE public.{table_name}(
+                id int PRIMARY KEY,
+                kept text,
+                ignored text
+            );
+            CREATE PUBLICATION {publication_name}
+            FOR TABLE public.{table_name} (id, kept)
+            WHERE (id > 0);
+            "
+        ))
+        .unwrap();
+
+        let contract = Spi::get_one::<String>(&format!(
+            "
+            SELECT array_to_string(att_list, ',') || ';' ||
+                   validated_property || ';' ||
+                   exact_comparable::text || ';' ||
+                   has_row_filter::text || ';' ||
+                   repl_insert::text || ';' ||
+                   repl_update::text || ';' ||
+                   repl_delete::text || ';' ||
+                   repl_truncate::text
+            FROM pgl_validate.native_table_contract(
+                'public.{table_name}'::regclass,
+                ARRAY[{publication}]
+            )
+            ",
+            publication = sql_literal(&publication_name)
+        ))
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(contract, "id,kept;full;true;true;true;true;true;true");
+    }
+
+    #[pg_test]
+    fn native_contract_skips_incompatible_column_lists() {
+        let backend_pid = Spi::get_one::<i32>("SELECT pg_backend_pid()")
+            .unwrap()
+            .unwrap();
+        let table_name = identifier(&format!("native_column_conflict_{backend_pid}"));
+        let first_publication = identifier(&format!("pgl_validate_native_cols_a_{backend_pid}"));
+        let second_publication = identifier(&format!("pgl_validate_native_cols_b_{backend_pid}"));
+
+        Spi::run(&format!(
+            "
+            CREATE TABLE public.{table_name}(
+                id int PRIMARY KEY,
+                kept_a text,
+                kept_b text
+            );
+            CREATE PUBLICATION {first_publication}
+            FOR TABLE public.{table_name} (id, kept_a);
+            CREATE PUBLICATION {second_publication}
+            FOR TABLE public.{table_name} (id, kept_b);
+            "
+        ))
+        .unwrap();
+
+        let contract = Spi::get_one::<String>(&format!(
+            "
+            SELECT validated_property || ';' ||
+                   exact_comparable::text || ';' ||
+                   (reason LIKE '%incompatible column lists%')::text
+            FROM pgl_validate.native_table_contract(
+                'public.{table_name}'::regclass,
+                ARRAY[{first_publication},{second_publication}]
+            )
+            ",
+            first_publication = sql_literal(&first_publication),
+            second_publication = sql_literal(&second_publication)
+        ))
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(contract, "skipped;false;true");
     }
 
     #[pg_test]
@@ -1548,6 +1677,173 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(differ_contract, "differ;keyless;true;0;0");
+
+        let _ = crate::transport::libpq::execute_command(
+            &local_dsn,
+            &format!("DROP DATABASE IF EXISTS {peer_db} WITH (FORCE)"),
+        );
+    }
+
+    #[pg_test]
+    fn compare_table_uses_native_publication_column_projection() {
+        let backend_pid = Spi::get_one::<i32>("SELECT pg_backend_pid()")
+            .unwrap()
+            .unwrap();
+        let peer_db = identifier(&format!(
+            "pgl_validate_native_projection_peer_{backend_pid}"
+        ));
+        let table_name = identifier(&format!("native_projection_target_{backend_pid}"));
+        let publication_name = identifier(&format!("pgl_validate_native_projection_{backend_pid}"));
+        let local_dsn = local_dsn();
+        let remote_dsn = peer_dsn(&peer_db);
+        let options_json = format!(
+            "'{{\"backend\":\"native\",\"publications\":[\"{publication_name}\"]}}'::jsonb"
+        );
+
+        let _ = crate::transport::libpq::execute_command(
+            &local_dsn,
+            &format!("DROP DATABASE IF EXISTS {peer_db} WITH (FORCE)"),
+        );
+        crate::transport::libpq::execute_command(&local_dsn, &format!("CREATE DATABASE {peer_db}"))
+            .unwrap();
+        crate::transport::libpq::execute_command(
+            &remote_dsn,
+            &format!(
+                "CREATE EXTENSION pgl_validate;
+                 CREATE TABLE public.{table_name}(
+                     id int PRIMARY KEY,
+                     kept text,
+                     ignored text
+                 );
+                 INSERT INTO public.{table_name}
+                 VALUES (1, 'same', 'remote-only');"
+            ),
+        )
+        .unwrap();
+
+        Spi::run(&format!(
+            "
+            CREATE TABLE public.{table_name}(
+                id int PRIMARY KEY,
+                kept text,
+                ignored text
+            );
+            INSERT INTO public.{table_name}
+            VALUES (1, 'same', 'local-only');
+            CREATE PUBLICATION {publication_name}
+            FOR TABLE public.{table_name} (id, kept);
+            INSERT INTO pgl_validate.peer(name, dsn, backend, replication_sets)
+            VALUES ('remote_native_projection', {remote_dsn}, 'native', ARRAY[{publication}]);
+            ",
+            remote_dsn = sql_literal(&remote_dsn),
+            publication = sql_literal(&publication_name)
+        ))
+        .unwrap();
+
+        let run_id = Spi::get_one::<i64>(&format!(
+            "
+            SELECT (pgl_validate.compare_table(
+                'public.{table_name}'::regclass,
+                ARRAY['remote_native_projection'],
+                {options_json}
+            )).run_id
+            "
+        ))
+        .unwrap()
+        .unwrap();
+
+        let plan = Spi::get_one::<String>(&format!(
+            "
+            SELECT tr.verdict || ';' ||
+                   tp.validated_property || ';' ||
+                   array_to_string(tp.att_list, ',')
+            FROM pgl_validate.table_result tr
+            JOIN pgl_validate.table_plan tp USING (run_id, schema_name, table_name)
+            WHERE tr.run_id = {run_id}
+            "
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(plan, "match;full;id,kept");
+
+        let _ = crate::transport::libpq::execute_command(
+            &local_dsn,
+            &format!("DROP DATABASE IF EXISTS {peer_db} WITH (FORCE)"),
+        );
+    }
+
+    #[pg_test]
+    fn compare_table_confirms_native_filtered_presence_differences() {
+        let backend_pid = Spi::get_one::<i32>("SELECT pg_backend_pid()")
+            .unwrap()
+            .unwrap();
+        let peer_db = identifier(&format!("pgl_validate_native_filter_peer_{backend_pid}"));
+        let table_name = identifier(&format!("native_filtered_target_{backend_pid}"));
+        let publication_name = identifier(&format!("pgl_validate_native_filter_{backend_pid}"));
+        let local_dsn = local_dsn();
+        let remote_dsn = peer_dsn(&peer_db);
+        let options_json = format!(
+            "'{{\"backend\":\"native\",\"publications\":[\"{publication_name}\"]}}'::jsonb"
+        );
+
+        let _ = crate::transport::libpq::execute_command(
+            &local_dsn,
+            &format!("DROP DATABASE IF EXISTS {peer_db} WITH (FORCE)"),
+        );
+        crate::transport::libpq::execute_command(&local_dsn, &format!("CREATE DATABASE {peer_db}"))
+            .unwrap();
+        crate::transport::libpq::execute_command(
+            &remote_dsn,
+            &format!(
+                "CREATE EXTENSION pgl_validate;
+                 CREATE TABLE public.{table_name}(id int PRIMARY KEY, kept text);
+                 INSERT INTO public.{table_name} VALUES
+                     (5, 'remote-extra-outside-filter'),
+                     (11, 'same');"
+            ),
+        )
+        .unwrap();
+
+        Spi::run(&format!(
+            "
+            CREATE TABLE public.{table_name}(id int PRIMARY KEY, kept text);
+            INSERT INTO public.{table_name} VALUES
+                (5, 'local-outside-filter'),
+                (11, 'same'),
+                (12, 'local-filtered-missing');
+            CREATE PUBLICATION {publication_name}
+            FOR TABLE public.{table_name}
+            WHERE (id > 10);
+            INSERT INTO pgl_validate.peer(name, dsn, backend, replication_sets)
+            VALUES ('remote_native_filtered', {remote_dsn}, 'native', ARRAY[{publication}]);
+            ",
+            remote_dsn = sql_literal(&remote_dsn),
+            publication = sql_literal(&publication_name)
+        ))
+        .unwrap();
+
+        let run_id = Spi::get_one::<i64>(&format!(
+            "
+            SELECT (pgl_validate.compare_table(
+                'public.{table_name}'::regclass,
+                ARRAY['remote_native_filtered'],
+                {options_json}
+            )).run_id
+            "
+        ))
+        .unwrap()
+        .unwrap();
+
+        let divergence = Spi::get_one::<String>(&format!(
+            "
+            SELECT string_agg(classification || ':' || status, ',' ORDER BY classification)
+            FROM pgl_validate.divergence
+            WHERE run_id = {run_id}
+            "
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(divergence, "extra_on:confirmed,missing_on:confirmed");
 
         let _ = crate::transport::libpq::execute_command(
             &local_dsn,

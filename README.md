@@ -66,9 +66,10 @@ bindgen error means that environment is missing from the cargo process.
 
 The repository is being built from the design outward. The current slice covers
 catalog DDL, row digest framing, LtHash state, pglogical contract discovery,
-edge-specific barrier fencing, pglogical row-filter intersection semantics,
-sequence-window validation, keyless whole-relation validation, multi-table and
-replication-set compare orchestration, structured JSON reports, reviewable
-repair generation, audited repair application, conflict-history evidence
-correlation, run-control and retention APIs, and fenced paths exercised against
-a real pglogical subscription.
+native publication contract discovery, edge-specific barrier fencing, pglogical
+row-filter intersection semantics, sequence-window validation, keyless
+whole-relation validation, multi-table and replication-set compare
+orchestration, structured JSON reports, reviewable repair generation, audited
+repair application, conflict-history evidence correlation, run-control and
+retention APIs, and fenced paths exercised against a real pglogical
+subscription.

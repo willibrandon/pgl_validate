@@ -380,6 +380,72 @@ AS $$
     WHERE t.oid = type_oid
 $$;
 
+-- Resolve the comparison key used for row-level localization. Prefer the
+-- relation's replica identity index, then its primary key, then a simple
+-- non-partial unique key whose NULL semantics make duplicate keys impossible.
+CREATE FUNCTION pgl_validate.comparison_key_cols(relation regclass)
+RETURNS text[]
+LANGUAGE sql
+STABLE
+AS $$
+    WITH candidates AS (
+        SELECT i.*,
+               CASE
+                   WHEN i.indisreplident THEN 1
+                   WHEN i.indisprimary THEN 2
+                   ELSE 3
+               END AS priority
+        FROM pg_index i
+        WHERE i.indrelid = $1
+          AND i.indisvalid
+          AND i.indisready
+          AND i.indpred IS NULL
+          AND i.indexprs IS NULL
+          AND (
+              i.indisreplident
+              OR i.indisprimary
+              OR (
+                  i.indisunique
+                  AND i.indimmediate
+                  AND (
+                      i.indnullsnotdistinct
+                      OR NOT EXISTS (
+                          SELECT 1
+                          FROM unnest(i.indkey) WITH ORDINALITY AS key(attnum, ordinality)
+                          JOIN pg_attribute a
+                            ON a.attrelid = i.indrelid
+                           AND a.attnum = key.attnum
+                          WHERE key.ordinality <= i.indnkeyatts
+                            AND NOT a.attnotnull
+                      )
+                  )
+              )
+          )
+          AND NOT EXISTS (
+              SELECT 1
+              FROM unnest(i.indkey) WITH ORDINALITY AS key(attnum, ordinality)
+              LEFT JOIN pg_attribute a
+                ON a.attrelid = i.indrelid
+               AND a.attnum = key.attnum
+              WHERE key.ordinality <= i.indnkeyatts
+                AND (key.attnum <= 0 OR a.attnum IS NULL OR a.attisdropped)
+          )
+    ),
+    chosen AS (
+        SELECT *
+        FROM candidates
+        ORDER BY priority, indexrelid
+        LIMIT 1
+    )
+    SELECT array_agg(a.attname ORDER BY key.ordinality)
+    FROM chosen i
+    CROSS JOIN LATERAL unnest(i.indkey) WITH ORDINALITY AS key(attnum, ordinality)
+    JOIN pg_attribute a
+      ON a.attrelid = i.indrelid
+     AND a.attnum = key.attnum
+    WHERE key.ordinality <= i.indnkeyatts
+$$;
+
 -- Resolve the pglogical replication contract for one relation. The effective
 -- column list is taken from pglogical.show_repset_table_info(), because that is
 -- pglogical's own resolved bitmap after combining all covering repsets.
@@ -426,13 +492,7 @@ BEGIN
     JOIN pg_namespace n ON n.oid = c.relnamespace
     WHERE c.oid = relation;
 
-    SELECT array_agg(a.attname ORDER BY ord.ordinality)
-    INTO key_cols
-    FROM pg_index i
-    CROSS JOIN LATERAL unnest(i.indkey) WITH ORDINALITY AS ord(attnum, ordinality)
-    JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ord.attnum
-    WHERE i.indrelid = relation
-      AND i.indisprimary;
+    key_cols := pgl_validate.comparison_key_cols(relation);
 
     IF input_repsets IS NULL OR cardinality(input_repsets) = 0 THEN
         SELECT array_agg(DISTINCT rs.set_name::text ORDER BY rs.set_name::text)
@@ -565,6 +625,203 @@ BEGIN
         validated_property := 'full';
         exact_comparable := true;
         reason := 'full pglogical action mask with no row filter';
+    ELSIF repl_update THEN
+        validated_property := 'superset';
+        exact_comparable := true;
+        reason := 'delete or truncate is not replicated, so subscriber extras are legitimate';
+    ELSE
+        validated_property := 'keys_only';
+        exact_comparable := true;
+        reason := 'updates are not replicated, so content drift is contract-permitted';
+    END IF;
+
+    RETURN NEXT;
+END
+$$;
+
+-- Resolve the native logical replication contract for one relation. The
+-- effective table membership, column list, and row filter come from the core
+-- pg_publication_tables view so FOR ALL TABLES and FOR TABLES IN SCHEMA are
+-- expanded exactly as PostgreSQL does.
+CREATE FUNCTION pgl_validate.native_table_contract(
+    relation regclass,
+    input_publications text[] DEFAULT NULL,
+    subscription_name name DEFAULT NULL
+)
+RETURNS TABLE (
+    schema_name text,
+    table_name text,
+    key_cols text[],
+    att_list text[],
+    repsets text[],
+    repl_insert boolean,
+    repl_update boolean,
+    repl_delete boolean,
+    repl_truncate boolean,
+    has_row_filter boolean,
+    row_filter_sql text,
+    row_filter_exact boolean,
+    sync_status "char",
+    validated_property text,
+    exact_comparable boolean,
+    reason text
+)
+LANGUAGE plpgsql
+STABLE
+AS $$
+DECLARE
+    action_rec record;
+    filter_rec record;
+    distinct_att_lists int;
+BEGIN
+    SELECT n.nspname, c.relname
+    INTO schema_name, table_name
+    FROM pg_class c
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE c.oid = relation;
+
+    key_cols := pgl_validate.comparison_key_cols(relation);
+
+    SELECT array_agg(DISTINCT pt.pubname::text ORDER BY pt.pubname::text),
+           count(DISTINCT pt.attnames::text)
+    INTO repsets, distinct_att_lists
+    FROM pg_publication_tables pt
+    WHERE pt.schemaname = schema_name
+      AND pt.tablename = table_name
+      AND (
+          input_publications IS NULL
+          OR cardinality(input_publications) = 0
+          OR pt.pubname::text = ANY (input_publications)
+      );
+
+    IF repsets IS NULL OR cardinality(repsets) = 0 THEN
+        att_list := NULL;
+        repl_insert := false;
+        repl_update := false;
+        repl_delete := false;
+        repl_truncate := false;
+        has_row_filter := false;
+        row_filter_sql := NULL;
+        row_filter_exact := true;
+        sync_status := NULL;
+        validated_property := 'skipped';
+        exact_comparable := false;
+        reason := 'table is not a member of any selected native publication';
+        RETURN NEXT;
+        RETURN;
+    END IF;
+
+    IF distinct_att_lists > 1 THEN
+        att_list := NULL;
+        repl_insert := false;
+        repl_update := false;
+        repl_delete := false;
+        repl_truncate := false;
+        has_row_filter := false;
+        row_filter_sql := NULL;
+        row_filter_exact := false;
+        sync_status := NULL;
+        validated_property := 'skipped';
+        exact_comparable := false;
+        reason := 'native publications have incompatible column lists for this table';
+        RETURN NEXT;
+        RETURN;
+    END IF;
+
+    SELECT array_agg(DISTINCT att.attname::text ORDER BY att.attname::text)
+    INTO att_list
+    FROM pg_publication_tables pt
+    CROSS JOIN LATERAL unnest(pt.attnames) AS att(attname)
+    WHERE pt.schemaname = schema_name
+      AND pt.tablename = table_name
+      AND pt.pubname::text = ANY (repsets);
+
+    SELECT bool_or(p.pubinsert) AS repl_insert,
+           bool_or(p.pubupdate) AS repl_update,
+           bool_or(p.pubdelete) AS repl_delete,
+           bool_or(p.pubtruncate) AS repl_truncate
+    INTO action_rec
+    FROM pg_publication p
+    WHERE p.pubname::text = ANY (repsets);
+
+    repl_insert := COALESCE(action_rec.repl_insert, false);
+    repl_update := COALESCE(action_rec.repl_update, false);
+    repl_delete := COALESCE(action_rec.repl_delete, false);
+    repl_truncate := COALESCE(action_rec.repl_truncate, false);
+
+    SELECT
+        COALESCE(bool_or(pt.rowfilter IS NULL), false) AS has_unfiltered_membership,
+        count(*) FILTER (WHERE pt.rowfilter IS NOT NULL) AS filtered_memberships,
+        string_agg(
+            format('(%s)', pt.rowfilter),
+            ' OR '
+            ORDER BY pt.pubname::text
+        ) FILTER (WHERE pt.rowfilter IS NOT NULL) AS predicate,
+        bool_and(
+            pt.rowfilter !~*
+                '(^|[^[:alnum:]_])(current_user|session_user|current_role|current_setting|set_config|current_schema|current_schemas)([^[:alnum:]_]|$)'
+        ) FILTER (WHERE pt.rowfilter IS NOT NULL) AS exact
+    INTO filter_rec
+    FROM pg_publication_tables pt
+    WHERE pt.schemaname = schema_name
+      AND pt.tablename = table_name
+      AND pt.pubname::text = ANY (repsets);
+
+    IF COALESCE(filter_rec.has_unfiltered_membership, false)
+       OR COALESCE(filter_rec.filtered_memberships, 0) = 0 THEN
+        has_row_filter := false;
+        row_filter_sql := NULL;
+        row_filter_exact := true;
+    ELSE
+        has_row_filter := true;
+        row_filter_sql := filter_rec.predicate;
+        row_filter_exact := COALESCE(filter_rec.exact, false);
+    END IF;
+
+    sync_status := 'r';
+    IF subscription_name IS NOT NULL THEN
+        SELECT sr.srsubstate
+        INTO sync_status
+        FROM pg_subscription s
+        JOIN pg_subscription_rel sr ON sr.srsubid = s.oid
+        JOIN pg_database d ON d.oid = s.subdbid
+        WHERE s.subname = subscription_name
+          AND d.datname = current_database()
+          AND sr.srrelid = relation;
+    END IF;
+
+    IF sync_status IS NULL THEN
+        validated_property := 'skipped';
+        exact_comparable := false;
+        reason := format('native subscription % has no sync state for this table', subscription_name);
+    ELSIF sync_status <> 'r' THEN
+        validated_property := 'skipped';
+        exact_comparable := false;
+        reason := format('native subscription sync status is %s, not ready', sync_status);
+    ELSIF NOT repl_insert THEN
+        validated_property := 'unsupported_mask';
+        exact_comparable := false;
+        reason := 'publish=insert is disabled, so the provider row set does not bound the subscriber';
+    ELSIF has_row_filter AND NOT row_filter_exact THEN
+        validated_property := 'skipped';
+        exact_comparable := false;
+        reason := 'native row filter is session-sensitive; exact validation would be context-dependent';
+    ELSIF has_row_filter AND repl_update AND repl_delete AND repl_truncate THEN
+        validated_property := 'full';
+        exact_comparable := true;
+        reason := 'native row filter with full action mask maintains S = P_F';
+    ELSIF has_row_filter AND repl_update THEN
+        validated_property := 'superset';
+        exact_comparable := true;
+        reason := 'native row filter is exact, but delete or truncate is not replicated, so subscriber extras are legitimate';
+    ELSIF has_row_filter THEN
+        validated_property := 'filtered_advisory';
+        exact_comparable := false;
+        reason := 'native filtered table without update replication is advisory only';
+    ELSIF repl_update AND repl_delete AND repl_truncate THEN
+        validated_property := 'full';
+        exact_comparable := true;
+        reason := 'full native publication action mask with no row filter';
     ELSIF repl_update THEN
         validated_property := 'superset';
         exact_comparable := true;
@@ -1215,6 +1472,7 @@ DECLARE
     contract_reason text := 'direct full-table comparison';
     pglogical_available boolean;
     table_in_pglogical boolean := false;
+    table_in_native_publication boolean := false;
     requested_backend text;
     provider_dsn text;
     provider_node text;
@@ -1263,15 +1521,20 @@ BEGIN
       AND a.attnum > 0
       AND NOT a.attisdropped;
 
-    SELECT array_agg(a.attname ORDER BY ord.ordinality)
-    INTO key_cols
-    FROM pg_index i
-    CROSS JOIN LATERAL unnest(i.indkey) WITH ORDINALITY AS ord(attnum, ordinality)
-    JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ord.attnum
-    WHERE i.indrelid = p_table_name
-      AND i.indisprimary;
+    key_cols := pgl_validate.comparison_key_cols(p_table_name);
 
-    requested_backend := COALESCE(NULLIF(options->>'backend', ''), 'pglogical');
+    requested_backend := COALESCE(
+        NULLIF(options->>'backend', ''),
+        CASE WHEN options ? 'publications' THEN 'native' ELSE 'pglogical' END
+    );
+    IF requested_backend NOT IN ('pglogical','native','standby') THEN
+        RAISE EXCEPTION 'unsupported backend %', requested_backend
+            USING ERRCODE = '0A000';
+    END IF;
+    IF requested_backend = 'standby' THEN
+        RAISE EXCEPTION 'backend=standby requires the replay-LSN fence path, which is not implemented yet'
+            USING ERRCODE = '0A000';
+    END IF;
     provider_dsn := NULLIF(options->>'provider_dsn', '');
     provider_node := COALESCE(NULLIF(options->>'provider_node', ''), 'local');
     fence_timeout_ms := COALESCE((NULLIF(options->>'fence_timeout_ms', ''))::int, 300000);
@@ -1306,7 +1569,11 @@ BEGIN
         END IF;
     END IF;
 
-    IF options ? 'repsets' THEN
+    IF options ? 'publications' THEN
+        SELECT array_agg(DISTINCT elem.value ORDER BY elem.value)
+        INTO contract_repsets
+        FROM jsonb_array_elements_text(options->'publications') AS elem(value);
+    ELSIF options ? 'repsets' THEN
         SELECT array_agg(DISTINCT elem.value ORDER BY elem.value)
         INTO contract_repsets
         FROM jsonb_array_elements_text(options->'repsets') AS elem(value);
@@ -1332,6 +1599,21 @@ BEGIN
             USING ERRCODE = '0A000';
     END IF;
 
+    IF requested_backend = 'native' THEN
+        SELECT EXISTS (
+            SELECT 1
+            FROM pg_publication_tables pt
+            WHERE pt.schemaname = v_schema_name
+              AND pt.tablename = v_rel_name
+              AND (
+                  contract_repsets IS NULL
+                  OR cardinality(contract_repsets) = 0
+                  OR pt.pubname::text = ANY (contract_repsets)
+              )
+        )
+        INTO table_in_native_publication;
+    END IF;
+
     IF requested_backend = 'pglogical'
        AND pglogical_available
        AND (table_in_pglogical
@@ -1340,6 +1622,33 @@ BEGIN
         SELECT *
         INTO contract_rec
         FROM pgl_validate.pglogical_table_contract(
+            p_table_name,
+            contract_repsets,
+            contract_subscription
+        );
+
+        cols := contract_rec.att_list;
+        key_cols := contract_rec.key_cols;
+        plan_repsets := contract_rec.repsets;
+        repl_insert := contract_rec.repl_insert;
+        repl_update := contract_rec.repl_update;
+        repl_delete := contract_rec.repl_delete;
+        repl_truncate := contract_rec.repl_truncate;
+        has_row_filter := contract_rec.has_row_filter;
+        row_filter_sql := contract_rec.row_filter_sql;
+        row_filter_exact := contract_rec.row_filter_exact;
+        sync_status := contract_rec.sync_status;
+        validated_property := contract_rec.validated_property;
+        exact_comparable := contract_rec.exact_comparable;
+        contract_reason := contract_rec.reason;
+    ELSIF requested_backend = 'native'
+          AND (table_in_native_publication
+               OR contract_repsets IS NOT NULL
+               OR contract_subscription IS NOT NULL
+               OR options ? 'backend') THEN
+        SELECT *
+        INTO contract_rec
+        FROM pgl_validate.native_table_contract(
             p_table_name,
             contract_repsets,
             contract_subscription
@@ -1399,7 +1708,7 @@ BEGIN
     END IF;
 
     INSERT INTO pgl_validate.run_participant(run_id, node, role, backend, pg_version, status)
-    VALUES (v_run_id, 'local', 'coordinator', 'pglogical', current_setting('server_version_num')::int, 'connected')
+    VALUES (v_run_id, 'local', 'coordinator', requested_backend, current_setting('server_version_num')::int, 'connected')
     ON CONFLICT (run_id, node) DO UPDATE
     SET status = 'connected',
         pg_version = EXCLUDED.pg_version;
@@ -1578,7 +1887,7 @@ BEGIN
         NULL,
         cols,
         NULL,
-        CASE WHEN validated_property = 'filtered_intersection' THEN row_filter_sql ELSE NULL END
+        row_filter_sql
     );
     remote_checksum_sql := pgl_validate.plan_chunk_sql(
         p_table_name,
@@ -1655,7 +1964,7 @@ BEGIN
             p_table_name,
             key_cols,
             cols,
-            CASE WHEN validated_property = 'filtered_intersection' THEN row_filter_sql ELSE NULL END
+            row_filter_sql
         );
         remote_localize_sql := pgl_validate.plan_localize_sql(
             p_table_name,

@@ -63,8 +63,12 @@ COMMENT ON VIEW pgl_validate.schema_issues IS
 
 COMMENT ON FUNCTION pgl_validate.column_encoding_mode(oid) IS
     'Select the coordinator-pushed row_digest encoding mode for a column type.';
+COMMENT ON FUNCTION pgl_validate.comparison_key_cols(regclass) IS
+    'Select the replica-identity, primary-key, or safe unique-index columns used for row-level divergence localization.';
 COMMENT ON FUNCTION pgl_validate.pglogical_table_contract(regclass, text[], name) IS
     'Resolve pglogical action masks, effective column list, exact filter predicate, sync state, and validated property for a relation.';
+COMMENT ON FUNCTION pgl_validate.native_table_contract(regclass, text[], name) IS
+    'Resolve native logical publication actions, effective column list, exact row filter, sync state, and validated property for a relation.';
 COMMENT ON FUNCTION pgl_validate.ensure_pglogical_barrier_repset() IS
     'Create or verify the dedicated insert-only pglogical replication set that carries fence barrier tokens.';
 COMMENT ON FUNCTION pgl_validate.fence_pglogical_edge(bigint, integer, integer, text, text, text, text, text, text, text, text[], integer, integer, integer, integer, integer) IS
