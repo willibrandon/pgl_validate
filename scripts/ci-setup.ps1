@@ -4,6 +4,8 @@ param(
 
     [string] $CargoPgrxVersion = '0.19.1',
 
+    [string] $LlvmVersion = '21.1.7',
+
     [switch] $BuildPostgresFromSource
 )
 
@@ -32,6 +34,177 @@ function Add-GitHubPath {
     if ($env:GITHUB_PATH) {
         $Path | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
     }
+}
+
+function Get-PeMachine {
+    param([string] $Path)
+
+    $stream = [IO.File]::Open(
+        $Path,
+        [IO.FileMode]::Open,
+        [IO.FileAccess]::Read,
+        [IO.FileShare]::ReadWrite
+    )
+    try {
+        $reader = [IO.BinaryReader]::new($stream)
+        try {
+            if ($stream.Length -lt 0x40) {
+                return 'unknown'
+            }
+
+            $stream.Position = 0x3c
+            $peOffset = $reader.ReadInt32()
+            if ($peOffset -lt 0 -or ($peOffset + 6) -gt $stream.Length) {
+                return 'unknown'
+            }
+
+            $stream.Position = $peOffset
+            $signature = $reader.ReadUInt32()
+            if ($signature -ne 0x00004550) {
+                return 'unknown'
+            }
+
+            $machine = $reader.ReadUInt16()
+            switch ($machine) {
+                0x014c { return 'x86' }
+                0x8664 { return 'x64' }
+                0xaa64 { return 'arm64' }
+                default { return "unknown-0x$($machine.ToString('x4'))" }
+            }
+        }
+        finally {
+            $reader.Dispose()
+        }
+    }
+    finally {
+        $stream.Dispose()
+    }
+}
+
+function Normalize-WindowsArchitecture {
+    param([string] $Architecture)
+
+    if ([string]::IsNullOrWhiteSpace($Architecture)) {
+        return [Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString().ToLowerInvariant()
+    }
+
+    switch ($Architecture.ToLowerInvariant()) {
+        'amd64' { return 'x64' }
+        'x86_64' { return 'x64' }
+        'x64' { return 'x64' }
+        'aarch64' { return 'arm64' }
+        'arm64' { return 'arm64' }
+        default { throw "Unsupported Windows architecture '$Architecture'." }
+    }
+}
+
+function Test-LibclangArchitecture {
+    param(
+        [string] $Directory,
+        [string] $Architecture
+    )
+
+    $dll = Join-Path $Directory 'libclang.dll'
+    if (-not (Test-Path -LiteralPath $dll)) {
+        return $false
+    }
+
+    $actual = Get-PeMachine -Path $dll
+    if ($actual -eq $Architecture) {
+        return $true
+    }
+
+    Write-Warning "Ignoring $dll because it is $actual, but the Rust target needs $Architecture."
+    return $false
+}
+
+function Get-VisualStudioLibclangCandidates {
+    param([string] $Architecture)
+
+    $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+    if (-not (Test-Path -LiteralPath $vswhere)) {
+        return @()
+    }
+
+    $installPaths = & $vswhere -all -products * -property installationPath 2>$null
+    if ($LASTEXITCODE -ne 0 -or -not $installPaths) {
+        return @()
+    }
+
+    $archFolder = switch ($Architecture) {
+        'x64' { 'x64' }
+        'arm64' { 'ARM64' }
+        default { $Architecture }
+    }
+
+    $candidates = New-Object System.Collections.Generic.List[string]
+    foreach ($installPath in $installPaths) {
+        [void] $candidates.Add((Join-Path $installPath "VC\Tools\Llvm\$archFolder\bin"))
+        [void] $candidates.Add((Join-Path $installPath 'VC\Tools\Llvm\bin'))
+    }
+
+    return $candidates
+}
+
+function Install-WindowsLlvm {
+    param([string] $Architecture)
+
+    if ($Architecture -ne 'x64') {
+        $choco = Get-PglCommandSource -Name 'choco'
+        if (-not $choco) {
+            throw "LLVM for $Architecture was not found and Chocolatey is unavailable."
+        }
+
+        Invoke-Logged -FilePath $choco -Arguments @('install', 'llvm', '-y', '--no-progress')
+        return
+    }
+
+    $installRoot = Join-Path (Get-PglPgrxHome) "llvm-$LlvmVersion-$Architecture"
+    $bin = Join-Path $installRoot 'bin'
+    if (Test-LibclangArchitecture -Directory $bin -Architecture $Architecture) {
+        return
+    }
+
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $installRoot) | Out-Null
+    $installer = Join-Path ([IO.Path]::GetTempPath()) "LLVM-$LlvmVersion-win64.exe"
+    $uri = "https://github.com/llvm/llvm-project/releases/download/llvmorg-$LlvmVersion/LLVM-$LlvmVersion-win64.exe"
+
+    Write-Host "+ Invoke-WebRequest $uri"
+    Invoke-WebRequest -Uri $uri -OutFile $installer
+
+    Write-Host "+ $installer /S /D=$installRoot"
+    $process = Start-Process -FilePath $installer -ArgumentList @('/S', "/D=$installRoot") -Wait -PassThru -WindowStyle Hidden
+    if ($process.ExitCode -ne 0) {
+        throw "LLVM installer exited with code $($process.ExitCode)."
+    }
+}
+
+function Resolve-WindowsLibclangPath {
+    $architecture = Normalize-WindowsArchitecture -Architecture $env:PGL_VALIDATE_MSVC_ARCH
+
+    $candidateDirs = New-Object System.Collections.Generic.List[string]
+    foreach ($candidate in Get-VisualStudioLibclangCandidates -Architecture $architecture) {
+        [void] $candidateDirs.Add($candidate)
+    }
+    foreach ($candidate in @('C:\Program Files\LLVM\bin', 'C:\Program Files (x86)\LLVM\bin')) {
+        [void] $candidateDirs.Add($candidate)
+    }
+
+    foreach ($candidate in $candidateDirs) {
+        if (Test-LibclangArchitecture -Directory $candidate -Architecture $architecture) {
+            return $candidate
+        }
+    }
+
+    Install-WindowsLlvm -Architecture $architecture
+
+    foreach ($candidate in $candidateDirs + @((Join-Path (Get-PglPgrxHome) "llvm-$LlvmVersion-$architecture\bin"))) {
+        if (Test-LibclangArchitecture -Directory $candidate -Architecture $architecture) {
+            return $candidate
+        }
+    }
+
+    throw "Could not find a $architecture libclang.dll after LLVM setup."
 }
 
 function Invoke-Logged {
@@ -253,15 +426,8 @@ function Initialize-MacPostgres {
 }
 
 function Initialize-WindowsPostgres {
-    $libclang = 'C:\Program Files\LLVM\bin'
-    if (-not (Test-Path -LiteralPath (Join-Path $libclang 'libclang.dll'))) {
-        $choco = Get-PglCommandSource -Name 'choco'
-        if (-not $choco) {
-            throw 'LLVM was not found and Chocolatey is unavailable.'
-        }
-        Invoke-Logged -FilePath $choco -Arguments @('install', 'llvm', '-y', '--no-progress')
-    }
-
+    $libclang = Resolve-WindowsLibclangPath
+    Add-GitHubPath -Path $libclang
     Add-GitHubEnv -Name 'LIBCLANG_PATH' -Value $libclang
 
     if (-not (Get-PglCommandSource -Name 'cmake')) {

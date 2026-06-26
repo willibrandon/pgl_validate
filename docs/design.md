@@ -718,31 +718,26 @@ Reporting surfaces: `runs`, `run_progress` (chunks done/total, ETA, bytes scanne
 pgl_validate/
 ├── Cargo.toml                 # cdylib; features pg15..pg18; deps: pgrx, pq-sys, blake3
 ├── pgl_validate.control
-├── sql/                       # extension_sql_file!: catalogs, views, grants, aggregate DDL
+├── sql/
+│   ├── bootstrap/             # extension_sql_file!: catalogs, contracts, barriers, fencing,
+│   │                           # planning SQL, compare orchestration, repair, reporting, cleanup
+│   └── comments.sql            # SQL object comments and privilege-role descriptions
 ├── src/
 │   ├── lib.rs                 # pg_module_magic!, _PG_init (GUCs, optional launcher worker)
+│   ├── sql_api.rs             # pgrx SQL bindings, aggregate, libpq wrappers, worker launcher
 │   ├── digest/
 │   │   ├── encode.rs          # canonical per-type encoding: send vs pinned-text vs error  (#[test])
 │   │   ├── row_digest.rs      # raw-fcinfo VARIADIC "any" scalar; framing; BLAKE3            (#[pg_test])
 │   │   └── lthash.rs          # LtHash lanes + sorted-digest; #[pg_aggregate]               (#[test]/#[pg_test])
-│   ├── contract/
-│   │   ├── pglogical.rs       # replication_set*, set_att_list/set_row_filter, sequence_state, local_sync_status
-│   │   ├── native.rs          # pg_publication*, pg_subscription_rel, prqual/prattrs
-│   │   └── standby.rs         # replay-LSN participant
-│   ├── fence.rs               # barrier injection, slot-confirm/origin convergence, digest-stability confirm
-│   ├── plan.rs                # table/peer discovery, key choice, adaptive chunk planning
-│   ├── sqlgen.rs              # coordinator-generated chunk SQL (planner-transparent)
-│   ├── merkle.rs              # bisection state machine                                     (#[test])
-│   ├── transport/            # async libpq fan-out (pq-sys + WaitEventSet); DSN resolution
+│   ├── transport/             # libpq fan-out, remote checksums/localization, DSN handling
 │   ├── worker.rs              # dynamic run worker + optional static launcher/scheduler
-│   ├── catalog.rs             # typed accessors over pgl_validate.* tables
-│   ├── repair.rs              # generate/apply: origin-aware, locked, FK-ordered
-│   ├── guc.rs                 # GucSetting registrations
-│   └── compat/               # version-gated shims (origin progress, commit-ts-origin, send-format table)
+│   └── pg_tests.rs            # in-server regression coverage for SQL and Rust surfaces
 └── tests/                     # cargo pgrx regress + multi-node harness (Section 21)
 ```
 
-**Boundary discipline** (per the cargo-pgrx skill): pure logic — encoding rules, LtHash/sorted-digest math, Merkle planning, contract parsing of fetched rows, FK topological sort — lives in `#[test]`-able modules with **zero `pg_sys` contact**; anything touching SPI/relations/GUC-runtime/libpq/workers is `#[pg_test]` or runtime-only. No `pg_sys` symbols ever appear inside `#[test]`.
+**Boundary discipline:** PostgreSQL-visible orchestration stays in `sql/bootstrap/*.sql` unless there is a concrete reason it needs Rust. That includes catalog invariants, contract discovery, barrier/fence state transitions, planner-visible SQL generation, Merkle/chunk state, repair bookkeeping, reporting, and maintenance. Keeping that logic in SQL is intentional: DBAs can inspect it with normal PostgreSQL tools, generated checksum queries remain planner-visible, and catalog behavior can be covered directly by `#[pg_test]` and multi-node harnesses.
+
+Rust owns the pieces that are either CPU-bound, pgrx-specific, or outside PL/pgSQL's natural boundary: canonical row encoding, the raw-fcinfo heterogeneous `row_digest`, LtHash and sorted-digest confirmation, libpq transport, GUC registration, and background worker launch/execution. Pure Rust tests cover digest math and encoding helpers; SQL behavior is tested through in-server regression tests and real replication harnesses.
 
 **Hot path** is exactly two custom objects (`row_digest` scalar via raw fcinfo; `lthash` concrete-typed aggregate); everything else is planner-visible generated SQL (Section 12), so the design is implementable within pgrx's actual capabilities.
 

@@ -46,11 +46,27 @@ function Stop-ProcessTree {
     Stop-PglProcessTree -ProcessId $ProcessId
 }
 
+function Write-LogTail {
+    param(
+        [string] $Path,
+        [int] $Lines = 120
+    )
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        Write-Output "--- log tail unavailable: $Path does not exist ---"
+        return
+    }
+
+    Write-Output "--- log tail: $Path ---"
+    Get-Content -LiteralPath $Path -Tail $Lines
+}
+
 function Invoke-CheckedProcess {
     param(
         [string] $FilePath,
         [string[]] $Arguments,
         [int] $TimeoutSeconds = 60,
+        [string[]] $FailureLogPaths = @(),
         [switch] $AllowFailure
     )
 
@@ -65,11 +81,17 @@ function Invoke-CheckedProcess {
     $process = [System.Diagnostics.Process]::Start($startInfo)
     if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
         Stop-ProcessTree -ProcessId $process.Id
+        foreach ($path in $FailureLogPaths) {
+            Write-LogTail -Path $path
+        }
         throw "$FilePath timed out after ${TimeoutSeconds}s."
     }
 
     $process.Refresh()
     if ($process.ExitCode -ne 0 -and -not $AllowFailure) {
+        foreach ($path in $FailureLogPaths) {
+            Write-LogTail -Path $path
+        }
         throw "$FilePath exited with code $($process.ExitCode)."
     }
 
@@ -196,7 +218,7 @@ function Invoke-Sql {
         [int] $Port = $script:PrimaryPort
     )
 
-    $output = & $script:Psql -X -w -h localhost -p $Port -U postgres -d $Database `
+    $output = & $script:Psql -X -w -h 127.0.0.1 -p $Port -U postgres -d $Database `
         -v ON_ERROR_STOP=1 -Atq -c $Sql 2>&1
     if ($LASTEXITCODE -ne 0) {
         throw "psql failed on port ${Port}, database ${Database}: $($output -join [Environment]::NewLine)"
@@ -283,7 +305,7 @@ try {
     $socketOption = Get-PglUnixSocketOption -Directory $target
     $primaryOptions = (@(
         "-p $script:PrimaryPort",
-        '-h localhost',
+        '-h 127.0.0.1',
         $socketOption,
         '-c wal_level=replica',
         '-c hot_standby=on',
@@ -293,10 +315,11 @@ try {
     Invoke-CheckedProcess `
         -FilePath $script:PgCtl `
         -Arguments @('start', '-D', $primaryData, '-l', $primaryLog, '-o', $primaryOptions, '-w', '-t', '30') `
+        -FailureLogPaths @($primaryLog) `
         -TimeoutSeconds 45 | Out-Null
 
-    $primaryDsn = "host=localhost port=$script:PrimaryPort dbname=postgres user=postgres connect_timeout=5 application_name=pgl_validate_standby_primary"
-    $standbyDsn = "host=localhost port=$script:StandbyPort dbname=postgres user=postgres connect_timeout=5 application_name=pgl_validate_standby_replica"
+    $primaryDsn = "host=127.0.0.1 port=$script:PrimaryPort dbname=postgres user=postgres connect_timeout=5 application_name=pgl_validate_standby_primary"
+    $standbyDsn = "host=127.0.0.1 port=$script:StandbyPort dbname=postgres user=postgres connect_timeout=5 application_name=pgl_validate_standby_replica"
     $standbyDsnSql = Sql-Literal $standbyDsn
 
     Write-Step 'Creating extension, test table, standby peer metadata, and physical slot on primary'
@@ -313,7 +336,7 @@ SELECT pg_create_physical_replication_slot('pgl_validate_standby_slot');
     Invoke-CheckedProcess `
         -FilePath $script:PgBaseBackup `
         -Arguments @(
-            '-h', 'localhost',
+            '-h', '127.0.0.1',
             '-p', "$script:PrimaryPort",
             '-U', 'postgres',
             '-D', $standbyData,
@@ -327,13 +350,14 @@ SELECT pg_create_physical_replication_slot('pgl_validate_standby_slot');
     Write-Step "Starting physical standby on port $script:StandbyPort"
     $standbyOptions = (@(
         "-p $script:StandbyPort",
-        '-h localhost',
+        '-h 127.0.0.1',
         $socketOption,
         '-c hot_standby=on'
     ) | Where-Object { $_ }) -join ' '
     Invoke-CheckedProcess `
         -FilePath $script:PgCtl `
         -Arguments @('start', '-D', $standbyData, '-l', $standbyLog, '-o', $standbyOptions, '-w', '-t', '45') `
+        -FailureLogPaths @($primaryLog, $standbyLog) `
         -TimeoutSeconds 60 | Out-Null
 
     Write-Step 'Waiting for standby recovery and streaming replay'

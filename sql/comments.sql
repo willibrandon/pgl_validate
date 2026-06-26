@@ -132,7 +132,7 @@ COMMENT ON FUNCTION pgl_validate.run_schedule(text, boolean) IS
 COMMENT ON FUNCTION pgl_validate.compare_async(regclass[], text, text[], text, jsonb) IS
     'Create a durable validation run, enqueue a compare task, launch a dynamic background worker, and return the run id immediately.';
 COMMENT ON FUNCTION pgl_validate._claim_worker_task(integer) IS
-    'Atomically mark a queued worker task running before the background worker executes it.';
+    'Atomically mark a queued worker task running before the background worker executes it; returns NULL when a just-launched worker has not yet observed the enqueuing transaction.';
 COMMENT ON FUNCTION pgl_validate._run_worker_task(integer) IS
     'Execute one claimed worker task and persist completed or failed state without hiding the run id from callers.';
 COMMENT ON FUNCTION pgl_validate.purge(timestamptz) IS

@@ -374,8 +374,7 @@ BEGIN
     FOR UPDATE;
 
     IF NOT FOUND THEN
-        RAISE EXCEPTION 'worker task % does not exist', task_id
-            USING ERRCODE = '02000';
+        RETURN NULL;
     END IF;
 
     IF task.status = 'canceled' THEN

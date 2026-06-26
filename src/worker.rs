@@ -263,7 +263,16 @@ fn wait_for_task_claim(task_id: i32) -> bool {
 
         match claim {
             Ok(Some(true)) => return true,
-            Ok(_) => return false,
+            Ok(Some(false)) => return false,
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    log!("pgl_validate worker could not see task {task_id} before startup timeout");
+                    return false;
+                }
+                if !BackgroundWorker::wait_latch(Some(Duration::from_millis(100))) {
+                    return false;
+                }
+            }
             Err(err) => {
                 if Instant::now() >= deadline {
                     log!("pgl_validate worker could not claim task {task_id}: {err}");
