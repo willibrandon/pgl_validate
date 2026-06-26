@@ -7,15 +7,37 @@ RETURNS int
 LANGUAGE sql
 STABLE
 AS $$
+    WITH RECURSIVE expanded_type AS (
+        SELECT t.oid, t.typtype, t.typcategory, t.typbasetype, t.typelem, t.typsend
+        FROM pg_type t
+        WHERE t.oid = type_oid
+        UNION ALL
+        SELECT child.oid,
+               child.typtype,
+               child.typcategory,
+               child.typbasetype,
+               child.typelem,
+               child.typsend
+        FROM expanded_type parent
+        JOIN pg_type child
+          ON child.oid = CASE
+              WHEN parent.typtype = 'd' AND parent.typbasetype <> 0 THEN parent.typbasetype
+              WHEN parent.typcategory = 'A' AND parent.typelem <> 0 THEN parent.typelem
+              ELSE 0::oid
+          END
+    )
     SELECT CASE
         WHEN type_oid = 'json'::regtype::oid
          AND COALESCE(NULLIF(current_setting('pgl_validate.json_normalize', true), '')::boolean, false) THEN 3
-        WHEN type_oid IN ('json'::regtype::oid, 'numeric'::regtype::oid) THEN 2
-        WHEN t.typsend = 0 THEN 2
+        WHEN EXISTS (
+            SELECT 1
+            FROM expanded_type e
+            WHERE e.oid IN ('json'::regtype::oid, 'numeric'::regtype::oid)
+               OR e.typtype IN ('c', 'd', 'm', 'p', 'r')
+               OR e.typsend = 0
+        ) THEN 2
         ELSE 1
     END
-    FROM pg_type t
-    WHERE t.oid = type_oid
 $$;
 
 -- Resolve the comparison key used for row-level localization. Prefer the

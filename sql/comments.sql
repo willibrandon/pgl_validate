@@ -68,7 +68,7 @@ COMMENT ON VIEW pgl_validate.worker_tasks IS
     'Reporting view over asynchronous validation worker tasks.';
 
 COMMENT ON FUNCTION pgl_validate.column_encoding_mode(oid) IS
-    'Select the coordinator-pushed row_digest encoding mode for a column type.';
+    'Select the coordinator-pushed row_digest encoding mode for a column type, recursively falling back to text for nested unstable type families.';
 COMMENT ON FUNCTION pgl_validate.plan_settings_cte(text) IS
     'Build the generated-SQL CTE that pins digest-affecting GUCs on a participant session.';
 COMMENT ON FUNCTION pgl_validate.comparison_key_cols(regclass) IS

@@ -210,6 +210,39 @@ mod tests {
     }
 
     #[pg_test]
+    fn column_encoding_mode_recurses_into_arrays_and_domains() {
+        let backend_pid = Spi::get_one::<i32>("SELECT pg_backend_pid()")
+            .unwrap()
+            .unwrap();
+        let domain_name = identifier(&format!("pgl_validate_numeric_domain_{backend_pid}"));
+        let composite_name = identifier(&format!("pgl_validate_composite_{backend_pid}"));
+
+        Spi::run(&format!(
+            "
+            CREATE DOMAIN public.{domain_name} AS numeric;
+            CREATE TYPE public.{composite_name} AS (amount numeric);
+            SET LOCAL pgl_validate.json_normalize = on;
+            "
+        ))
+        .unwrap();
+
+        let modes = Spi::get_one::<String>(&format!(
+            "
+            SELECT pgl_validate.column_encoding_mode('int4[]'::regtype::oid)::text || ';' ||
+                   pgl_validate.column_encoding_mode('numeric[]'::regtype::oid)::text || ';' ||
+                   pgl_validate.column_encoding_mode('json[]'::regtype::oid)::text || ';' ||
+                   pgl_validate.column_encoding_mode('public.{domain_name}'::regtype::oid)::text || ';' ||
+                   pgl_validate.column_encoding_mode('public.{composite_name}'::regtype::oid)::text || ';' ||
+                   pgl_validate.column_encoding_mode('int4range'::regtype::oid)::text
+            "
+        ))
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(modes, "1;2;2;2;2;2");
+    }
+
+    #[pg_test]
     fn lthash_aggregate_is_order_independent_and_duplicate_sensitive() {
         Spi::run(
             r#"
