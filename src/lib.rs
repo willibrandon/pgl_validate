@@ -12,7 +12,51 @@ mod transport;
 
 pgrx::pg_module_magic!(name, version);
 
-extension_sql_file!("../sql/bootstrap.sql", name = "bootstrap", bootstrap);
+extension_sql_file!(
+    "../sql/bootstrap/001_catalog.sql",
+    name = "bootstrap_catalog",
+    bootstrap
+);
+extension_sql_file!(
+    "../sql/bootstrap/010_contracts.sql",
+    name = "bootstrap_contracts",
+    requires = ["bootstrap_catalog"]
+);
+extension_sql_file!(
+    "../sql/bootstrap/020_barriers.sql",
+    name = "bootstrap_barriers",
+    requires = ["bootstrap_contracts"]
+);
+extension_sql_file!(
+    "../sql/bootstrap/030_fencing.sql",
+    name = "bootstrap_fencing",
+    requires = ["bootstrap_barriers"]
+);
+extension_sql_file!(
+    "../sql/bootstrap/040_planning.sql",
+    name = "bootstrap_planning",
+    requires = ["bootstrap_fencing"]
+);
+extension_sql_file!(
+    "../sql/bootstrap/050_compare.sql",
+    name = "bootstrap_compare",
+    requires = ["bootstrap_planning"]
+);
+extension_sql_file!(
+    "../sql/bootstrap/060_repair.sql",
+    name = "bootstrap_repair",
+    requires = ["bootstrap_compare"]
+);
+extension_sql_file!(
+    "../sql/bootstrap/070_reporting.sql",
+    name = "bootstrap_reporting",
+    requires = ["bootstrap_repair"]
+);
+extension_sql_file!(
+    "../sql/bootstrap/080_fence_maintenance.sql",
+    name = "bootstrap_fence_maintenance",
+    requires = ["bootstrap_reporting"]
+);
 extension_sql_file!("../sql/comments.sql", name = "comments", finalize);
 
 static PARANOID_CONFIRM: GucSetting<bool> = GucSetting::<bool>::new(false);
