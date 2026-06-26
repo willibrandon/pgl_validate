@@ -831,6 +831,11 @@ mod tests {
                 id int PRIMARY KEY,
                 amount numeric
             );
+            INSERT INTO plan_target VALUES
+                ('before', 1, 9.50),
+                ('inside-low', 2, 10.25),
+                ('inside-high', 9, 11.50),
+                ('after', 10, 12.00);
             "#,
         )
         .unwrap();
@@ -876,6 +881,89 @@ mod tests {
 
         assert!(confirm_sql.contains("pgl_validate.hash_digest_array"));
         assert!(confirm_sql.contains("array_agg(rd ORDER BY rd)"));
+
+        let bounded_sql = Spi::get_one::<String>(
+            r#"
+            SELECT pgl_validate.plan_chunk_sql(
+                'plan_target'::regclass,
+                ARRAY['id'],
+                convert_to('{"id":2}', 'UTF8'),
+                convert_to('{"id":10}', 'UTF8'),
+                ARRAY['status','id','amount']
+            )
+            "#,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(bounded_sql.contains("t.id >= '2'::integer"));
+        assert!(bounded_sql.contains("t.id < '10'::integer"));
+
+        let bounded_count =
+            Spi::get_one::<i64>(&format!("SELECT n_rows FROM ({bounded_sql}) AS q"))
+                .unwrap()
+                .unwrap();
+        assert_eq!(bounded_count, 2);
+
+        Spi::run(
+            r#"
+            CREATE TEMP TABLE plan_composite(
+                part int NOT NULL,
+                code text NOT NULL,
+                amount int,
+                PRIMARY KEY (part, code)
+            );
+            INSERT INTO plan_composite VALUES
+                (1, 'a', 10),
+                (1, 'b', 20),
+                (2, 'a', 30),
+                (2, 'b', 40);
+            "#,
+        )
+        .unwrap();
+
+        let composite_sql = Spi::get_one::<String>(
+            r#"
+            SELECT pgl_validate.plan_chunk_sql(
+                'plan_composite'::regclass,
+                ARRAY['part','code'],
+                convert_to('{"part":1,"code":"b"}', 'UTF8'),
+                convert_to('{"part":2,"code":"b"}', 'UTF8'),
+                ARRAY['part','code','amount']
+            )
+            "#,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(composite_sql.contains("(t.part, t.code) >= ('1'::integer, 'b'::text)"));
+        assert!(composite_sql.contains("(t.part, t.code) < ('2'::integer, 'b'::text)"));
+
+        let composite_count =
+            Spi::get_one::<i64>(&format!("SELECT n_rows FROM ({composite_sql}) AS q"))
+                .unwrap()
+                .unwrap();
+        assert_eq!(composite_count, 2);
+
+        let localize_sql = Spi::get_one::<String>(
+            r#"
+            SELECT pgl_validate.plan_localize_sql(
+                'plan_composite'::regclass,
+                ARRAY['part','code'],
+                convert_to('{"part":1,"code":"b"}', 'UTF8'),
+                convert_to('{"part":2,"code":"b"}', 'UTF8'),
+                ARRAY['part','code','amount']
+            )
+            "#,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(localize_sql.contains("(t.part, t.code) >= ('1'::integer, 'b'::text)"));
+        assert!(localize_sql.contains("(t.part, t.code) < ('2'::integer, 'b'::text)"));
+
+        let localized_count =
+            Spi::get_one::<i64>(&format!("SELECT count(*) FROM ({localize_sql}) AS q"))
+                .unwrap()
+                .unwrap();
+        assert_eq!(localized_count, 2);
     }
 
     #[pg_test]

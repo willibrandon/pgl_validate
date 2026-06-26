@@ -1196,6 +1196,107 @@ BEGIN
 END
 $$;
 
+-- Build the planner-visible key-range predicate shared by chunk checksums and
+-- row localization. Boundary bytes are UTF-8 JSON objects whose keys are the
+-- comparison-key column names; SQL generation casts each value to the actual
+-- column type so the final predicate is over table columns and typed constants.
+CREATE FUNCTION pgl_validate.plan_key_range_predicate(
+    rel regclass,
+    key_cols text[],
+    lo bytea,
+    hi bytea
+)
+RETURNS text
+LANGUAGE plpgsql
+STABLE
+AS $$
+DECLARE
+    lower_doc jsonb;
+    upper_doc jsonb;
+    key_exprs text[] := ARRAY[]::text[];
+    lower_values text[] := ARRAY[]::text[];
+    upper_values text[] := ARRAY[]::text[];
+    predicates text[] := ARRAY[]::text[];
+    attr_rec record;
+    seen_keys int := 0;
+    value_text text;
+BEGIN
+    IF lo IS NULL AND hi IS NULL THEN
+        RETURN 'true';
+    END IF;
+
+    IF key_cols IS NULL OR cardinality(key_cols) = 0 THEN
+        RAISE EXCEPTION 'bounded chunks require a comparison key';
+    END IF;
+
+    IF lo IS NOT NULL THEN
+        lower_doc := convert_from(lo, 'UTF8')::jsonb;
+        IF jsonb_typeof(lower_doc) <> 'object' THEN
+            RAISE EXCEPTION 'lower chunk boundary must be a JSON object';
+        END IF;
+    END IF;
+
+    IF hi IS NOT NULL THEN
+        upper_doc := convert_from(hi, 'UTF8')::jsonb;
+        IF jsonb_typeof(upper_doc) <> 'object' THEN
+            RAISE EXCEPTION 'upper chunk boundary must be a JSON object';
+        END IF;
+    END IF;
+
+    FOR attr_rec IN
+        SELECT ord.ordinality,
+               a.attname,
+               format_type(a.atttypid, a.atttypmod) AS type_sql
+        FROM unnest(key_cols) WITH ORDINALITY AS ord(col_name, ordinality)
+        JOIN pg_attribute a
+          ON a.attrelid = rel
+         AND a.attname = ord.col_name
+         AND a.attnum > 0
+         AND NOT a.attisdropped
+        ORDER BY ord.ordinality
+    LOOP
+        seen_keys := seen_keys + 1;
+        key_exprs := key_exprs || format('t.%I', attr_rec.attname);
+
+        IF lower_doc IS NOT NULL THEN
+            value_text := lower_doc ->> attr_rec.attname;
+            IF value_text IS NULL THEN
+                RAISE EXCEPTION 'lower chunk boundary is missing non-null key column %', attr_rec.attname;
+            END IF;
+            lower_values := lower_values || format('%L::%s', value_text, attr_rec.type_sql);
+        END IF;
+
+        IF upper_doc IS NOT NULL THEN
+            value_text := upper_doc ->> attr_rec.attname;
+            IF value_text IS NULL THEN
+                RAISE EXCEPTION 'upper chunk boundary is missing non-null key column %', attr_rec.attname;
+            END IF;
+            upper_values := upper_values || format('%L::%s', value_text, attr_rec.type_sql);
+        END IF;
+    END LOOP;
+
+    IF seen_keys <> cardinality(key_cols) THEN
+        RAISE EXCEPTION 'one or more key columns are not present on %', rel::text;
+    END IF;
+
+    IF lower_doc IS NOT NULL THEN
+        predicates := predicates || CASE
+            WHEN seen_keys = 1 THEN format('%s >= %s', key_exprs[1], lower_values[1])
+            ELSE format('(%s) >= (%s)', array_to_string(key_exprs, ', '), array_to_string(lower_values, ', '))
+        END;
+    END IF;
+
+    IF upper_doc IS NOT NULL THEN
+        predicates := predicates || CASE
+            WHEN seen_keys = 1 THEN format('%s < %s', key_exprs[1], upper_values[1])
+            ELSE format('(%s) < (%s)', array_to_string(key_exprs, ', '), array_to_string(upper_values, ', '))
+        END;
+    END IF;
+
+    RETURN array_to_string(predicates, ' AND ');
+END
+$$;
+
 -- Generate the planner-visible SQL used to checksum a table chunk. Columns are
 -- sorted by name before they are passed as heterogeneous VARIADIC row_digest
 -- arguments; callers may EXPLAIN the returned SQL directly on a participant.
@@ -1219,13 +1320,10 @@ DECLARE
     digest_args text;
     row_digest_expr text;
     selected_cols text[];
+    filter_sql text;
+    range_sql text;
     where_sql text;
 BEGIN
-    IF lo IS NOT NULL OR hi IS NOT NULL THEN
-        RAISE EXCEPTION 'bounded chunks are not available until Merkle planning is enabled'
-            USING ERRCODE = '0A000';
-    END IF;
-
     SELECT format('%I.%I', n.nspname, c.relname)
     INTO rel_sql
     FROM pg_class c
@@ -1277,10 +1375,22 @@ BEGIN
         enc_modes::text,
         digest_args
     );
-    where_sql := CASE
+    filter_sql := CASE
         WHEN row_filter_sql IS NULL OR btrim(row_filter_sql) = '' THEN 'true'
         ELSE format('(%s)', row_filter_sql)
     END;
+    range_sql := pgl_validate.plan_key_range_predicate(rel, key_cols, lo, hi);
+    where_sql := COALESCE(
+        NULLIF(
+            concat_ws(
+                ' AND ',
+                NULLIF(filter_sql, 'true'),
+                NULLIF(range_sql, 'true')
+            ),
+            ''
+        ),
+        'true'
+    );
 
     IF include_set_hash THEN
         RETURN format(
@@ -1301,11 +1411,12 @@ END
 $$;
 
 -- Generate the planner-visible SQL used to enumerate keys and row digests for
--- a localized divergent range. The current implementation emits the whole
--- relation; range predicates will reuse this shape once Merkle bounds exist.
+-- a localized divergent key range.
 CREATE FUNCTION pgl_validate.plan_localize_sql(
     rel regclass,
     key_cols text[],
+    lo bytea,
+    hi bytea,
     cols text[],
     row_filter_sql text DEFAULT NULL
 )
@@ -1323,6 +1434,9 @@ DECLARE
     key_digest_args text;
     key_text_args text;
     order_args text;
+    filter_sql text;
+    range_sql text;
+    where_sql text;
 BEGIN
     IF key_cols IS NULL OR cardinality(key_cols) = 0 THEN
         RAISE EXCEPTION 'row-level localization requires a comparison key';
@@ -1387,6 +1501,23 @@ BEGIN
      AND a.attnum > 0
      AND NOT a.attisdropped;
 
+    filter_sql := CASE
+        WHEN row_filter_sql IS NULL OR btrim(row_filter_sql) = '' THEN 'true'
+        ELSE format('(%s)', row_filter_sql)
+    END;
+    range_sql := pgl_validate.plan_key_range_predicate(rel, key_cols, lo, hi);
+    where_sql := COALESCE(
+        NULLIF(
+            concat_ws(
+                ' AND ',
+                NULLIF(filter_sql, 'true'),
+                NULLIF(range_sql, 'true')
+            ),
+            ''
+        ),
+        'true'
+    );
+
     RETURN format(
         'SELECT jsonb_build_object(%s)::text AS key_text, pgl_validate.row_digest(%L::int[], %s) AS key_bytes, pgl_validate.row_digest(%L::int[], %s) AS row_digest, to_jsonb(t)::text AS row_json FROM %s t WHERE %s ORDER BY %s',
         key_text_args,
@@ -1395,13 +1526,24 @@ BEGIN
         enc_modes::text,
         digest_args,
         rel_sql,
-        CASE
-            WHEN row_filter_sql IS NULL OR btrim(row_filter_sql) = '' THEN 'true'
-            ELSE format('(%s)', row_filter_sql)
-        END,
+        where_sql,
         order_args
     );
 END
+$$;
+
+-- Backward-compatible unbounded localization SQL generator.
+CREATE FUNCTION pgl_validate.plan_localize_sql(
+    rel regclass,
+    key_cols text[],
+    cols text[],
+    row_filter_sql text DEFAULT NULL
+)
+RETURNS text
+LANGUAGE sql
+STABLE
+AS $$
+    SELECT pgl_validate.plan_localize_sql($1, $2, NULL, NULL, $3, $4)
 $$;
 
 -- Generate the planner-visible SQL used to read a sequence last_value on each
@@ -2205,12 +2347,16 @@ BEGIN
         localize_sql := pgl_validate.plan_localize_sql(
             p_table_name,
             key_cols,
+            NULL,
+            NULL,
             cols,
             row_filter_sql
         );
         remote_localize_sql := pgl_validate.plan_localize_sql(
             p_table_name,
             key_cols,
+            NULL,
+            NULL,
             cols,
             NULL
         );

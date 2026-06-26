@@ -75,10 +75,14 @@ COMMENT ON FUNCTION pgl_validate.fence_pglogical_edge(bigint, integer, integer, 
     'Inject and converge an exact pglogical barrier for one provider-to-target run edge.';
 COMMENT ON FUNCTION pgl_validate.fence_standby_edge(bigint, integer, integer, text, text, text, pg_lsn, integer, integer, integer, integer, integer) IS
     'Converge one physical standby edge by waiting for replay to reach a primary WAL LSN.';
+COMMENT ON FUNCTION pgl_validate.plan_key_range_predicate(regclass, text[], bytea, bytea) IS
+    'Generate an indexable key-column range predicate from UTF-8 JSON boundary bytes.';
 COMMENT ON FUNCTION pgl_validate.plan_chunk_sql(regclass, text[], bytea, bytea, text[], text[], text, boolean) IS
     'Generate planner-visible SQL for a table chunk checksum and optional cryptographic set confirmation.';
+COMMENT ON FUNCTION pgl_validate.plan_localize_sql(regclass, text[], bytea, bytea, text[], text) IS
+    'Generate planner-visible SQL for key and row-digest enumeration within a bounded divergent range.';
 COMMENT ON FUNCTION pgl_validate.plan_localize_sql(regclass, text[], text[], text) IS
-    'Generate planner-visible SQL for key and row-digest enumeration during divergence localization.';
+    'Generate planner-visible SQL for unbounded key and row-digest enumeration during divergence localization.';
 COMMENT ON FUNCTION pgl_validate.plan_sequence_sql(regclass) IS
     'Generate planner-visible SQL for reading a sequence last_value on a participant.';
 COMMENT ON FUNCTION pgl_validate.compare(regclass[], text, text[], text, jsonb) IS
