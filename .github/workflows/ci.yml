@@ -37,11 +37,6 @@ jobs:
             platform: windows-x64
             msvc_arch: x64
           - os: windows-11-vs2026-arm
-            platform: windows-arm64
-            msvc_arch: arm64
-            rust_toolchain: stable-aarch64-pc-windows-msvc
-            postgres_from_source: true
-          - os: windows-11-vs2026-arm
             platform: windows-arm64-hosted-x64
             msvc_arch: x64
             rust_toolchain: stable-x86_64-pc-windows-msvc
@@ -59,8 +54,14 @@ jobs:
           if ([string]::IsNullOrWhiteSpace($toolchain)) {
             $toolchain = 'stable'
           }
-          rustup toolchain install $toolchain --profile minimal
+          $installArgs = @('toolchain', 'install', $toolchain, '--profile', 'minimal')
+          if ($toolchain -like '*x86_64-pc-windows-msvc' -and [Runtime.InteropServices.RuntimeInformation]::OSArchitecture -eq [Runtime.InteropServices.Architecture]::Arm64) {
+            $installArgs += '--force-non-host'
+          }
+          rustup @installArgs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           rustup default $toolchain
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           rustc --version
           cargo --version
 
@@ -75,23 +76,10 @@ jobs:
           restore-keys: |
             cargo-pgrx-pg${{ matrix.pg }}-${{ matrix.target.platform }}-
 
-      - name: Cache source-built PostgreSQL
-        if: ${{ matrix.target.postgres_from_source == true }}
-        uses: actions/cache@v4
-        with:
-          path: ~/.pgrx/postgresql-*
-          key: postgres-source-pg${{ matrix.pg }}-${{ matrix.target.platform }}-pglogical-${{ env.PGL_VALIDATE_PGLOGICAL_VERSION }}-v1
-
       - name: Set up PostgreSQL and pgrx
         env:
           PGL_VALIDATE_MSVC_ARCH: ${{ matrix.target.msvc_arch }}
-          PGL_VALIDATE_POSTGRES_FROM_SOURCE: ${{ matrix.target.postgres_from_source }}
-        run: |
-          $setupArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', './scripts/ci-setup.ps1', '-PgMajor', '${{ matrix.pg }}')
-          if ($env:PGL_VALIDATE_POSTGRES_FROM_SOURCE -eq 'true') {
-            $setupArgs += '-BuildPostgresFromSource'
-          }
-          ./scripts/pgrx-vs.ps1 pwsh @setupArgs
+        run: ./scripts/pgrx-vs.ps1 pwsh -NoProfile -ExecutionPolicy Bypass -File ./scripts/ci-setup.ps1 -PgMajor ${{ matrix.pg }}
 
       - name: Install pglogical release
         env:
@@ -129,11 +117,6 @@ jobs:
             platform: windows-x64
             msvc_arch: x64
           - os: windows-11-vs2026-arm
-            platform: windows-arm64
-            msvc_arch: arm64
-            rust_toolchain: stable-aarch64-pc-windows-msvc
-            postgres_from_source: true
-          - os: windows-11-vs2026-arm
             platform: windows-arm64-hosted-x64
             msvc_arch: x64
             rust_toolchain: stable-x86_64-pc-windows-msvc
@@ -151,8 +134,14 @@ jobs:
           if ([string]::IsNullOrWhiteSpace($toolchain)) {
             $toolchain = 'stable'
           }
-          rustup toolchain install $toolchain --profile minimal
+          $installArgs = @('toolchain', 'install', $toolchain, '--profile', 'minimal')
+          if ($toolchain -like '*x86_64-pc-windows-msvc' -and [Runtime.InteropServices.RuntimeInformation]::OSArchitecture -eq [Runtime.InteropServices.Architecture]::Arm64) {
+            $installArgs += '--force-non-host'
+          }
+          rustup @installArgs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           rustup default $toolchain
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           rustc --version
           cargo --version
 
@@ -167,23 +156,10 @@ jobs:
           restore-keys: |
             cargo-pglogical-pg${{ matrix.pg }}-${{ matrix.target.platform }}-
 
-      - name: Cache source-built PostgreSQL
-        if: ${{ matrix.target.postgres_from_source == true }}
-        uses: actions/cache@v4
-        with:
-          path: ~/.pgrx/postgresql-*
-          key: postgres-source-pg${{ matrix.pg }}-${{ matrix.target.platform }}-pglogical-${{ env.PGL_VALIDATE_PGLOGICAL_VERSION }}-v1
-
       - name: Set up PostgreSQL and pgrx
         env:
           PGL_VALIDATE_MSVC_ARCH: ${{ matrix.target.msvc_arch }}
-          PGL_VALIDATE_POSTGRES_FROM_SOURCE: ${{ matrix.target.postgres_from_source }}
-        run: |
-          $setupArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', './scripts/ci-setup.ps1', '-PgMajor', '${{ matrix.pg }}')
-          if ($env:PGL_VALIDATE_POSTGRES_FROM_SOURCE -eq 'true') {
-            $setupArgs += '-BuildPostgresFromSource'
-          }
-          ./scripts/pgrx-vs.ps1 pwsh @setupArgs
+        run: ./scripts/pgrx-vs.ps1 pwsh -NoProfile -ExecutionPolicy Bypass -File ./scripts/ci-setup.ps1 -PgMajor ${{ matrix.pg }}
 
       - name: Install pglogical release
         env:
@@ -217,11 +193,6 @@ jobs:
             platform: windows-x64
             msvc_arch: x64
           - os: windows-11-vs2026-arm
-            platform: windows-arm64
-            msvc_arch: arm64
-            rust_toolchain: stable-aarch64-pc-windows-msvc
-            postgres_from_source: true
-          - os: windows-11-vs2026-arm
             platform: windows-arm64-hosted-x64
             msvc_arch: x64
             rust_toolchain: stable-x86_64-pc-windows-msvc
@@ -239,8 +210,14 @@ jobs:
           if ([string]::IsNullOrWhiteSpace($toolchain)) {
             $toolchain = 'stable'
           }
-          rustup toolchain install $toolchain --profile minimal
+          $installArgs = @('toolchain', 'install', $toolchain, '--profile', 'minimal')
+          if ($toolchain -like '*x86_64-pc-windows-msvc' -and [Runtime.InteropServices.RuntimeInformation]::OSArchitecture -eq [Runtime.InteropServices.Architecture]::Arm64) {
+            $installArgs += '--force-non-host'
+          }
+          rustup @installArgs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           rustup default $toolchain
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           rustc --version
           cargo --version
 
@@ -255,23 +232,10 @@ jobs:
           restore-keys: |
             cargo-${{ matrix.backend }}-pg${{ matrix.pg }}-${{ matrix.target.platform }}-
 
-      - name: Cache source-built PostgreSQL
-        if: ${{ matrix.target.postgres_from_source == true }}
-        uses: actions/cache@v4
-        with:
-          path: ~/.pgrx/postgresql-*
-          key: postgres-source-pg${{ matrix.pg }}-${{ matrix.target.platform }}-pglogical-${{ env.PGL_VALIDATE_PGLOGICAL_VERSION }}-v1
-
       - name: Set up PostgreSQL and pgrx
         env:
           PGL_VALIDATE_MSVC_ARCH: ${{ matrix.target.msvc_arch }}
-          PGL_VALIDATE_POSTGRES_FROM_SOURCE: ${{ matrix.target.postgres_from_source }}
-        run: |
-          $setupArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', './scripts/ci-setup.ps1', '-PgMajor', '${{ matrix.pg }}')
-          if ($env:PGL_VALIDATE_POSTGRES_FROM_SOURCE -eq 'true') {
-            $setupArgs += '-BuildPostgresFromSource'
-          }
-          ./scripts/pgrx-vs.ps1 pwsh @setupArgs
+        run: ./scripts/pgrx-vs.ps1 pwsh -NoProfile -ExecutionPolicy Bypass -File ./scripts/ci-setup.ps1 -PgMajor ${{ matrix.pg }}
 
       - name: Run native logical harness
         if: matrix.backend == 'native-logical'

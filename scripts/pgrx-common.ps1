@@ -238,6 +238,21 @@ function Get-PglPowerShellExecutable {
     throw 'Could not find pwsh or powershell on PATH.'
 }
 
+<#
+.SYNOPSIS
+Returns a writable Unix-domain socket option for PostgreSQL test clusters.
+#>
+function Get-PglUnixSocketOption {
+    param([string] $Directory)
+
+    if (Test-PglWindows) {
+        return ''
+    }
+
+    New-Item -ItemType Directory -Force -Path $Directory | Out-Null
+    return "-c unix_socket_directories=$Directory"
+}
+
 function Start-PglHiddenProcess {
     param(
         [string] $FilePath,

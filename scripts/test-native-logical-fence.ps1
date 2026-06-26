@@ -322,7 +322,16 @@ try {
         -TimeoutSeconds 120 | Out-Null
 
     Write-Step "Starting native-logical test cluster on port $script:Port"
-    $serverOptions = "-p $script:Port -h localhost -c wal_level=logical -c max_worker_processes=20 -c max_replication_slots=20 -c max_wal_senders=20"
+    $socketOption = Get-PglUnixSocketOption -Directory $target
+    $serverOptions = (@(
+        "-p $script:Port",
+        '-h localhost',
+        $socketOption,
+        '-c wal_level=logical',
+        '-c max_worker_processes=20',
+        '-c max_replication_slots=20',
+        '-c max_wal_senders=20'
+    ) | Where-Object { $_ }) -join ' '
     Invoke-CheckedProcess `
         -FilePath $script:PgCtl `
         -Arguments @('start', '-D', $data, '-l', $log, '-o', $serverOptions, '-w', '-t', '30') `

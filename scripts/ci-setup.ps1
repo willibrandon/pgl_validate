@@ -111,6 +111,30 @@ function Enable-PostgresInstallWrites {
     Invoke-Logged -FilePath 'sudo' -Arguments (@('chmod', '-R', 'a+rwx') + $paths)
 }
 
+<#
+.SYNOPSIS
+Removes runner-provided Homebrew taps that fail current tap-trust checks.
+#>
+function Remove-UntrustedHomebrewTaps {
+    $brew = Get-PglCommandSource -Name 'brew'
+    if (-not $brew) {
+        return
+    }
+
+    $taps = & $brew tap 2>$null
+    if ($LASTEXITCODE -ne 0) {
+        return
+    }
+
+    if ($taps -contains 'aws/tap') {
+        Write-Host '+ brew untap aws/tap'
+        & $brew untap aws/tap
+        if ($LASTEXITCODE -ne 0) {
+            Write-Warning 'Could not untap aws/tap; continuing because it is unrelated to PostgreSQL setup.'
+        }
+    }
+}
+
 function Initialize-LinuxPostgres {
     $packages = @(
         'build-essential',
@@ -119,6 +143,7 @@ function Initialize-LinuxPostgres {
         'gcc',
         'gnupg',
         'libclang-dev',
+        'libkrb5-dev',
         'libssl-dev',
         'llvm-dev',
         'lsb-release',
@@ -155,6 +180,7 @@ function Initialize-LinuxPostgres {
 }
 
 function Initialize-MacPostgres {
+    Remove-UntrustedHomebrewTaps
     Invoke-Logged -FilePath 'brew' -Arguments @('install', 'llvm', 'pkg-config', "postgresql@$PgMajor")
 
     $llvmPrefix = (& brew --prefix llvm).Trim()
@@ -203,6 +229,10 @@ function Initialize-WindowsSourcePostgres {
     else {
         [Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString().ToLowerInvariant()
     }
+    if ($architecture -eq 'arm64') {
+        throw 'Native Windows ARM64 PostgreSQL source builds are not supported by the PostgreSQL 15-18 MSVC build scripts used in this CI path. Use the Windows ARM64-hosted x64 matrix lane instead.'
+    }
+
     $pgrxHome = Get-PglPgrxHome
     $installRoot = Join-Path $pgrxHome "postgresql-$postgresVersion-$architecture"
     $pgConfig = Join-Path (Join-Path $installRoot 'bin') 'pg_config.exe'
@@ -222,6 +252,10 @@ function Initialize-WindowsSourcePostgres {
 
             Invoke-Logged -FilePath $tar -Arguments @('-xzf', $archivePath, '-C', $workDir)
             $sourceRoot = Join-Path $workDir "postgresql-$postgresVersion"
+            $msvcRoot = Join-Path (Join-Path (Join-Path $sourceRoot 'src') 'tools') 'msvc'
+            if (-not (Test-Path -LiteralPath $msvcRoot)) {
+                throw "PostgreSQL $postgresVersion source archive does not contain src/tools/msvc; this CI source build path cannot build it with MSVC."
+            }
 
             Push-Location $sourceRoot
             try {

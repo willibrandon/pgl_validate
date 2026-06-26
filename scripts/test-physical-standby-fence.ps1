@@ -280,7 +280,16 @@ try {
     )
 
     Write-Step "Starting primary on port $script:PrimaryPort"
-    $primaryOptions = "-p $script:PrimaryPort -h localhost -c wal_level=replica -c hot_standby=on -c max_wal_senders=10 -c max_replication_slots=10"
+    $socketOption = Get-PglUnixSocketOption -Directory $target
+    $primaryOptions = (@(
+        "-p $script:PrimaryPort",
+        '-h localhost',
+        $socketOption,
+        '-c wal_level=replica',
+        '-c hot_standby=on',
+        '-c max_wal_senders=10',
+        '-c max_replication_slots=10'
+    ) | Where-Object { $_ }) -join ' '
     Invoke-CheckedProcess `
         -FilePath $script:PgCtl `
         -Arguments @('start', '-D', $primaryData, '-l', $primaryLog, '-o', $primaryOptions, '-w', '-t', '30') `
@@ -316,7 +325,12 @@ SELECT pg_create_physical_replication_slot('pgl_validate_standby_slot');
         -TimeoutSeconds 180 | Out-Null
 
     Write-Step "Starting physical standby on port $script:StandbyPort"
-    $standbyOptions = "-p $script:StandbyPort -h localhost -c hot_standby=on"
+    $standbyOptions = (@(
+        "-p $script:StandbyPort",
+        '-h localhost',
+        $socketOption,
+        '-c hot_standby=on'
+    ) | Where-Object { $_ }) -join ' '
     Invoke-CheckedProcess `
         -FilePath $script:PgCtl `
         -Arguments @('start', '-D', $standbyData, '-l', $standbyLog, '-o', $standbyOptions, '-w', '-t', '45') `
