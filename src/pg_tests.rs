@@ -3980,12 +3980,21 @@ mod tests {
                 .unwrap();
         assert_eq!(missing_report, "run not found");
 
-        let metrics_ok = Spi::get_one::<bool>(
+        let metrics_ok = Spi::get_one::<bool>(&format!(
             "
-            SELECT pgl_validate.metrics() ? 'runs'
-               AND pgl_validate.metrics() ? 'tables'
-               AND pgl_validate.metrics()->'tables'->'by_verdict' ? 'match'
-            ",
+            WITH metrics AS (
+                SELECT pgl_validate.metrics() AS doc
+            )
+            SELECT doc ? 'runs'
+               AND doc ? 'tables'
+               AND doc ? 'io'
+               AND doc->'tables'->'by_verdict' ? 'match'
+               AND doc->'tables'->'last_successful_by_table' ? 'public.{table_name}'
+               AND (doc->'io'->>'rows_scanned')::bigint >= 1
+               AND (doc->'io'->>'bytes_transferred')::bigint >= 0
+            FROM metrics
+            "
+        ),
         )
         .unwrap()
         .unwrap();

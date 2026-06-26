@@ -305,7 +305,21 @@ SELECT jsonb_build_object(
                     ) s
                 ), '{}'::jsonb),
             'last_successful_validation',
-                (SELECT max(tr.finished_at) FROM pgl_validate.table_result tr WHERE tr.verdict = 'match')
+                (SELECT max(tr.finished_at) FROM pgl_validate.table_result tr WHERE tr.verdict = 'match'),
+            'last_successful_by_table',
+                COALESCE((
+                    SELECT jsonb_object_agg(table_key, last_finished_at)
+                    FROM (
+                        SELECT
+                            tr.schema_name || '.' || tr.table_name AS table_key,
+                            max(tr.finished_at) AS last_finished_at
+                        FROM pgl_validate.table_result tr
+                        WHERE tr.verdict = 'match'
+                          AND tr.finished_at IS NOT NULL
+                        GROUP BY tr.schema_name, tr.table_name
+                        ORDER BY tr.schema_name, tr.table_name
+                    ) s
+                ), '{}'::jsonb)
         ),
     'sequences',
         jsonb_build_object(
@@ -349,6 +363,31 @@ SELECT jsonb_build_object(
                         ORDER BY fa.status
                     ) s
                 ), '{}'::jsonb)
+        ),
+    'io',
+        jsonb_build_object(
+            'rows_scanned',
+                COALESCE((SELECT sum(tnr.n_rows) FROM pgl_validate.table_node_result tnr), 0)
+              + COALESCE((SELECT sum(cnr.n_rows) FROM pgl_validate.chunk_node_result cnr), 0),
+            'bytes_transferred',
+                COALESCE((
+                    SELECT sum(
+                        COALESCE(octet_length(tnr.lthash), 0)
+                      + COALESCE(octet_length(tnr.set_hash), 0)
+                    )
+                    FROM pgl_validate.table_node_result tnr
+                    WHERE tnr.node <> 'local'
+                ), 0)
+              + COALESCE((
+                    SELECT sum(COALESCE(octet_length(cnr.lthash), 0))
+                    FROM pgl_validate.chunk_node_result cnr
+                    WHERE cnr.node <> 'local'
+                ), 0)
+              + COALESCE((
+                    SELECT sum(COALESCE(octet_length(d.key_bytes), 0))
+                    FROM pgl_validate.divergence d
+                    WHERE d.node <> 'local'
+                ), 0)
         )
 )
 $$;

@@ -136,7 +136,7 @@ COMMENT ON FUNCTION pgl_validate.sequences(bigint) IS
 COMMENT ON FUNCTION pgl_validate.report(bigint) IS
     'Return a structured JSON validation report for one run, including plans, verdicts, divergences, sequences, fences, and issues.';
 COMMENT ON FUNCTION pgl_validate.metrics() IS
-    'Return aggregate validation counters and gauges as structured JSON.';
+    'Return aggregate validation counters, per-table last success, rows scanned, and recorded remote payload bytes as structured JSON.';
 COMMENT ON FUNCTION pgl_validate.record_barrier_fence(bigint, integer, integer, uuid, text, pg_lsn) IS
     'Persist an exact barrier token and end LSN for one run edge and epoch.';
 COMMENT ON FUNCTION pgl_validate.record_fence_attempt(bigint, integer, integer, pg_lsn, pg_lsn, boolean, pg_lsn, text) IS
