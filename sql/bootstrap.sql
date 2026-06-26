@@ -2602,6 +2602,50 @@ BEGIN
         );
     END IF;
 
+    INSERT INTO pgl_validate.chunk_result(
+        run_id, schema_name, table_name, chunk_id, parent_id, lo, hi, state, updated_at
+    )
+    VALUES (
+        v_run_id,
+        v_schema_name,
+        v_rel_name,
+        1,
+        NULL,
+        NULL,
+        NULL,
+        CASE
+            WHEN verdict = 'match' THEN 'clean'
+            WHEN verdict = 'differ' THEN 'divergent'
+            ELSE 'candidate'
+        END,
+        now()
+    )
+    ON CONFLICT (run_id, schema_name, table_name, chunk_id) DO UPDATE
+    SET parent_id = EXCLUDED.parent_id,
+        lo = EXCLUDED.lo,
+        hi = EXCLUDED.hi,
+        state = EXCLUDED.state,
+        updated_at = EXCLUDED.updated_at;
+
+    INSERT INTO pgl_validate.chunk_node_result(
+        run_id, schema_name, table_name, chunk_id, node, n_rows, lthash
+    )
+    SELECT
+        tnr.run_id,
+        tnr.schema_name,
+        tnr.table_name,
+        1,
+        tnr.node,
+        tnr.n_rows,
+        tnr.lthash
+    FROM pgl_validate.table_node_result tnr
+    WHERE tnr.run_id = v_run_id
+      AND tnr.schema_name = v_schema_name
+      AND tnr.table_name = v_rel_name
+    ON CONFLICT (run_id, schema_name, table_name, chunk_id, node) DO UPDATE
+    SET n_rows = EXCLUDED.n_rows,
+        lthash = EXCLUDED.lthash;
+
     INSERT INTO pgl_validate.table_result(
         run_id, schema_name, table_name, verdict, reason, finished_at
     )

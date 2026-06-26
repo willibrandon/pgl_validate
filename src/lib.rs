@@ -914,6 +914,21 @@ mod tests {
         .unwrap()
         .unwrap();
         assert!(lthash_present);
+
+        let root_chunk = Spi::get_one::<String>(
+            "
+            SELECT cr.state || ';' || cnr.n_rows::text || ';' || (cnr.lthash IS NOT NULL)::text
+            FROM pgl_validate.chunk_result cr
+            JOIN pgl_validate.chunk_node_result cnr
+              USING (run_id, schema_name, table_name, chunk_id)
+            WHERE cr.table_name = 'compare_target'
+              AND cr.chunk_id = 1
+              AND cnr.node = 'local'
+            ",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(root_chunk, "clean;2;true");
     }
 
     #[pg_test]
@@ -1017,7 +1032,10 @@ mod tests {
                    (SELECT count(*)::text
                     FROM pgl_validate.run_participant rp
                     WHERE rp.run_id = r.run_id) || ';' ||
-                   jsonb_array_length(pgl_validate.report(r.run_id)->'tables')::text
+                   jsonb_array_length(pgl_validate.report(r.run_id)->'tables')::text || ';' ||
+                   (SELECT chunks_done::text || '/' || chunks_total::text
+                    FROM pgl_validate.run_progress rp
+                    WHERE rp.run_id = r.run_id)
             FROM pgl_validate.run r
             JOIN pgl_validate.table_result tr ON tr.run_id = r.run_id
             WHERE r.run_id = {run_id}
@@ -1026,7 +1044,7 @@ mod tests {
         ))
         .unwrap()
         .unwrap();
-        assert_eq!(run_shape, "completed;2;2;2;2;2");
+        assert_eq!(run_shape, "completed;2;2;2;2;2;2/2");
 
         let _ = crate::transport::libpq::execute_command(
             &dsn,
@@ -1653,6 +1671,23 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(remote_rows, 2);
+
+        let root_chunk = Spi::get_one::<String>(&format!(
+            "
+            SELECT cr.state || ';' || count(cnr.*)::text
+            FROM pgl_validate.chunk_result cr
+            JOIN pgl_validate.chunk_node_result cnr
+              USING (run_id, schema_name, table_name, chunk_id)
+            WHERE cr.run_id = {run_id}
+              AND cr.table_name = {table_name}
+              AND cr.chunk_id = 1
+            GROUP BY cr.state
+            ",
+            table_name = sql_literal(&table_name)
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(root_chunk, "divergent;2");
 
         let divergence_summary = Spi::get_one::<String>(&format!(
             "
