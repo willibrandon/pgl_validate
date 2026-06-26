@@ -1,5 +1,6 @@
 \set ON_ERROR_STOP on
 \pset null '<null>'
+\pset format unaligned
 
 SELECT 'extension' AS subject, extversion
 FROM pg_extension
