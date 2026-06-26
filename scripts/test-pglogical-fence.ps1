@@ -1038,10 +1038,21 @@ SELECT EXISTS (
     Write-Step 'Validating post-fence provider UPDATE is cleared by digest-stability recheck'
     $clearedTimeoutSeconds = [Math]::Min($TimeoutSeconds, 30)
     Invoke-Sql -Database 'provider' -Sql @"
+DO `$pgl_validate_role`$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'pgl_validate_recheck_user') THEN
+        CREATE ROLE pgl_validate_recheck_user LOGIN;
+    END IF;
+END
+`$pgl_validate_role`$;
+GRANT pgl_validate_orchestrate TO pgl_validate_recheck_user;
+GRANT USAGE ON SCHEMA public, pglogical TO pgl_validate_recheck_user;
+GRANT SELECT ON ALL TABLES IN SCHEMA pglogical TO pgl_validate_recheck_user;
+GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA pglogical TO pgl_validate_recheck_user;
 CREATE FUNCTION public.pgl_validate_recheck_gate(i int)
 RETURNS boolean
 LANGUAGE plpgsql
-IMMUTABLE
+VOLATILE
 AS `$pgl_validate_gate`$
 DECLARE
     app_name text := current_setting('application_name', true);
@@ -1078,10 +1089,16 @@ CREATE TABLE public.post_fence_update_accounts(
 SELECT pglogical.replication_set_add_table(
     'default',
     'public.post_fence_update_accounts'::regclass,
-    false,
-    NULL,
-    'public.pgl_validate_recheck_gate(id)'
+    false
 );
+ALTER TABLE public.post_fence_update_accounts ENABLE ROW LEVEL SECURITY;
+CREATE POLICY pgl_validate_recheck_update_gate
+ON public.post_fence_update_accounts
+FOR SELECT
+TO pgl_validate_recheck_user
+USING (public.pgl_validate_recheck_gate(id));
+GRANT SELECT ON public.post_fence_update_accounts TO pgl_validate_recheck_user;
+GRANT EXECUTE ON FUNCTION public.pgl_validate_recheck_gate(int) TO pgl_validate_recheck_user;
 "@ | Out-Null
     Invoke-Sql -Database 'target' -Sql @"
 CREATE TABLE public.post_fence_update_accounts(
@@ -1098,6 +1115,7 @@ CREATE TABLE public.post_fence_update_accounts(
     Invoke-Sql -Database 'target' -Sql "UPDATE public.post_fence_update_accounts SET value = 'after-update' WHERE id = 1" | Out-Null
 
     $clearedCompareSql = @"
+SET ROLE pgl_validate_recheck_user;
 SET application_name = 'pgl_validate_recheck_update';
 SET pgl_validate.recheck_gate_calls = '0';
 SELECT run_id::text || ';' || verdict
@@ -1165,7 +1183,7 @@ WHERE d.run_id = $clearedRunId
   AND d.table_name = 'post_fence_update_accounts'
   AND d.node = 'target'
 "@
-    if ($clearedEvidence -ne 'differs;cleared;cleared;match;filtered_intersection') {
+    if ($clearedEvidence -ne 'differs;cleared;cleared;match;full') {
         throw "post-fence UPDATE did not persist a cleared recheck outcome: $clearedEvidence"
     }
 
@@ -1178,10 +1196,15 @@ CREATE TABLE public.post_fence_delete_accounts(
 SELECT pglogical.replication_set_add_table(
     'default',
     'public.post_fence_delete_accounts'::regclass,
-    false,
-    NULL,
-    'public.pgl_validate_recheck_gate(id)'
+    false
 );
+ALTER TABLE public.post_fence_delete_accounts ENABLE ROW LEVEL SECURITY;
+CREATE POLICY pgl_validate_recheck_delete_gate
+ON public.post_fence_delete_accounts
+FOR SELECT
+TO pgl_validate_recheck_user
+USING (public.pgl_validate_recheck_gate(id));
+GRANT SELECT ON public.post_fence_delete_accounts TO pgl_validate_recheck_user;
 "@ | Out-Null
     Invoke-Sql -Database 'target' -Sql @"
 CREATE TABLE public.post_fence_delete_accounts(
@@ -1198,6 +1221,7 @@ CREATE TABLE public.post_fence_delete_accounts(
     Invoke-Sql -Database 'target' -Sql "UPDATE public.post_fence_delete_accounts SET value = 'target-delete-drift' WHERE id = 1" | Out-Null
 
     $deleteCompareSql = @"
+SET ROLE pgl_validate_recheck_user;
 SET application_name = 'pgl_validate_recheck_delete';
 SET pgl_validate.recheck_gate_calls = '0';
 SELECT run_id::text || ';' || verdict
@@ -1264,7 +1288,7 @@ SELECT EXISTS (
       AND d.classification IN ('differs', 'missing_on')
       AND d.status = 'cleared'
       AND tr.verdict = 'match'
-      AND tp.validated_property = 'filtered_intersection'
+      AND tp.validated_property = 'full'
     GROUP BY d.run_id, d.schema_name, d.table_name, d.key_bytes, d.node
     HAVING bool_or(dr.outcome = 'cleared')
 )::text
