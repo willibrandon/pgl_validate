@@ -64,6 +64,9 @@ jobs:
       - name: Run pgrx pg_test suite
         run: ./scripts/test-pgrx.ps1 -PgMajor ${{ matrix.pg }} -TimeoutSeconds 1800
 
+      - name: Run async worker smoke harness
+        run: ./scripts/test-async-worker.ps1 -PgMajor ${{ matrix.pg }} -TimeoutSeconds 180
+
       - name: Clean test clusters
         if: always()
         run: ./scripts/stop-pgrx-test-clusters.ps1 -RemoveData
