@@ -146,6 +146,69 @@ function Install-PglogicalPackage {
             Copy-Item -LiteralPath $file.FullName -Destination $binDir -Force
         }
     }
+
+    Update-PglogicalMacDylibReferences -PgConfig $PgConfig
+}
+
+function Update-PglogicalMacDylibReferences {
+    param([string] $PgConfig)
+
+    if (-not (Test-PglMacOS)) {
+        return
+    }
+
+    $otool = Get-PglCommandSource -Name 'otool'
+    $installNameTool = Get-PglCommandSource -Name 'install_name_tool'
+    if (-not $otool -or -not $installNameTool) {
+        throw 'otool and install_name_tool are required to relocate macOS pglogical package dependencies.'
+    }
+
+    $pkglibDir = & $PgConfig --pkglibdir
+    $libDir = & $PgConfig --libdir
+    $libraryTargets = @($libDir, $pkglibDir) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    $pglogicalLibraries = Get-ChildItem -LiteralPath $pkglibDir -File -Filter 'pglogical*.dylib' -ErrorAction SilentlyContinue
+
+    foreach ($library in $pglogicalLibraries) {
+        $dependencies = & $otool -L $library.FullName
+        if ($LASTEXITCODE -ne 0) {
+            throw "otool failed for $($library.FullName)."
+        }
+
+        foreach ($line in $dependencies) {
+            $trimmed = $line.Trim()
+            if ($trimmed -notmatch '^(?<path>/\S+)\s+\(') {
+                continue
+            }
+
+            $dependency = $Matches['path']
+            if ((Test-Path -LiteralPath $dependency) -or
+                $dependency.StartsWith('/usr/lib/', [StringComparison]::Ordinal) -or
+                $dependency.StartsWith('/System/', [StringComparison]::Ordinal)) {
+                continue
+            }
+
+            $dependencyName = Split-Path -Leaf $dependency
+            $replacement = $null
+            foreach ($target in $libraryTargets) {
+                $candidate = Join-Path $target $dependencyName
+                if (Test-Path -LiteralPath $candidate) {
+                    $replacement = $candidate
+                    break
+                }
+            }
+
+            if (-not $replacement) {
+                throw "Could not relocate missing dependency $dependency for $($library.FullName)."
+            }
+
+            & $installNameTool -change $dependency $replacement $library.FullName
+            if ($LASTEXITCODE -ne 0) {
+                throw "install_name_tool failed while changing $dependency to $replacement in $($library.FullName)."
+            }
+
+            Write-Host "Relocated $dependencyName for $($library.Name) to $replacement"
+        }
+    }
 }
 
 function Install-PglogicalSource {
@@ -312,6 +375,8 @@ if ($pgVersion -notmatch "PostgreSQL\s+$PgMajor\.") {
 }
 
 if (Test-PglogicalInstalled -PgConfig $PgConfig -Version $Version) {
+    Update-PglogicalMacDylibReferences -PgConfig $PgConfig
+    Assert-PglogicalInstalled -PgConfig $PgConfig
     Write-Host "pglogical $Version is already installed for $pgVersion"
     Write-Host "pg_config: $PgConfig"
     return
