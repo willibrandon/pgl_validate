@@ -478,7 +478,14 @@ function Initialize-WindowsPostgres {
         Invoke-Logged -FilePath $choco -Arguments @('install', 'cmake', '-y', '--no-progress')
     }
 
-    Invoke-Logged -FilePath 'cargo' -Arguments @('pgrx', 'init', "--pg$PgMajor", 'download')
+    try {
+        Invoke-Logged -FilePath 'cargo' -Arguments @('pgrx', 'init', "--pg$PgMajor", 'download')
+    }
+    catch {
+        Write-Host "cargo-pgrx PostgreSQL download failed; building PostgreSQL $PgMajor from source instead."
+        Write-Host $_.Exception.Message
+        Initialize-WindowsSourcePostgres
+    }
 }
 
 function Initialize-WindowsSourcePostgres {

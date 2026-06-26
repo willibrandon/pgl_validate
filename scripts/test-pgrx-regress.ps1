@@ -206,9 +206,35 @@ function New-PglRegressSchedule {
     return (Resolve-Path -LiteralPath $schedulePath).Path
 }
 
+function Write-PglRegressDiffs {
+    $diffsPath = Join-Path $regressDirectory 'regression.diffs'
+    if (Test-Path -LiteralPath $diffsPath) {
+        Write-Host ''
+        Write-Host "----- regression.diffs -----"
+        Get-Content -LiteralPath $diffsPath
+        Write-Host "----- end regression.diffs -----"
+    }
+}
+
 $exitCode = 0
 try {
     & (Join-Path $PSScriptRoot 'stop-pgrx-test-clusters.ps1') @stopArgs
+
+    $runner = Join-Path $PSScriptRoot 'pgrx-vs.ps1'
+    $powershell = Get-PglPowerShellExecutable
+
+    if (-not (Test-PglWindows)) {
+        $regressCommand = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $runner) +
+            @('cargo', 'pgrx', 'regress', "pg$PgMajor", '--resetdb', '--psql-verbosity', 'terse') +
+            $CargoPgrxArgs
+        $exitCode = Invoke-PglTimedProcess -FilePath $powershell -ArgumentList $regressCommand
+        if ($exitCode -ne 0) {
+            Write-PglRegressDiffs
+            throw "cargo pgrx regress exited with code $exitCode."
+        }
+
+        return
+    }
 
     $pgConfig = Get-PglPgrxPgConfig -PgMajor $PgMajor
     $pgRegress = Get-PglPgRegressPath -PgConfig $pgConfig
@@ -219,9 +245,11 @@ try {
     $launcher = New-PglRegressLauncher -PsqlPath $psql -Directory $launcherDirectory
     $tests = Get-PglRegressTests -Directory $regressDirectory
     $schedule = New-PglRegressSchedule -Tests $tests -Directory $launcherDirectory
-
-    $runner = Join-Path $PSScriptRoot 'pgrx-vs.ps1'
-    $powershell = Get-PglPowerShellExecutable
+    $databaseUser = [Environment]::UserName
+    Remove-Item -LiteralPath Env:PGDATABASE -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath Env:PGHOST -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath Env:PGPORT -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath Env:PGUSER -ErrorAction SilentlyContinue
 
     $initialStopCommand = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $runner) +
         @('cargo', 'pgrx', 'stop', "pg$PgMajor")
@@ -245,12 +273,12 @@ try {
         throw "cargo pgrx start exited with code $exitCode."
     }
 
-    $exitCode = Invoke-PglTimedProcess -FilePath $dropdb -ArgumentList @('--if-exists', '-h', 'localhost', '-p', "$port", $databaseName) -Seconds 60
+    $exitCode = Invoke-PglTimedProcess -FilePath $dropdb -ArgumentList @('--if-exists', '-h', 'localhost', '-p', "$port", '-U', $databaseUser, $databaseName) -Seconds 60
     if ($exitCode -ne 0) {
         throw "dropdb exited with code $exitCode."
     }
 
-    $exitCode = Invoke-PglTimedProcess -FilePath $createdb -ArgumentList @('-h', 'localhost', '-p', "$port", $databaseName) -Seconds 60
+    $exitCode = Invoke-PglTimedProcess -FilePath $createdb -ArgumentList @('-h', 'localhost', '-p', "$port", '-U', $databaseUser, $databaseName) -Seconds 60
     if ($exitCode -ne 0) {
         throw "createdb exited with code $exitCode."
     }
@@ -259,6 +287,7 @@ try {
     $regressArgs = @(
         '--host', 'localhost',
         '--port', "$port",
+        '--user', $databaseUser,
         '--use-existing',
         "--dbname=$databaseName",
         "--inputdir=$regressDirectory",
@@ -269,6 +298,7 @@ try {
     )
     $exitCode = Invoke-PglTimedProcess -FilePath $pgRegress -ArgumentList $regressArgs -WorkingDirectory $regressDirectory
     if ($exitCode -ne 0) {
+        Write-PglRegressDiffs
         throw "pg_regress exited with code $exitCode."
     }
 }
