@@ -1099,7 +1099,8 @@ BEGIN
     INTO lock_object, trigger_call
     FROM (VALUES
         ('pgl_validate_recheck_update'::text, 2, 2),
-        ('pgl_validate_recheck_delete'::text, 3, 3)
+        ('pgl_validate_recheck_delete'::text, 3, 3),
+        ('pgl_validate_recheck_hot'::text, 4, 3)
     ) AS locks(name, signal_lock, signal_call)
     WHERE name = app_name;
 
@@ -1345,6 +1346,112 @@ WHERE d.run_id = $deleteRunId
   AND d.node = 'target'
 "@
         throw "post-fence DELETE did not persist a cleared recheck outcome: $deleteEvidence"
+    }
+
+    Write-Step 'Validating continuously hot pglogical key becomes indeterminate'
+    Invoke-Sql -Database 'provider' -Sql @"
+CREATE TABLE public.post_fence_hot_accounts(
+    id int PRIMARY KEY,
+    value text
+);
+SELECT pglogical.replication_set_add_table(
+    'default',
+    'public.post_fence_hot_accounts'::regclass,
+    false
+);
+ALTER TABLE public.post_fence_hot_accounts ENABLE ROW LEVEL SECURITY;
+CREATE POLICY pgl_validate_recheck_hot_gate
+ON public.post_fence_hot_accounts
+FOR SELECT
+TO pgl_validate_recheck_user
+USING (public.pgl_validate_recheck_gate(id));
+GRANT SELECT ON public.post_fence_hot_accounts TO pgl_validate_recheck_user;
+"@ | Out-Null
+    Invoke-Sql -Database 'target' -Sql @"
+CREATE TABLE public.post_fence_hot_accounts(
+    id int PRIMARY KEY,
+    value text
+)
+"@ | Out-Null
+    Invoke-Sql -Database 'provider' -Sql "INSERT INTO public.post_fence_hot_accounts VALUES (1, 'hot-before')" | Out-Null
+    Wait-SqlEquals `
+        -Database 'target' `
+        -Sql "SELECT value FROM public.post_fence_hot_accounts WHERE id = 1" `
+        -Expected 'hot-before' `
+        -TimeoutSeconds $TimeoutSeconds
+    Invoke-Sql -Database 'target' -Sql "UPDATE public.post_fence_hot_accounts SET value = 'target-hot-drift' WHERE id = 1" | Out-Null
+
+    $hotCompareSql = @"
+SET ROLE pgl_validate_recheck_user;
+SET application_name = 'pgl_validate_recheck_hot';
+SET pgl_validate.recheck_gate_calls = '0';
+SELECT run_id::text || ';' || verdict
+FROM pgl_validate.compare_table(
+    'public.post_fence_hot_accounts'::regclass,
+    ARRAY['target'],
+    jsonb_build_object(
+        'provider_dsn', $providerDsnSql,
+        'provider_node', 'provider',
+        'repsets', jsonb_build_array('default'),
+        'recheck_passes', 1,
+        'fence_timeout_ms', 30000,
+        'fence_poll_interval_ms', 100
+    )
+)
+"@
+    $hotProcess = Start-AsyncSql -Database 'provider' -Sql $hotCompareSql
+    try {
+        Wait-AdvisoryLockHeld `
+            -Database 'provider' `
+            -ClassId 76422 `
+            -ObjectId 4 `
+            -TimeoutSeconds $clearedTimeoutSeconds
+
+        Invoke-Sql -Database 'provider' -Sql "UPDATE public.post_fence_hot_accounts SET value = 'hot-after' WHERE id = 1" | Out-Null
+        Wait-SqlEquals `
+            -Database 'target' `
+            -Sql "SELECT value FROM public.post_fence_hot_accounts WHERE id = 1" `
+            -Expected 'hot-after' `
+            -TimeoutSeconds $clearedTimeoutSeconds
+
+        $hotResult = Wait-AsyncSql `
+            -Process $hotProcess `
+            -TimeoutSeconds $clearedTimeoutSeconds `
+            -Context 'continuously hot pglogical key compare_table'
+    }
+    finally {
+        if ($hotProcess -and -not $hotProcess.HasExited) {
+            Stop-ProcessTree -ProcessId $hotProcess.Id
+        }
+    }
+
+    $hotParts = $hotResult.Split(';', 2)
+    if ($hotParts.Count -ne 2) {
+        throw "unexpected hot-key compare_table result: $hotResult"
+    }
+    $hotRunId = $hotParts[0]
+    $hotVerdict = $hotParts[1]
+    if ($hotVerdict -ne 'indeterminate') {
+        throw "continuously hot pglogical key should become indeterminate, saw: $hotResult"
+    }
+
+    $hotEvidence = Invoke-Sql -Database 'provider' -Sql @"
+SELECT d.classification || ';' ||
+       d.status || ';' ||
+       dr.outcome || ';' ||
+       tr.verdict || ';' ||
+       tp.validated_property
+FROM pgl_validate.divergence d
+JOIN pgl_validate.divergence_recheck dr USING (run_id, schema_name, table_name, key_bytes, node)
+JOIN pgl_validate.table_result tr USING (run_id, schema_name, table_name)
+JOIN pgl_validate.table_plan tp USING (run_id, schema_name, table_name)
+WHERE d.run_id = $hotRunId
+  AND d.schema_name = 'public'
+  AND d.table_name = 'post_fence_hot_accounts'
+  AND d.node = 'target'
+"@
+    if ($hotEvidence -ne 'differs;indeterminate;still_hot;indeterminate;full') {
+        throw "hot pglogical key did not persist an indeterminate still_hot outcome: $hotEvidence"
     }
 
     Write-Step 'Creating subscriber-side drift and applying audited pglogical repair'
