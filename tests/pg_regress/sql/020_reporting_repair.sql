@@ -192,6 +192,39 @@ CREATE TEMP TABLE pgl_validate_regress_action_case(
 INSERT INTO pgl_validate_regress_action_case
 VALUES
     (
+        'filtered_advisory_differs',
+        'filtered_advisory',
+        true,
+        false,
+        true,
+        true,
+        'differs',
+        6,
+        '{"local":{"id":6,"value":"local"},"peer":{"id":6,"value":"target"}}'
+    ),
+    (
+        'filtered_intersection_differs',
+        'filtered_intersection',
+        true,
+        true,
+        true,
+        true,
+        'differs',
+        7,
+        '{"local":{"id":7,"value":"local"},"peer":{"id":7,"value":"target"}}'
+    ),
+    (
+        'filtered_intersection_missing',
+        'filtered_intersection',
+        true,
+        true,
+        true,
+        true,
+        'missing_on',
+        8,
+        '{"local":{"id":8,"value":"local"},"peer":null}'
+    ),
+    (
         'keys_only_delete',
         'keys_only',
         true,
@@ -275,6 +308,33 @@ WITH run AS (
 )
 INSERT INTO pgl_validate_regress_action_seed
 SELECT 'superset_missing', run_id
+FROM run;
+
+WITH run AS (
+    INSERT INTO pgl_validate.run(status, started_at, finished_at, tables_total, tables_differ)
+    VALUES ('completed', '2026-01-01 00:00:00+00', '2026-01-01 00:00:01+00', 1, 1)
+    RETURNING run_id
+)
+INSERT INTO pgl_validate_regress_action_seed
+SELECT 'filtered_advisory_differs', run_id
+FROM run;
+
+WITH run AS (
+    INSERT INTO pgl_validate.run(status, started_at, finished_at, tables_total, tables_differ)
+    VALUES ('completed', '2026-01-01 00:00:00+00', '2026-01-01 00:00:01+00', 1, 1)
+    RETURNING run_id
+)
+INSERT INTO pgl_validate_regress_action_seed
+SELECT 'filtered_intersection_differs', run_id
+FROM run;
+
+WITH run AS (
+    INSERT INTO pgl_validate.run(status, started_at, finished_at, tables_total, tables_differ)
+    VALUES ('completed', '2026-01-01 00:00:00+00', '2026-01-01 00:00:01+00', 1, 1)
+    RETURNING run_id
+)
+INSERT INTO pgl_validate_regress_action_seed
+SELECT 'filtered_intersection_missing', run_id
 FROM run;
 
 INSERT INTO pgl_validate.run_participant(run_id, node, role, backend, pg_version, status)

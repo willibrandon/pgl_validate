@@ -217,7 +217,13 @@ BEGIN
          AND tp.table_name = d.table_name
         WHERE d.run_id = p_run_id
           AND d.status = 'confirmed'
-          AND tp.validated_property IN ('full','superset','keys_only')
+          AND (
+              tp.validated_property IN ('full','superset','keys_only')
+              OR (
+                  tp.validated_property = 'filtered_intersection'
+                  AND d.classification = 'differs'
+              )
+          )
         ORDER BY d.schema_name, d.table_name, d.key_text, d.node
     LOOP
         rel_sql := format('%I.%I', rec.schema_name, rec.table_name);
