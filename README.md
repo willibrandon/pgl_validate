@@ -1,13 +1,15 @@
 # pgl_validate
 
-`pgl_validate` validates table contents across PostgreSQL replication
-topologies. It is built for pglogical first, especially bidirectional
-replication, and also supports native logical replication and physical
+`pgl_validate` is a PostgreSQL extension for checking whether replicated tables
+agree across nodes.
+
+The primary target is pglogical, including bidirectional deployments. The same
+validation model also supports native logical replication and physical
 standbys.
 
-The extension compares data only after a replication-aware fence proves the
-right state is visible. That matters: a validator that cannot tell lag from
-divergence is worse than noisy.
+Validation is replication-aware. It accounts for apply lag, row filters, column
+lists, action masks, sequence windows, and standby replay state before
+reporting a match or divergence.
 
 ## Supported Scope
 
@@ -26,12 +28,13 @@ validation does not depend on it.
 
 ## Quick Start
 
-Install with pgrx against the PostgreSQL major you want to use:
+Install with pgrx against the PostgreSQL major you want to use. Replace
+`/path/to/pg_config` with the `pg_config` for that PostgreSQL installation:
 
-```powershell
-.\scripts\pgrx-vs.ps1 cargo pgrx install `
-  --pg-config C:\path\to\pg_config.exe `
-  --no-default-features `
+```sh
+cargo pgrx install \
+  --pg-config /path/to/pg_config \
+  --no-default-features \
   --features pg18
 ```
 
@@ -44,25 +47,25 @@ SELECT *
 FROM pgl_validate.compare_table('public.accounts'::regclass);
 ```
 
-On Windows, run pgrx commands through `scripts\pgrx-vs.ps1` so bindgen sees
+On Windows, run the same command through `scripts\pgrx-vs.ps1` so bindgen sees
 the Visual Studio C++ and Windows SDK headers.
 
 ## Development
 
 Use Rust stable with `cargo-pgrx` 0.19.1.
 
-```powershell
+```sh
 rustup default stable
 cargo install --locked cargo-pgrx --version 0.19.1
 ```
 
 Common checks:
 
-```powershell
-.\scripts\check-powershell.ps1
-.\scripts\check-design-catalog-ddl.ps1
-.\scripts\test-pgrx.ps1 -PgMajor 18
-.\scripts\test-pglogical-fence.ps1 -PgMajor 18
+```sh
+pwsh -NoProfile -File scripts/check-powershell.ps1
+pwsh -NoProfile -File scripts/check-design-catalog-ddl.ps1
+pwsh -NoProfile -File scripts/test-pgrx.ps1 -PgMajor 18
+pwsh -NoProfile -File scripts/test-pglogical-fence.ps1 -PgMajor 18
 ```
 
 Script details live in [scripts/README.md](scripts/README.md). The design
