@@ -118,6 +118,39 @@ foreach ($file in $sqlFiles) {
     }
 }
 
+$commentedColumns = @{}
+foreach ($match in [regex]::Matches($commentsText, "\('([^']+)'\s*,\s*'([^']+)'\s*,\s*'[^']*'\)")) {
+    $commentedColumns["$($match.Groups[1].Value).$($match.Groups[2].Value)"] = $true
+}
+foreach ($match in [regex]::Matches($commentsText, '(?im)^\s*COMMENT\s+ON\s+COLUMN\s+pgl_validate\.([a-zA-Z_][a-zA-Z0-9_]*)\.([a-zA-Z_][a-zA-Z0-9_]*)\b')) {
+    $commentedColumns["$($match.Groups[1].Value).$($match.Groups[2].Value)"] = $true
+}
+
+$catalogPath = Join-Path $workspace 'sql/bootstrap/001_catalog.sql'
+$catalogText = Get-Content -LiteralPath $catalogPath -Raw
+foreach ($tableMatch in [regex]::Matches($catalogText, '(?ims)^\s*CREATE\s+TABLE\s+pgl_validate\.([a-zA-Z_][a-zA-Z0-9_]*)\s*\((.*?)^\s*\);')) {
+    $tableName = $tableMatch.Groups[1].Value
+    $body = $tableMatch.Groups[2].Value
+    foreach ($line in ($body -split "`r?`n")) {
+        if ($line -notmatch '^\s+([a-zA-Z_][a-zA-Z0-9_]*)\s+') {
+            continue
+        }
+
+        $columnName = $Matches[1]
+        if ($columnName -cne $columnName.ToLowerInvariant()) {
+            continue
+        }
+
+        if ($columnName -in @('CHECK', 'CONSTRAINT', 'EXCLUDE', 'FOREIGN', 'PRIMARY', 'UNIQUE')) {
+            continue
+        }
+
+        if (-not $commentedColumns.ContainsKey("$tableName.$columnName")) {
+            Add-Failure "sql/bootstrap/001_catalog.sql: missing COMMENT ON COLUMN for pgl_validate.$tableName.$columnName."
+        }
+    }
+}
+
 if ($failures.Count -gt 0) {
     $failures | Sort-Object | ForEach-Object { Write-Output $_ }
     throw "Public comment checks found $($failures.Count) issue(s)."
