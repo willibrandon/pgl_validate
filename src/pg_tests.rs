@@ -546,6 +546,63 @@ mod tests {
     }
 
     #[pg_test]
+    fn generated_digest_sql_pins_text_fallback_gucs() {
+        let backend_pid = Spi::get_one::<i32>("SELECT pg_backend_pid()")
+            .unwrap()
+            .unwrap();
+        let domain_name = identifier(&format!("pgl_validate_tstz_domain_{backend_pid}"));
+        let table_name = identifier(&format!("pgl_validate_text_fallback_{backend_pid}"));
+
+        Spi::run(&format!(
+            "
+            CREATE DOMAIN public.{domain_name} AS timestamptz;
+            CREATE TABLE public.{table_name}(
+                id int PRIMARY KEY,
+                observed_at public.{domain_name}
+            );
+            INSERT INTO public.{table_name}
+            VALUES (1, '2026-06-27 01:02:03+00'::timestamptz);
+            "
+        ))
+        .unwrap();
+
+        let checksum_sql = Spi::get_one::<String>(&format!(
+            "
+            SELECT pgl_validate.plan_chunk_sql(
+                'public.{table_name}'::regclass,
+                ARRAY['id'],
+                NULL,
+                NULL,
+                ARRAY['observed_at'],
+                NULL,
+                NULL,
+                true
+            )
+            "
+        ))
+        .unwrap()
+        .unwrap();
+        assert!(checksum_sql.contains("set_config('TimeZone', 'UTC', true)"));
+        assert!(checksum_sql.contains("pgl_validate.row_digest('{2}'::int[]"));
+
+        Spi::run("SET LOCAL TimeZone = 'America/Los_Angeles'").unwrap();
+        let los_angeles_digest = Spi::get_one::<String>(&format!(
+            "SELECT encode(set_hash, 'hex') FROM ({checksum_sql}) AS checksum"
+        ))
+        .unwrap()
+        .unwrap();
+
+        Spi::run("SET LOCAL TimeZone = 'Asia/Tokyo'").unwrap();
+        let tokyo_digest = Spi::get_one::<String>(&format!(
+            "SELECT encode(set_hash, 'hex') FROM ({checksum_sql}) AS checksum"
+        ))
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(los_angeles_digest, tokyo_digest);
+    }
+
+    #[pg_test]
     fn compare_table_records_local_match_result() {
         Spi::run(
             r#"
