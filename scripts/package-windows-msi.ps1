@@ -101,10 +101,60 @@ function Test-PglWindowsPackageLayout {
     }
 }
 
+function Get-PglMsiProductCode {
+    <#
+    .SYNOPSIS
+        Reads ProductCode from an MSI database.
+    #>
+    param([string] $MsiPath)
+
+    $installer = New-Object -ComObject WindowsInstaller.Installer
+    $database = $installer.OpenDatabase((Resolve-Path $MsiPath).Path, 0)
+    $view = $database.OpenView("SELECT ``Value`` FROM ``Property`` WHERE ``Property`` = 'ProductCode'")
+    [void] $view.Execute()
+    $record = $view.Fetch()
+    if (-not $record) {
+        throw "Could not read ProductCode from $MsiPath."
+    }
+
+    return [string] $record.StringData(1)
+}
+
+function Get-PglMsiProductState {
+    <#
+    .SYNOPSIS
+        Reads the Windows Installer state for a product code.
+    #>
+    param([string] $ProductCode)
+
+    $installer = New-Object -ComObject WindowsInstaller.Installer
+    return $installer.ProductState($ProductCode)
+}
+
+function Get-PglMsiProductCodeFromUninstallEntry {
+    <#
+    .SYNOPSIS
+        Extracts an MSI product code from an uninstall registry entry.
+    #>
+    param($Entry)
+
+    if ($Entry.PSChildName -match '^\{[0-9A-Fa-f-]{36}\}$') {
+        return $Entry.PSChildName
+    }
+
+    foreach ($value in @($Entry.UninstallString, $Entry.QuietUninstallString)) {
+        if ($value -and $value -match '\{[0-9A-Fa-f-]{36}\}') {
+            return $matches[0]
+        }
+    }
+
+    return $null
+}
+
 function Assert-PglNoInstalledMsiProduct {
     <#
     .SYNOPSIS
-        Refuses verification when the same PG-major MSI product is already installed.
+        Refuses verification when the same PG-major MSI product is installed.
     #>
     $uninstallRoots = @(
         'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*',
@@ -114,7 +164,20 @@ function Assert-PglNoInstalledMsiProduct {
     $displayPattern = "pgl_validate * for PostgreSQL $PgMajor"
     $installed = foreach ($rootPath in $uninstallRoots) {
         Get-ItemProperty -Path $rootPath -ErrorAction SilentlyContinue |
-            Where-Object { $_.DisplayName -like $displayPattern } |
+            Where-Object {
+                if ($_.DisplayName -notlike $displayPattern) {
+                    $false
+                }
+                else {
+                    $productCode = Get-PglMsiProductCodeFromUninstallEntry -Entry $_
+                    if (-not $productCode) {
+                        $true
+                    }
+                    else {
+                        (Get-PglMsiProductState -ProductCode $productCode) -ne -1
+                    }
+                }
+            } |
             Select-Object -First 1
     }
 
@@ -134,6 +197,7 @@ function Invoke-PglMsiInstallVerification {
     $pgRoot = Join-Path $ArtifactDir "msi-verify-pg$PgMajor"
     $installLog = Join-Path $ArtifactDir "pgl_validate-pg$PgMajor-msi-install.log"
     $uninstallLog = Join-Path $ArtifactDir "pgl_validate-pg$PgMajor-msi-uninstall.log"
+    $productCode = Get-PglMsiProductCode -MsiPath $MsiPath
     Assert-PglNoInstalledMsiProduct
 
     if (Test-Path -LiteralPath $pgRoot) {
@@ -165,7 +229,7 @@ function Invoke-PglMsiInstallVerification {
 
     $uninstall = Start-Process `
         -FilePath 'msiexec.exe' `
-        -ArgumentList @('/x', $MsiPath, '/qn', '/norestart', '/l*v', $uninstallLog) `
+        -ArgumentList @('/x', $productCode, 'ALLUSERS=2', 'MSIINSTALLPERUSER=1', '/qn', '/norestart', '/l*v', $uninstallLog) `
         -Wait `
         -PassThru
     if ($uninstall.ExitCode -ne 0) {
@@ -173,6 +237,11 @@ function Invoke-PglMsiInstallVerification {
             Get-Content -LiteralPath $uninstallLog -Tail 80
         }
         throw "MSI uninstall failed with code $($uninstall.ExitCode)."
+    }
+
+    $productState = Get-PglMsiProductState -ProductCode $productCode
+    if ($productState -ne -1) {
+        throw "MSI uninstall left product $productCode in Windows Installer state $productState."
     }
 }
 
