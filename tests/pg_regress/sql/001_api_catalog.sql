@@ -37,6 +37,7 @@ FROM (
         ('pgl_validate.fence_timeout_ms', '1000'),
         ('pgl_validate.hash_algorithm', 'blake3_256'),
         ('pgl_validate.recheck_passes', '2'),
+        ('pgl_validate.require_barrier', 'on'),
         ('pgl_validate.split_fanout', '4')
 ) AS required_setting(name, setting)
 ORDER BY name;

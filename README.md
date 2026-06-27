@@ -126,6 +126,7 @@ SET pgl_validate.max_snapshot_age = '5min';
 SET pgl_validate.statement_timeout_per_chunk = '30s';
 SET pgl_validate.throttle_max_lag = 'off';
 SET pgl_validate.allow_approximate_filters = off;
+SET pgl_validate.require_barrier = on;
 SET pgl_validate.allow_degraded_fence = off;
 SET pgl_validate.correlate_conflict_history = on;
 SET pgl_validate.conflict_history_max_rows = 1000;

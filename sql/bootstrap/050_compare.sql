@@ -685,6 +685,11 @@ DECLARE
         NULLIF(current_setting('pgl_validate.allow_degraded_fence', true), '')::boolean,
         false
     );
+    require_barrier boolean := COALESCE(
+        (NULLIF(options->>'require_barrier', ''))::boolean,
+        NULLIF(current_setting('pgl_validate.require_barrier', true), '')::boolean,
+        true
+    );
     approximate_filter_mode boolean := false;
     sync_status "char" := 'r';
     validated_property text := 'full';
@@ -940,6 +945,7 @@ BEGIN
         RAISE EXCEPTION 'hash_algorithm % is not implemented; supported values are blake3_256, blake3_512', hash_algorithm
             USING ERRCODE = '0A000';
     END IF;
+    allow_degraded_fence := allow_degraded_fence OR NOT require_barrier;
     PERFORM set_config('pgl_validate.hash_algorithm', hash_algorithm, true);
     PERFORM set_config('pgl_validate.json_normalize', json_normalize::text, true);
     PERFORM set_config('pgl_validate.float_signed_zero_distinct', float_signed_zero_distinct::text, true);
@@ -969,6 +975,7 @@ BEGIN
             'paranoid_confirm', paranoid_confirm,
             'paranoid_confirm_max_rows', paranoid_confirm_max_rows,
             'recheck_passes', recheck_passes,
+            'require_barrier', require_barrier,
             'split_fanout', split_fanout,
             'statement_timeout_per_chunk', statement_timeout_per_chunk,
             'throttle_max_lag', throttle_max_lag_setting

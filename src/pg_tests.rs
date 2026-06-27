@@ -958,10 +958,16 @@ mod tests {
         )
         .unwrap();
 
+        let require_barrier_default = Spi::get_one::<String>("SHOW pgl_validate.require_barrier")
+            .unwrap()
+            .unwrap();
+        assert_eq!(require_barrier_default, "on");
+
         Spi::run(&format!(
             "
             SET LOCAL pgl_validate.chunk_target_rows = 2;
             SET LOCAL pgl_validate.recheck_passes = 2;
+            SET LOCAL pgl_validate.require_barrier = off;
             SET LOCAL pgl_validate.max_reported_tuple_bytes = 8192;
             SET LOCAL pgl_validate.max_reported_divergences = 1000;
             SET LOCAL pgl_validate.hash_algorithm = 'blake3_256';
@@ -1014,14 +1020,19 @@ mod tests {
                    (options->>'split_fanout') || ';' ||
                    (options->>'json_normalize') || ';' ||
                    (options->>'float_signed_zero_distinct') || ';' ||
-                   (options->>'float_nan_distinct')
+                   (options->>'float_nan_distinct') || ';' ||
+                   (options->>'require_barrier') || ';' ||
+                   (options->>'allow_degraded_fence')
             FROM pgl_validate.run
             WHERE run_id = {guc_run_id}
             "
         ))
         .unwrap()
         .unwrap();
-        assert_eq!(guc_run_options, "2;2;off;blake3_256;3;false;false;false");
+        assert_eq!(
+            guc_run_options,
+            "2;2;off;blake3_256;3;false;false;false;false;true"
+        );
 
         let override_run_id = Spi::get_one::<i64>(&format!(
             "
@@ -2178,33 +2189,41 @@ mod tests {
         ))
         .unwrap();
 
-        let evidence = Spi::get_one::<String>(&format!(
+        let compare_result = Spi::get_one::<String>(&format!(
             "
-            WITH compared AS (
-                SELECT pgl_validate.compare_table(
-                    'public.{table_name}'::regclass,
-                    ARRAY[]::text[]
-                ) AS result
+            SELECT run_id::text || ';' || verdict
+            FROM pgl_validate.compare_table(
+                'public.{table_name}'::regclass,
+                ARRAY[]::text[]
             )
-            SELECT (result).verdict || ';' ||
-                   EXISTS (
-                       SELECT 1
-                       FROM pgl_validate.schema_issue si
-                       WHERE si.run_id = (result).run_id
-                         AND si.table_name = {table_name_lit}
-                         AND si.node = 'local'
-                         AND si.issue_code = 'NONDETERMINISTIC_COLLATION'
-                         AND si.detail LIKE {collation_like}
-                         AND si.detail LIKE '%validation hashes canonical bytes%'
-                   )::text
-            FROM compared
+            "
+        ))
+        .unwrap()
+        .unwrap();
+        let (run_id, verdict) = compare_result
+            .split_once(';')
+            .expect("compare_table result should include run id and verdict");
+        assert_eq!(verdict, "match");
+
+        let has_advisory = Spi::get_one::<bool>(&format!(
+            "
+            SELECT EXISTS (
+                SELECT 1
+                FROM pgl_validate.schema_issue si
+                WHERE si.run_id = {run_id}
+                  AND si.table_name = {table_name_lit}
+                  AND si.node = 'local'
+                  AND si.issue_code = 'NONDETERMINISTIC_COLLATION'
+                  AND si.detail LIKE {collation_like}
+                  AND si.detail LIKE '%validation hashes canonical bytes%'
+            )
             ",
             table_name_lit = sql_literal(&table_name),
             collation_like = sql_literal(&format!("%{collation_name}%"))
         ))
         .unwrap()
         .unwrap();
-        assert_eq!(evidence, "match;true");
+        assert!(has_advisory);
     }
 
     #[pg_test]

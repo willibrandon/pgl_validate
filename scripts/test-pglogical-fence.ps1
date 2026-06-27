@@ -967,7 +967,7 @@ FROM pgl_validate.compare_table(
         'provider_dsn', $providerDsnSql,
         'provider_node', 'provider',
         'repsets', jsonb_build_array('default'),
-        'allow_degraded_fence', true,
+        'require_barrier', false,
         'fence_timeout_ms', 30000,
         'fence_poll_interval_ms', 100
     )

@@ -82,6 +82,7 @@ static JSON_NORMALIZE: GucSetting<bool> = GucSetting::<bool>::new(false);
 static FLOAT_SIGNED_ZERO_DISTINCT: GucSetting<bool> = GucSetting::<bool>::new(false);
 static FLOAT_NAN_DISTINCT: GucSetting<bool> = GucSetting::<bool>::new(false);
 static ALLOW_APPROXIMATE_FILTERS: GucSetting<bool> = GucSetting::<bool>::new(false);
+static REQUIRE_BARRIER: GucSetting<bool> = GucSetting::<bool>::new(true);
 static ALLOW_DEGRADED_FENCE: GucSetting<bool> = GucSetting::<bool>::new(false);
 static CHUNK_TARGET_ROWS: GucSetting<i32> = GucSetting::<i32>::new(50000);
 static CHUNK_MAX_DURATION: GucSetting<Option<CString>> =
@@ -230,6 +231,14 @@ pub extern "C-unwind" fn _PG_init() {
         c"Allow degraded pglogical fences.",
         c"Permit explicit best-effort fencing when a pglogical edge cannot carry barrier tokens; results are never exact.",
         &ALLOW_DEGRADED_FENCE,
+        GucContext::Userset,
+        flags,
+    );
+    GucRegistry::define_bool_guc(
+        c"pgl_validate.require_barrier",
+        c"Require exact barrier fences.",
+        c"Abort pglogical edges that cannot carry barrier tokens unless degraded fencing is explicitly allowed.",
+        &REQUIRE_BARRIER,
         GucContext::Userset,
         flags,
     );
