@@ -3895,6 +3895,163 @@ mod tests {
     }
 
     #[pg_test]
+    fn compare_table_compares_multiple_remote_peers_in_one_run() {
+        let backend_pid = Spi::get_one::<i32>("SELECT pg_backend_pid()")
+            .unwrap()
+            .unwrap();
+        let peer_a_db = identifier(&format!("pgl_validate_nway_a_{backend_pid}"));
+        let peer_b_db = identifier(&format!("pgl_validate_nway_b_{backend_pid}"));
+        let table_name = identifier(&format!("nway_compare_target_{backend_pid}"));
+        let peer_a_name = identifier(&format!("remote_nway_a_{backend_pid}"));
+        let peer_b_name = identifier(&format!("remote_nway_b_{backend_pid}"));
+        let local_dsn = local_dsn();
+        let peer_a_dsn = peer_dsn(&peer_a_db);
+        let peer_b_dsn = peer_dsn(&peer_b_db);
+
+        let _ = crate::transport::libpq::execute_command(
+            &local_dsn,
+            &format!("DROP DATABASE IF EXISTS {peer_a_db} WITH (FORCE)"),
+        );
+        let _ = crate::transport::libpq::execute_command(
+            &local_dsn,
+            &format!("DROP DATABASE IF EXISTS {peer_b_db} WITH (FORCE)"),
+        );
+        crate::transport::libpq::execute_command(
+            &local_dsn,
+            &format!("CREATE DATABASE {peer_a_db}"),
+        )
+        .unwrap();
+        crate::transport::libpq::execute_command(
+            &local_dsn,
+            &format!("CREATE DATABASE {peer_b_db}"),
+        )
+        .unwrap();
+
+        crate::transport::libpq::execute_command(
+            &peer_a_dsn,
+            &format!(
+                "CREATE EXTENSION pgl_validate;
+                 CREATE TABLE public.{table_name}(id int PRIMARY KEY, value text);
+                 INSERT INTO public.{table_name} VALUES
+                     (1, 'local'),
+                     (2, 'shared');"
+            ),
+        )
+        .unwrap();
+        crate::transport::libpq::execute_command(
+            &peer_b_dsn,
+            &format!(
+                "CREATE EXTENSION pgl_validate;
+                 CREATE TABLE public.{table_name}(id int PRIMARY KEY, value text);
+                 INSERT INTO public.{table_name} VALUES
+                     (1, 'remote'),
+                     (3, 'peer-only');"
+            ),
+        )
+        .unwrap();
+
+        Spi::run(&format!(
+            "
+            DELETE FROM pgl_validate.peer WHERE name IN ({peer_a_name}, {peer_b_name});
+            CREATE TABLE public.{table_name}(id int PRIMARY KEY, value text);
+            INSERT INTO public.{table_name} VALUES
+                (1, 'local'),
+                (2, 'shared');
+            INSERT INTO pgl_validate.peer(name, dsn, backend)
+            VALUES
+                ({peer_a_name}, {peer_a_dsn}, 'native'),
+                ({peer_b_name}, {peer_b_dsn}, 'native');
+            ",
+            peer_a_name = sql_literal(&peer_a_name),
+            peer_b_name = sql_literal(&peer_b_name),
+            peer_a_dsn = sql_literal(&peer_a_dsn),
+            peer_b_dsn = sql_literal(&peer_b_dsn)
+        ))
+        .unwrap();
+
+        let run_id = Spi::get_one::<i64>(&format!(
+            "
+            SELECT run_id
+            FROM pgl_validate.compare_table(
+                'public.{table_name}'::regclass,
+                ARRAY[{peer_a_name}, {peer_b_name}],
+                '{{\"chunk_target_rows\":10}}'::jsonb
+            )
+            ",
+            peer_a_name = sql_literal(&peer_a_name),
+            peer_b_name = sql_literal(&peer_b_name)
+        ))
+        .unwrap()
+        .unwrap();
+
+        let table_state = Spi::get_one::<String>(&format!(
+            "
+            SELECT tr.verdict || ';' ||
+                   string_agg(tnr.node || ':' || tnr.n_rows::text, ',' ORDER BY tnr.node)
+            FROM pgl_validate.table_result tr
+            JOIN pgl_validate.table_node_result tnr
+              USING (run_id, schema_name, table_name)
+            WHERE tr.run_id = {run_id}
+              AND tr.table_name = {table_name}
+            GROUP BY tr.verdict
+            ",
+            table_name = sql_literal(&table_name)
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            table_state,
+            format!("differ;local:2,{peer_a_name}:2,{peer_b_name}:2")
+        );
+
+        let root_chunk_state = Spi::get_one::<String>(&format!(
+            "
+            SELECT cr.state || ';' ||
+                   string_agg(cnr.node, ',' ORDER BY cnr.node)
+            FROM pgl_validate.chunk_result cr
+            JOIN pgl_validate.chunk_node_result cnr
+              USING (run_id, schema_name, table_name, chunk_id)
+            WHERE cr.run_id = {run_id}
+              AND cr.table_name = {table_name}
+              AND cr.chunk_id = 1
+            GROUP BY cr.state
+            ",
+            table_name = sql_literal(&table_name)
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            root_chunk_state,
+            format!("divergent;local,{peer_a_name},{peer_b_name}")
+        );
+
+        let divergence_summary = Spi::get_one::<String>(&format!(
+            "
+            SELECT string_agg(node || ':' || classification || ':' || status, ',' ORDER BY classification)
+            FROM pgl_validate.divergence
+            WHERE run_id = {run_id}
+            "
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            divergence_summary,
+            format!(
+                "{peer_b_name}:differs:confirmed,{peer_b_name}:extra_on:confirmed,{peer_b_name}:missing_on:confirmed"
+            )
+        );
+
+        let _ = crate::transport::libpq::execute_command(
+            &local_dsn,
+            &format!("DROP DATABASE IF EXISTS {peer_a_db} WITH (FORCE)"),
+        );
+        let _ = crate::transport::libpq::execute_command(
+            &local_dsn,
+            &format!("DROP DATABASE IF EXISTS {peer_b_db} WITH (FORCE)"),
+        );
+    }
+
+    #[pg_test]
     fn compare_table_caps_reported_divergent_tuple_payloads() {
         let backend_pid = Spi::get_one::<i32>("SELECT pg_backend_pid()")
             .unwrap()
