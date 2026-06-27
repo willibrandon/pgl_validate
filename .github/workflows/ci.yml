@@ -41,6 +41,50 @@ jobs:
       - name: Check scripts
         run: pwsh -NoProfile -ExecutionPolicy Bypass -File ./scripts/check-powershell.ps1
 
+      - name: Smoke-test release asset contract
+        run: |
+          $assetDir = Join-Path $env:RUNNER_TEMP 'pgl_validate-release-assets'
+          if (Test-Path -LiteralPath $assetDir) {
+            Remove-Item -LiteralPath $assetDir -Recurse -Force
+          }
+          New-Item -ItemType Directory -Force -Path $assetDir | Out-Null
+
+          $version = '0.1.0'
+          $pgMajors = 15, 16, 17, 18
+          $platforms = @(
+            'linux-x64',
+            'linux-arm64',
+            'windows-x64',
+            'windows-arm64-hosted-x64',
+            'macos-arm64'
+          )
+
+          foreach ($pg in $pgMajors) {
+            foreach ($platform in $platforms) {
+              $extension = if ($platform -like 'windows-*') { '.zip' } else { '.tar.gz' }
+              $name = "pgl_validate-$version-pg$pg-$platform$extension"
+              Set-Content -LiteralPath (Join-Path $assetDir $name) -Value $name -Encoding ascii
+            }
+
+            $msi = "pgl_validate-$version-pg$pg-windows-x64.msi"
+            Set-Content -LiteralPath (Join-Path $assetDir $msi) -Value $msi -Encoding ascii
+          }
+
+          Push-Location $assetDir
+          try {
+            Get-FileHash -Algorithm SHA256 -LiteralPath (Get-ChildItem -File | Select-Object -ExpandProperty FullName) |
+              ForEach-Object { "$($_.Hash.ToLowerInvariant())  $([IO.Path]::GetFileName($_.Path))" } |
+              Set-Content -LiteralPath 'checksums.txt' -Encoding ascii
+          }
+          finally {
+            Pop-Location
+          }
+
+          pwsh -NoProfile -ExecutionPolicy Bypass -File ./scripts/check-release-assets.ps1 `
+            -AssetDirectory $assetDir `
+            -Version "v$version" `
+            -RequireChecksums
+
   design-check:
     name: design catalog DDL
     runs-on: ubuntu-24.04
