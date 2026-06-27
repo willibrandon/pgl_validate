@@ -646,7 +646,7 @@ Repair is **opt-in, single-target, transactional, locked, FK-ordered, and explic
 
 ### 18.1 Generate
 
-`generate_repair(run_id, authoritative)` emits the minimal DML to reconcile each non-authoritative node to `authoritative` for **confirmed** divergent keys only, and only those that are divergences *under the table's validated property* (§9.4) — e.g. it never "fixes" `extra_on(sub)` for a `superset`/`keys_only` contract, and for `keys_only` it reconciles key presence, not content. It emits `INSERT` for `missing_on`, `DELETE` for `extra_on` (full contract only), `UPDATE` for `differs`, using canonical values. Output is reviewable text; nothing is applied.
+`generate_repair(run_id, authoritative)` emits the minimal DML to reconcile each non-authoritative node to `authoritative` for **confirmed** divergent keys only, and only those that are divergences *under the table's validated property* (§9.4). For `superset`, subscriber extras are contract-permitted and are advisory/no-op. For `keys_only`, repair reconciles key presence only: `missing_on` becomes `INSERT`, and `extra_on` becomes `DELETE` only when delete/truncate are part of the replicated contract; content drift remains out of scope because updates are not replicated. For `full`, `differs` becomes `UPDATE`. Output is reviewable text; nothing is applied.
 
 ### 18.2 Origin model and loop prevention (the complete specification)
 
