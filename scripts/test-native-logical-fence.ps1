@@ -600,23 +600,74 @@ GROUP BY tp.validated_property, tp.has_row_filter
     }
 
     Write-Step 'Validating native mid-sync table is skipped before fencing'
-    $nativeSyncMarked = Invoke-Sql -Database 'target' -Sql @"
+    Invoke-Sql -Database 'provider' -Sql @"
+CREATE TABLE public.native_mid_sync_accounts(id int PRIMARY KEY, value text);
+ALTER TABLE public.native_mid_sync_accounts REPLICA IDENTITY FULL;
+ALTER PUBLICATION app_pub ADD TABLE public.native_mid_sync_accounts;
+"@ | Out-Null
+
+    Invoke-Sql -Database 'target' -Sql 'CREATE TABLE public.native_mid_sync_accounts(id int PRIMARY KEY, value text)' | Out-Null
+    Invoke-Sql -Database 'target' -Sql 'ALTER SUBSCRIPTION native_sub REFRESH PUBLICATION WITH (copy_data = false)' | Out-Null
+    $null = Wait-NativeSubscriptionReady `
+        -SubscriberDatabase 'target' `
+        -SubscriptionName 'native_sub' `
+        -ProviderDatabase 'provider' `
+        -MinReadyRelations 3 `
+        -TimeoutSeconds $TimeoutSeconds
+
+    $midSyncLock = $null
+    try {
+        $lockStartInfo = [System.Diagnostics.ProcessStartInfo]::new()
+        $lockStartInfo.FileName = $script:Psql
+        $lockStartInfo.UseShellExecute = $false
+        $lockStartInfo.CreateNoWindow = $true
+        foreach ($argument in @(
+                '-h', '127.0.0.1',
+                '-p', [string] $script:Port,
+                '-U', 'postgres',
+                '-d', 'target',
+                '-v', 'ON_ERROR_STOP=1',
+                '-X',
+                '-q',
+                '-c', "BEGIN; LOCK TABLE public.native_mid_sync_accounts IN ACCESS EXCLUSIVE MODE; SELECT pg_sleep($TimeoutSeconds);"
+            )) {
+            [void] $lockStartInfo.ArgumentList.Add($argument)
+        }
+        $midSyncLock = [System.Diagnostics.Process]::Start($lockStartInfo)
+
+        Wait-SqlEqual `
+            -Database 'target' `
+            -Sql @"
+SELECT count(*)::text
+FROM pg_locks l
+WHERE l.relation = 'public.native_mid_sync_accounts'::regclass
+  AND l.mode = 'AccessExclusiveLock'
+  AND l.granted
+"@ `
+            -Expected '1' `
+            -TimeoutSeconds $TimeoutSeconds
+
+        if ($midSyncLock.HasExited) {
+            throw "native mid-sync table lock holder exited early with code $($midSyncLock.ExitCode)"
+        }
+
+        $nativeSyncMarked = Invoke-Sql -Database 'target' -Sql @"
 UPDATE pg_subscription_rel sr
 SET srsubstate = 'd'
 FROM pg_subscription s
 WHERE sr.srsubid = s.oid
   AND s.subname = 'native_sub'::name
-  AND sr.srrelid = 'public.accounts'::regclass
+  AND sr.srrelid = 'public.native_mid_sync_accounts'::regclass
 RETURNING 1
 "@
-    if ($nativeSyncMarked -ne '1') {
-        throw "could not mark native table sync status as d: $nativeSyncMarked"
-    }
+        if ($nativeSyncMarked -ne '1') {
+            throw "could not mark native table sync status as d: $nativeSyncMarked"
+        }
 
-    $midSyncResult = Invoke-Sql -Database 'provider' -Sql @"
+        $midSyncResult = Invoke-Sql -Database 'provider' -Sql @"
 SELECT run_id::text || ';' || verdict || ';' || reason
 FROM pgl_validate.compare_table(
-    'public.accounts'::regclass,
+    'public.native_mid_sync_accounts'::regclass,
     ARRAY['target'],
     jsonb_build_object(
         'backend', 'native',
@@ -628,18 +679,18 @@ FROM pgl_validate.compare_table(
     )
 )
 "@
-    $midSyncParts = $midSyncResult.Split(';', 3)
-    if ($midSyncParts.Count -ne 3) {
-        throw "unexpected native mid-sync compare_table result: $midSyncResult"
-    }
-    $midSyncRunId = $midSyncParts[0]
-    $midSyncVerdict = $midSyncParts[1]
-    $midSyncReason = $midSyncParts[2]
-    if ($midSyncVerdict -ne 'partial' -or -not $midSyncReason.Contains('sync_status=d')) {
-        throw "native mid-sync table was not reported as partial/skipped: $midSyncResult"
-    }
+        $midSyncParts = $midSyncResult.Split(';', 3)
+        if ($midSyncParts.Count -ne 3) {
+            throw "unexpected native mid-sync compare_table result: $midSyncResult"
+        }
+        $midSyncRunId = $midSyncParts[0]
+        $midSyncVerdict = $midSyncParts[1]
+        $midSyncReason = $midSyncParts[2]
+        if ($midSyncVerdict -ne 'partial' -or -not $midSyncReason.Contains('sync_status=d')) {
+            throw "native mid-sync table was not reported as partial/skipped: $midSyncResult"
+        }
 
-    $nativeSyncEvidence = Invoke-Sql -Database 'provider' -Sql @"
+        $nativeSyncEvidence = Invoke-Sql -Database 'provider' -Sql @"
 SELECT
     EXISTS (
         SELECT 1
@@ -653,6 +704,7 @@ SELECT
         FROM pgl_validate.schema_issue
         WHERE run_id = $midSyncRunId
           AND node = 'target'
+          AND table_name = 'native_mid_sync_accounts'
           AND issue_code = 'SYNC_NOT_READY'
           AND detail LIKE '%sync_status=d%'
     )::text || ';' ||
@@ -660,22 +712,39 @@ SELECT
         SELECT 1
         FROM pgl_validate.table_result
         WHERE run_id = $midSyncRunId
+          AND table_name = 'native_mid_sync_accounts'
           AND verdict = 'partial'
           AND reason LIKE '%sync_status=d%'
     )::text
 "@
-    if ($nativeSyncEvidence -ne 'true;true;true') {
-        throw "native mid-sync skip evidence was incomplete: $nativeSyncEvidence"
+        if ($nativeSyncEvidence -ne 'true;true;true') {
+            throw "native mid-sync skip evidence was incomplete: $nativeSyncEvidence"
+        }
     }
-
-    Invoke-Sql -Database 'target' -Sql @"
+    finally {
+        Invoke-Sql -Database 'target' -Sql @"
 UPDATE pg_subscription_rel sr
 SET srsubstate = 'r'
 FROM pg_subscription s
 WHERE sr.srsubid = s.oid
   AND s.subname = 'native_sub'::name
-  AND sr.srrelid = 'public.accounts'::regclass
+  AND sr.srrelid = 'public.native_mid_sync_accounts'::regclass
 "@ | Out-Null
+
+        if ($midSyncLock) {
+            if (-not $midSyncLock.HasExited) {
+                Stop-ProcessTree -ProcessId $midSyncLock.Id
+            }
+            $midSyncLock.Dispose()
+        }
+    }
+
+    $null = Wait-NativeSubscriptionReady `
+        -SubscriberDatabase 'target' `
+        -SubscriptionName 'native_sub' `
+        -ProviderDatabase 'provider' `
+        -MinReadyRelations 3 `
+        -TimeoutSeconds $TimeoutSeconds
 
     Write-Step 'Creating subscriber-side drift and confirming native recheck fencing'
     Invoke-Sql -Database 'target' -Sql "UPDATE public.accounts SET value = 'target-drift' WHERE id = 1" | Out-Null
