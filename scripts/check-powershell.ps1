@@ -40,3 +40,5 @@ if ($failures.Count -gt 0) {
 }
 
 Write-Output 'PowerShell script checks passed.'
+
+& (Join-Path $PSScriptRoot 'check-public-comments.ps1') -Root (Split-Path -Parent $PSScriptRoot)

@@ -50,5 +50,8 @@ Generated packages are written under `target` and are ignored by git.
 `check-design-catalog-ddl.ps1` verifies that Appendix A in `docs/design.md`
 matches the authoritative catalog DDL in `sql/bootstrap/001_catalog.sql`.
 
+`check-public-comments.ps1` verifies that PostgreSQL-visible objects have
+`COMMENT ON` coverage and public Rust items have rustdoc.
+
 `check-powershell.ps1` parses every script and runs PSScriptAnalyzer with
-warnings treated as failures.
+warnings treated as failures, then runs the public-comment check.
