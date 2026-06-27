@@ -80,7 +80,10 @@ Windows ARM64-hosted x64, and macOS ARM64 runners. Intel macOS is intentionally
 excluded. Native Windows ARM64 PostgreSQL is not scheduled because PostgreSQL
 15-18 do not ship a supported native Windows ARM64 CI build path here. The pgrx
 pg_test, pglogical integration, and mixed-major pglogical jobs install the fork
-release package or source release for each target.
+release package or source release for each target. A separate vanilla
+pglogical lane builds upstream `2ndQuadrant/pglogical` from the pinned release
+source on Linux and macOS; Windows pglogical coverage uses the fork because the
+upstream release does not publish Windows packages or a CMake/MSVC source build.
 
 Native logical replication coverage uses PostgreSQL's built-in publication and
 subscription machinery:

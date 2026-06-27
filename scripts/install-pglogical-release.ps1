@@ -4,6 +4,10 @@ param(
 
     [string] $Version = '2.5.3',
 
+    [string] $Repository = 'willibrandon/pglogical',
+
+    [string] $ExpectedCommit,
+
     [string] $PgConfig,
 
     [ValidateSet('auto', 'package', 'source')]
@@ -48,6 +52,82 @@ function Get-PglogicalPackageAsset {
     }
 
     return $null
+}
+
+<#
+.SYNOPSIS
+Returns the GitHub release tag name for the selected pglogical repository.
+#>
+function Get-PglogicalReleaseTag {
+    param(
+        [string] $Repository,
+        [string] $Version
+    )
+
+    if ($Repository -eq 'willibrandon/pglogical') {
+        return "v$Version"
+    }
+
+    return $Version
+}
+
+<#
+.SYNOPSIS
+Returns the commit SHA referenced by a GitHub tag or branch.
+#>
+function Get-GitHubRefCommit {
+    param(
+        [string] $Repository,
+        [string] $Ref
+    )
+
+    $headers = @{ 'User-Agent' = 'pgl_validate-ci/1.0' }
+    $refUri = "https://api.github.com/repos/$Repository/git/ref/tags/$Ref"
+    try {
+        $refObject = Invoke-RestMethod -Uri $refUri -Headers $headers
+    }
+    catch {
+        $refUri = "https://api.github.com/repos/$Repository/git/ref/heads/$Ref"
+        $refObject = Invoke-RestMethod -Uri $refUri -Headers $headers
+    }
+
+    if ($refObject.object.type -eq 'commit') {
+        return $refObject.object.sha
+    }
+
+    if ($refObject.object.type -eq 'tag') {
+        $tagObject = Invoke-RestMethod -Uri $refObject.object.url -Headers $headers
+        if ($tagObject.object.type -ne 'commit') {
+            throw "$Repository ref $Ref resolves to unsupported Git object type '$($tagObject.object.type)'."
+        }
+
+        return $tagObject.object.sha
+    }
+
+    throw "$Repository ref $Ref resolves to unsupported Git object type '$($refObject.object.type)'."
+}
+
+<#
+.SYNOPSIS
+Downloads and validates a GitHub source tarball for repositories without release assets.
+#>
+function Save-GitHubSourceArchive {
+    param(
+        [string] $Repository,
+        [string] $Ref,
+        [string] $ExpectedCommit,
+        [string] $Destination
+    )
+
+    $commit = Get-GitHubRefCommit -Repository $Repository -Ref $Ref
+    if (-not [string]::IsNullOrWhiteSpace($ExpectedCommit) -and
+        -not [StringComparer]::OrdinalIgnoreCase.Equals($commit, $ExpectedCommit)) {
+        throw "$Repository ref $Ref points to $commit, expected $ExpectedCommit."
+    }
+
+    $tarballUri = "https://api.github.com/repos/$Repository/tarball/$Ref"
+    Invoke-WebRequest -Uri $tarballUri -OutFile $Destination -UserAgent 'pgl_validate-ci/1.0'
+    Write-Host "Downloaded $Repository@$Ref ($commit)"
 }
 
 function Save-CheckedReleaseAsset {
@@ -382,15 +462,18 @@ if ($pgVersion -notmatch "PostgreSQL\s+$PgMajor\.") {
     throw "$PgConfig reports '$pgVersion', not PostgreSQL $PgMajor.x"
 }
 
-if (Test-PglogicalInstalled -PgConfig $PgConfig -Version $Version) {
+$releaseTag = Get-PglogicalReleaseTag -Repository $Repository -Version $Version
+$markerVersion = "$Repository@$releaseTag"
+
+if (Test-PglogicalInstalled -PgConfig $PgConfig -Version $markerVersion) {
     Update-PglogicalMacDylibReferences -PgConfig $PgConfig
     Assert-PglogicalInstalled -PgConfig $PgConfig
-    Write-Host "pglogical $Version is already installed for $pgVersion"
+    Write-Host "pglogical $markerVersion is already installed for $pgVersion"
     Write-Host "pg_config: $PgConfig"
     return
 }
 
-$baseUri = "https://github.com/willibrandon/pglogical/releases/download/v$Version"
+$baseUri = "https://github.com/$Repository/releases/download/$releaseTag"
 $workDir = Join-Path ([IO.Path]::GetTempPath()) "pgl_validate-pglogical-$([guid]::NewGuid())"
 $checksumsPath = Join-Path $workDir 'checksums.txt'
 $extractDir = Join-Path $workDir 'extract'
@@ -398,9 +481,14 @@ $extractDir = Join-Path $workDir 'extract'
 New-Item -ItemType Directory -Path $workDir, $extractDir | Out-Null
 
 try {
-    Invoke-WebRequest -Uri "$baseUri/checksums.txt" -OutFile $checksumsPath
+    if ($Repository -eq 'willibrandon/pglogical') {
+        Invoke-WebRequest -Uri "$baseUri/checksums.txt" -OutFile $checksumsPath
+    }
+    elseif ($InstallMode -ne 'source') {
+        throw "$Repository does not provide pgl_validate release packages; use -InstallMode source."
+    }
 
-    $asset = if ($InstallMode -eq 'source') {
+    $asset = if ($InstallMode -eq 'source' -or $Repository -ne 'willibrandon/pglogical') {
         $null
     }
     else {
@@ -419,16 +507,30 @@ try {
         throw "No pglogical $Version package is published for this host (OS=$([Runtime.InteropServices.RuntimeInformation]::OSDescription), Architecture=$architecture)."
     }
     else {
-        $asset = "pglogical-$Version-source.tar.gz"
+        $asset = if ($Repository -eq 'willibrandon/pglogical') {
+            "pglogical-$Version-source.tar.gz"
+        }
+        else {
+            "pglogical-$Version-github-source.tar.gz"
+        }
         $archivePath = Join-Path $workDir $asset
-        Save-CheckedReleaseAsset -BaseUri $baseUri -Asset $asset -Destination $archivePath -ChecksumsPath $checksumsPath
+        if ($Repository -eq 'willibrandon/pglogical') {
+            Save-CheckedReleaseAsset -BaseUri $baseUri -Asset $asset -Destination $archivePath -ChecksumsPath $checksumsPath
+        }
+        else {
+            Save-GitHubSourceArchive `
+                -Repository $Repository `
+                -Ref $releaseTag `
+                -ExpectedCommit $ExpectedCommit `
+                -Destination $archivePath
+        }
         Expand-ReleaseAsset -ArchivePath $archivePath -ExtractDir $extractDir
         Install-PglogicalSource -ExtractDir $extractDir -PgConfig $PgConfig
-        Write-Host "Built and installed pglogical $Version from source for $pgVersion"
+        Write-Host "Built and installed pglogical $markerVersion from source for $pgVersion"
     }
 
     Assert-PglogicalInstalled -PgConfig $PgConfig
-    Set-PglogicalInstallMarker -PgConfig $PgConfig -Version $Version
+    Set-PglogicalInstallMarker -PgConfig $PgConfig -Version $markerVersion
     Write-Host "pg_config: $PgConfig"
 } finally {
     Remove-Item -LiteralPath $workDir -Recurse -Force -ErrorAction SilentlyContinue

@@ -20,6 +20,9 @@ env:
   CARGO_HTTP_TIMEOUT: "120"
   CARGO_NET_RETRY: "10"
   PGL_VALIDATE_PGLOGICAL_VERSION: "2.5.3"
+  PGL_VALIDATE_UPSTREAM_PGLOGICAL_COMMIT: "ba94ce240e39054550d5587a236154c4bcbe602f"
+  PGL_VALIDATE_UPSTREAM_PGLOGICAL_REPOSITORY: "2ndQuadrant/pglogical"
+  PGL_VALIDATE_UPSTREAM_PGLOGICAL_VERSION: "REL2_4_7"
   RUST_BACKTRACE: "1"
 
 jobs:
@@ -207,6 +210,68 @@ jobs:
       - name: Run pglogical fence harness
         env:
           PGL_VALIDATE_MSVC_ARCH: ${{ matrix.target.msvc_arch }}
+        run: ./scripts/pgrx-vs.ps1 pwsh -NoProfile -ExecutionPolicy Bypass -File ./scripts/test-pglogical-fence.ps1 -PgMajor ${{ matrix.pg }} -TimeoutSeconds 300
+
+      - name: Clean test clusters
+        if: always()
+        run: pwsh -NoProfile -ExecutionPolicy Bypass -File ./scripts/stop-pgrx-test-clusters.ps1 -RemoveData
+
+  pglogical-vanilla:
+    name: vanilla pglogical pg${{ matrix.pg }} / ${{ matrix.target.platform }}
+    runs-on: ${{ matrix.target.os }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: [15, 16, 17, 18]
+        target:
+          - os: ubuntu-24.04
+            platform: linux-x64
+          - os: ubuntu-24.04-arm
+            platform: linux-arm64
+          - os: macos-26
+            platform: macos-arm64
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustc --version
+          cargo --version
+
+      - name: Cache cargo artifacts
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/bin/cargo-pgrx*
+            ~/.cargo/.crates.toml
+            ~/.cargo/.crates2.json
+            ~/.pgrx
+            target
+          key: cargo-pglogical-vanilla-pg${{ matrix.pg }}-${{ matrix.target.platform }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-pglogical-vanilla-pg${{ matrix.pg }}-${{ matrix.target.platform }}-
+
+      - name: Set up PostgreSQL and pgrx
+        run: ./scripts/pgrx-vs.ps1 pwsh -NoProfile -ExecutionPolicy Bypass -File ./scripts/ci-setup.ps1 -PgMajor ${{ matrix.pg }}
+
+      - name: Install vanilla pglogical source
+        run: >
+          ./scripts/pgrx-vs.ps1 pwsh -NoProfile -ExecutionPolicy Bypass
+          -File ./scripts/install-pglogical-release.ps1
+          -PgMajor ${{ matrix.pg }}
+          -Repository $env:PGL_VALIDATE_UPSTREAM_PGLOGICAL_REPOSITORY
+          -Version $env:PGL_VALIDATE_UPSTREAM_PGLOGICAL_VERSION
+          -ExpectedCommit $env:PGL_VALIDATE_UPSTREAM_PGLOGICAL_COMMIT
+          -InstallMode source
+
+      - name: Run pglogical fence harness
         run: ./scripts/pgrx-vs.ps1 pwsh -NoProfile -ExecutionPolicy Bypass -File ./scripts/test-pglogical-fence.ps1 -PgMajor ${{ matrix.pg }} -TimeoutSeconds 300
 
       - name: Clean test clusters
