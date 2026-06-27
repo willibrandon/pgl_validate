@@ -603,6 +603,137 @@ mod tests {
     }
 
     #[pg_test]
+    fn generated_checksum_sql_covers_common_scalar_container_and_composite_types() {
+        let backend_pid = Spi::get_one::<i32>("SELECT pg_backend_pid()")
+            .unwrap()
+            .unwrap();
+        let composite_name = identifier(&format!("pgl_validate_type_matrix_{backend_pid}"));
+        let table_name = identifier(&format!("pgl_validate_type_matrix_target_{backend_pid}"));
+
+        Spi::run(&format!(
+            "
+            CREATE TYPE public.{composite_name} AS (amount numeric, label text);
+            CREATE TABLE public.{table_name}(
+                id int PRIMARY KEY,
+                amount numeric(18,6) NOT NULL,
+                bounds int4range NOT NULL,
+                bytes bytea NOT NULL,
+                duration interval NOT NULL,
+                ip inet NOT NULL,
+                observed_at timestamptz NOT NULL,
+                payload json NOT NULL,
+                payloadb jsonb NOT NULL,
+                point_value point NOT NULL,
+                shaped public.{composite_name} NOT NULL,
+                tags text[] NOT NULL,
+                uid uuid NOT NULL
+            );
+
+            INSERT INTO public.{table_name}
+            VALUES (
+                1,
+                12.345600,
+                int4range(1, 5, '[)'),
+                decode('00ff10', 'hex'),
+                interval '1 day 02:03:04.500',
+                inet '2001:db8::1/64',
+                TIMESTAMPTZ '2026-06-27 01:02:03.456+00',
+                '{{\"kind\":\"exact\",\"items\":[1,2,3]}}'::json,
+                '{{\"kind\":\"canonical\",\"items\":[1,2,3]}}'::jsonb,
+                point '(1.5,2.5)',
+                ROW(12.345600, 'same')::public.{composite_name},
+                ARRAY['alpha','beta']::text[],
+                '00000000-0000-0000-0000-000000000001'::uuid
+            );
+            "
+        ))
+        .unwrap();
+
+        let checksum_sql = Spi::get_one::<String>(&format!(
+            "
+            SELECT pgl_validate.plan_chunk_sql(
+                'public.{table_name}'::regclass,
+                ARRAY['id'],
+                NULL,
+                NULL,
+                ARRAY[
+                    'amount',
+                    'bounds',
+                    'bytes',
+                    'duration',
+                    'ip',
+                    'observed_at',
+                    'payload',
+                    'payloadb',
+                    'point_value',
+                    'shaped',
+                    'tags',
+                    'uid'
+                ],
+                NULL,
+                NULL,
+                true
+            )
+            "
+        ))
+        .unwrap()
+        .unwrap();
+
+        assert!(checksum_sql.contains("set_config('DateStyle', 'ISO, YMD', true)"));
+        assert!(checksum_sql.contains("set_config('IntervalStyle', 'iso_8601', true)"));
+        assert!(checksum_sql.contains("set_config('TimeZone', 'UTC', true)"));
+        assert!(checksum_sql.contains("set_config('bytea_output', 'hex', true)"));
+        assert!(checksum_sql.contains("pgl_validate.row_digest("));
+        assert!(checksum_sql.contains("t.shaped"));
+
+        Spi::run(
+            "
+            SET LOCAL DateStyle = 'SQL, DMY';
+            SET LOCAL IntervalStyle = 'postgres';
+            SET LOCAL TimeZone = 'America/Los_Angeles';
+            SET LOCAL bytea_output = 'escape';
+            ",
+        )
+        .unwrap();
+        let hostile_guc_digest = Spi::get_one::<String>(&format!(
+            "SELECT encode(set_hash, 'hex') FROM ({checksum_sql}) AS checksum"
+        ))
+        .unwrap()
+        .unwrap();
+
+        Spi::run(
+            "
+            SET LOCAL DateStyle = 'German, DMY';
+            SET LOCAL IntervalStyle = 'sql_standard';
+            SET LOCAL TimeZone = 'Asia/Tokyo';
+            SET LOCAL bytea_output = 'hex';
+            ",
+        )
+        .unwrap();
+        let alternate_guc_digest = Spi::get_one::<String>(&format!(
+            "SELECT encode(set_hash, 'hex') FROM ({checksum_sql}) AS checksum"
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(hostile_guc_digest, alternate_guc_digest);
+
+        Spi::run(&format!(
+            "
+            UPDATE public.{table_name}
+            SET shaped = ROW(12.345600, 'changed')::public.{composite_name}
+            WHERE id = 1;
+            "
+        ))
+        .unwrap();
+        let changed_digest = Spi::get_one::<String>(&format!(
+            "SELECT encode(set_hash, 'hex') FROM ({checksum_sql}) AS checksum"
+        ))
+        .unwrap()
+        .unwrap();
+        assert_ne!(alternate_guc_digest, changed_digest);
+    }
+
+    #[pg_test]
     fn compare_table_records_local_match_result() {
         Spi::run(
             r#"
