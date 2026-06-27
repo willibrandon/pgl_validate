@@ -118,6 +118,28 @@ foreach ($file in $sqlFiles) {
     }
 }
 
+$roleSourceFiles = @()
+$roleSourceFiles += Get-Item -LiteralPath $commentsPath
+$roleSourceFiles += Get-ChildItem -LiteralPath (Join-Path $workspace 'sql/bootstrap') -Filter '*.sql' -File
+
+$seenRoles = @{}
+foreach ($file in $roleSourceFiles) {
+    $text = Get-Content -LiteralPath $file.FullName -Raw
+    foreach ($match in [regex]::Matches($text, '(?im)^\s*CREATE\s+ROLE\s+([a-zA-Z_][a-zA-Z0-9_]*)\b')) {
+        $roleName = $match.Groups[1].Value
+        if ($seenRoles.ContainsKey($roleName)) {
+            continue
+        }
+        $seenRoles[$roleName] = $true
+
+        $commentPattern = "(?im)^\s*COMMENT\s+ON\s+ROLE\s+$([regex]::Escape($roleName))\b"
+        if ($commentsText -notmatch $commentPattern) {
+            $relative = [IO.Path]::GetRelativePath($workspace, $file.FullName)
+            Add-Failure "$relative`: missing COMMENT ON ROLE for $roleName."
+        }
+    }
+}
+
 $commentedColumns = @{}
 foreach ($match in [regex]::Matches($commentsText, "\('([^']+)'\s*,\s*'([^']+)'\s*,\s*'[^']*'\)")) {
     $commentedColumns["$($match.Groups[1].Value).$($match.Groups[2].Value)"] = $true
