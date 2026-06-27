@@ -186,20 +186,11 @@ because validation functions run as invoker.
 
 ## Status
 
-The repository is being built from the design outward. The current slice covers
-catalog DDL, row digest framing, LtHash state, pglogical contract discovery,
-native publication contract discovery, native barrier fencing, cryptographic
-set confirmation, edge-specific barrier fencing, pglogical row-filter
-intersection semantics, bidirectional pglogical reverse-edge fencing,
-physical-standby replay fence plumbing, sequence-window validation, keyless
-whole-relation validation, multi-table and replication-set compare
-orchestration, structured JSON reports, reviewable repair generation, audited
-repair application, conflict-history evidence correlation, run-control and
-retention APIs, durable schedule definitions with explicit async dispatch,
-optional automatic schedule dispatch, dynamic-worker async run orchestration
-with durable paused-task resume, and
-fenced paths exercised against real pglogical, native logical, and physical
-standby replication.
+The core validation path is implemented for pglogical, native logical
+replication, and physical standbys. CI exercises PostgreSQL 15-18 across Linux,
+Windows, and macOS, with both packaged pglogical fork coverage and vanilla
+pglogical source coverage where upstream supports it. Remaining work is tracked
+against [docs/design.md](docs/design.md).
 
 ## License
 
