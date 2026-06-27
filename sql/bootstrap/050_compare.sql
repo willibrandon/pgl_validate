@@ -717,6 +717,7 @@ DECLARE
     subscription_rec record;
     reverse_subscription_rec record;
     reverse_subscription_count int;
+    subscription_wait_deadline timestamptz;
     reverse_status_text text;
     reverse_sync_status "char";
     table_sync_rec record;
@@ -1589,15 +1590,24 @@ BEGIN
             END IF;
 
             BEGIN
-                SELECT *
-                INTO subscription_rec
-                FROM pgl_validate.remote_pglogical_subscription_status(
-                    peer_rec.dsn,
-                    peer_rec.subscription_name::text,
-                    peer_rec.connect_timeout_seconds,
-                    peer_rec.statement_timeout_ms,
-                    peer_rec.lock_timeout_ms
-                );
+                subscription_wait_deadline := clock_timestamp() + (fence_timeout_ms * interval '1 millisecond');
+                LOOP
+                    SELECT *
+                    INTO subscription_rec
+                    FROM pgl_validate.remote_pglogical_subscription_status(
+                        peer_rec.dsn,
+                        peer_rec.subscription_name::text,
+                        peer_rec.connect_timeout_seconds,
+                        peer_rec.statement_timeout_ms,
+                        peer_rec.lock_timeout_ms
+                    );
+
+                    EXIT WHEN subscription_rec.status = 'replicating';
+                    EXIT WHEN subscription_rec.status IS NULL;
+                    EXIT WHEN clock_timestamp() >= subscription_wait_deadline;
+
+                    PERFORM pg_sleep(GREATEST(fence_poll_interval_ms, 1)::double precision / 1000.0);
+                END LOOP;
 
                 IF subscription_rec.status <> 'replicating' THEN
                     RAISE EXCEPTION
@@ -1812,10 +1822,19 @@ BEGIN
                         USING ERRCODE = '0A000';
                 END IF;
 
-                SELECT *
-                INTO reverse_subscription_rec
-                FROM pglogical.show_subscription_status(peer_rec.reverse_subscription_name) AS s
-                LIMIT 1;
+                subscription_wait_deadline := clock_timestamp() + (fence_timeout_ms * interval '1 millisecond');
+                LOOP
+                    SELECT *
+                    INTO reverse_subscription_rec
+                    FROM pglogical.show_subscription_status(peer_rec.reverse_subscription_name) AS s
+                    LIMIT 1;
+
+                    EXIT WHEN reverse_subscription_rec.status = 'replicating';
+                    EXIT WHEN reverse_subscription_rec.status IS NULL;
+                    EXIT WHEN clock_timestamp() >= subscription_wait_deadline;
+
+                    PERFORM pg_sleep(GREATEST(fence_poll_interval_ms, 1)::double precision / 1000.0);
+                END LOOP;
 
                 IF reverse_subscription_rec.status <> 'replicating' THEN
                     RAISE EXCEPTION
@@ -4309,6 +4328,7 @@ DECLARE
     window_max numeric;
     verdict text;
     within_contract boolean;
+    subscription_wait_deadline timestamptz;
 BEGIN
     SELECT n.nspname, c.relname
     INTO v_schema_name, v_seq_name
@@ -4420,15 +4440,24 @@ BEGIN
                     USING ERRCODE = '0A000';
             END IF;
 
-            SELECT *
-            INTO subscription_rec
-            FROM pgl_validate.remote_pglogical_subscription_status(
-                peer_rec.dsn,
-                peer_rec.subscription_name::text,
-                peer_rec.connect_timeout_seconds,
-                peer_rec.statement_timeout_ms,
-                peer_rec.lock_timeout_ms
-            );
+            subscription_wait_deadline := clock_timestamp() + (fence_timeout_ms * interval '1 millisecond');
+            LOOP
+                SELECT *
+                INTO subscription_rec
+                FROM pgl_validate.remote_pglogical_subscription_status(
+                    peer_rec.dsn,
+                    peer_rec.subscription_name::text,
+                    peer_rec.connect_timeout_seconds,
+                    peer_rec.statement_timeout_ms,
+                    peer_rec.lock_timeout_ms
+                );
+
+                EXIT WHEN subscription_rec.status = 'replicating';
+                EXIT WHEN subscription_rec.status IS NULL;
+                EXIT WHEN clock_timestamp() >= subscription_wait_deadline;
+
+                PERFORM pg_sleep(GREATEST(fence_poll_interval_ms, 1)::double precision / 1000.0);
+            END LOOP;
 
             IF subscription_rec.status <> 'replicating' THEN
                 RAISE EXCEPTION

@@ -63,6 +63,32 @@ function Invoke-PglTimedProcess {
     return $process.ExitCode
 }
 
+function Remove-PglPgrxAutoConfSetting {
+    <#
+    .SYNOPSIS
+        Removes a generated ALTER SYSTEM setting from the pgrx test cluster.
+    #>
+    param(
+        [int] $PgMajor,
+        [string] $Name
+    )
+
+    $dataDirectory = Join-Path (Get-PglPgrxHome) "data-$PgMajor"
+    $autoConf = Join-Path $dataDirectory 'postgresql.auto.conf'
+    if (-not (Test-Path -LiteralPath $autoConf)) {
+        return
+    }
+
+    $lines = @(Get-Content -LiteralPath $autoConf)
+    $pattern = "^\s*$([regex]::Escape($Name))\s*="
+    $filtered = @($lines | Where-Object { $_ -notmatch $pattern })
+    if ($filtered.Count -eq $lines.Count) {
+        return
+    }
+
+    Set-Content -LiteralPath $autoConf -Value $filtered -Encoding ascii
+}
+
 function ConvertTo-CommandLineArgument {
     param([string] $Argument)
 
@@ -224,6 +250,7 @@ try {
 
     $runner = Join-Path $PSScriptRoot 'pgrx-vs.ps1'
     $powershell = Get-PglPowerShellExecutable
+    Remove-PglPgrxAutoConfSetting -PgMajor $PgMajor -Name 'shared_preload_libraries'
 
     if (-not (Test-PglWindows)) {
         $regressCommand = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $runner) +
