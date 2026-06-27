@@ -33,6 +33,7 @@
 *.profdata
 *.dSYM/
 .vs/
+.vscode/
 *.user
 *.suo
 *.VC.db
