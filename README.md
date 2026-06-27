@@ -13,7 +13,8 @@ windows. Native logical replication and physical standbys are supported modes.
 - Native logical replication validation.
 - Physical standby validation.
 - Windows, Linux, and macOS builds.
-- Release zip packages for each supported PostgreSQL major.
+- Linux and macOS `.tar.gz` packages for each supported PostgreSQL major.
+- Windows `.zip` packages for each supported PostgreSQL major.
 - Windows x64 MSI installers for each supported PostgreSQL major.
 
 pglogical support is first-class and release-gated. It is not a runtime

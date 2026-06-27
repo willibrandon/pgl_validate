@@ -208,7 +208,7 @@ jobs:
           New-Item -ItemType Directory -Force -Path $assetDir | Out-Null
 
           Get-ChildItem -LiteralPath release-artifacts -Recurse -File |
-            Where-Object { $_.Extension -in @('.zip', '.msi') } |
+            Where-Object { $_.Extension -in @('.zip', '.msi') -or $_.Name -like '*.tar.gz' } |
             ForEach-Object {
               Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $assetDir $_.Name) -Force
             }

@@ -156,11 +156,24 @@ function Test-PglPackageLayout {
     }
 }
 
+function Get-PglPackageArchivePath {
+    param(
+        [string] $ArchiveDirectory,
+        [string] $PackagePlatform
+    )
+
+    if ($PackagePlatform.StartsWith('windows-', [StringComparison]::OrdinalIgnoreCase)) {
+        return "$ArchiveDirectory.zip"
+    }
+
+    return "$ArchiveDirectory.tar.gz"
+}
+
 <#
 .SYNOPSIS
-Creates a ZIP archive while including hidden package paths such as macOS .pgrx.
+Creates a ZIP archive for Windows packages.
 #>
-function New-PglPackageArchive {
+function New-PglZipPackageArchive {
     [CmdletBinding(SupportsShouldProcess)]
     param(
         [string] $PackageDirectory,
@@ -200,9 +213,60 @@ function New-PglPackageArchive {
 
 <#
 .SYNOPSIS
-Verifies that a release archive contains the extension files users need.
+Creates a compressed tar archive for Linux and macOS packages.
 #>
-function Test-PglPackageArchive {
+function New-PglTarGzipPackageArchive {
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [string] $PackageDirectory,
+        [string] $PackageName,
+        [string] $ArchivePath
+    )
+
+    if (-not $PSCmdlet.ShouldProcess($ArchivePath, 'Create package archive')) {
+        return
+    }
+
+    $tar = Get-PglCommandSource -Name 'tar'
+    if (-not $tar) {
+        throw 'tar is required to build Linux and macOS release archives.'
+    }
+
+    $parent = Split-Path -Parent $PackageDirectory
+    & $tar -czf $ArchivePath -C $parent $PackageName
+    if ($LASTEXITCODE -ne 0) {
+        throw "tar exited with code $LASTEXITCODE while creating $ArchivePath."
+    }
+}
+
+function New-PglPackageArchive {
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [string] $PackageDirectory,
+        [string] $PackageName,
+        [string] $PackagePlatform,
+        [string] $ArchivePath
+    )
+
+    if ($PackagePlatform.StartsWith('windows-', [StringComparison]::OrdinalIgnoreCase)) {
+        New-PglZipPackageArchive `
+            -PackageDirectory $PackageDirectory `
+            -PackageName $PackageName `
+            -ArchivePath $ArchivePath
+        return
+    }
+
+    New-PglTarGzipPackageArchive `
+        -PackageDirectory $PackageDirectory `
+        -PackageName $PackageName `
+        -ArchivePath $ArchivePath
+}
+
+<#
+.SYNOPSIS
+Verifies that a ZIP release archive contains the extension files users need.
+#>
+function Test-PglZipPackageArchive {
     param(
         [string] $ArchivePath,
         [string] $Version
@@ -234,13 +298,65 @@ function Test-PglPackageArchive {
     }
 }
 
+<#
+.SYNOPSIS
+Verifies that a compressed tar release archive contains the extension files users need.
+#>
+function Test-PglTarGzipPackageArchive {
+    param(
+        [string] $ArchivePath,
+        [string] $Version
+    )
+
+    $tar = Get-PglCommandSource -Name 'tar'
+    if (-not $tar) {
+        throw 'tar is required to verify Linux and macOS release archives.'
+    }
+
+    $entries = @(& $tar -tzf $ArchivePath)
+    if ($LASTEXITCODE -ne 0) {
+        throw "tar exited with code $LASTEXITCODE while reading $ArchivePath."
+    }
+
+    foreach ($rootFile in @('LICENSE', 'README.md')) {
+        if (-not ($entries | Where-Object { $_ -match "/$([regex]::Escape($rootFile))$" })) {
+            throw "Archive is missing $rootFile."
+        }
+    }
+
+    if (-not ($entries | Where-Object { $_ -match '/pgl_validate\.control$' })) {
+        throw 'Archive is missing pgl_validate.control.'
+    }
+    if (-not ($entries | Where-Object { $_ -match "/pgl_validate--$([regex]::Escape($Version))\.sql$" })) {
+        throw "Archive is missing pgl_validate--$Version.sql."
+    }
+    if (-not ($entries | Where-Object { $_ -match '/pgl_validate\.(so|dylib)$' })) {
+        throw 'Archive is missing the pgl_validate shared library.'
+    }
+}
+
+function Test-PglPackageArchive {
+    param(
+        [string] $ArchivePath,
+        [string] $PackagePlatform,
+        [string] $Version
+    )
+
+    if ($PackagePlatform.StartsWith('windows-', [StringComparison]::OrdinalIgnoreCase)) {
+        Test-PglZipPackageArchive -ArchivePath $ArchivePath -Version $Version
+        return
+    }
+
+    Test-PglTarGzipPackageArchive -ArchivePath $ArchivePath -Version $Version
+}
+
 $pgConfig = Get-PglPgrxPgConfig -PgMajor $PgMajor
 $version = Get-PglExtensionVersion
 $packagePlatform = Get-PglPackagePlatform
 $packageName = "pgl_validate-$version-pg$PgMajor-$packagePlatform"
 $packageDirectory = Join-Path $OutDir $packageName
 $archiveDirectory = Join-Path $ArtifactDir $packageName
-$archivePath = "$archiveDirectory.zip"
+$archivePath = Get-PglPackageArchivePath -ArchiveDirectory $archiveDirectory -PackagePlatform $packagePlatform
 
 Test-PglPathUnderRoot -Path $packageDirectory -AllowedRoot $root | Out-Null
 Test-PglPathUnderRoot -Path $archivePath -AllowedRoot $root | Out-Null
@@ -259,8 +375,12 @@ Invoke-PglPackage -PgConfig $pgConfig -PackageDirectory $packageDirectory
 Copy-Item -LiteralPath (Join-Path $root 'LICENSE') -Destination (Join-Path $packageDirectory 'LICENSE') -Force
 Copy-Item -LiteralPath (Join-Path $root 'README.md') -Destination (Join-Path $packageDirectory 'README.md') -Force
 Test-PglPackageLayout -PackageDirectory $packageDirectory -Version $version
-New-PglPackageArchive -PackageDirectory $packageDirectory -PackageName $packageName -ArchivePath $archivePath
-Test-PglPackageArchive -ArchivePath $archivePath -Version $version
+New-PglPackageArchive `
+    -PackageDirectory $packageDirectory `
+    -PackageName $packageName `
+    -PackagePlatform $packagePlatform `
+    -ArchivePath $archivePath
+Test-PglPackageArchive -ArchivePath $archivePath -PackagePlatform $packagePlatform -Version $version
 
 if ($env:GITHUB_OUTPUT) {
     "artifact_name=$packageName" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
