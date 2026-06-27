@@ -352,6 +352,35 @@ SELECT COALESCE((
     throw "timed out waiting for pglogical subscription $SubscriptionName readiness on ${SubscriberDatabase}: $last"
 }
 
+function Wait-ReplicationSlotInactive {
+    param(
+        [string] $Database,
+        [string] $SlotName,
+        [int] $Port = $script:Port,
+        [int] $TimeoutSeconds
+    )
+
+    $deadline = [DateTimeOffset]::Now.AddSeconds($TimeoutSeconds)
+    $last = ''
+
+    while ([DateTimeOffset]::Now -lt $deadline) {
+        $last = Invoke-Sql -Database $Database -Port $Port -Sql @"
+SELECT COALESCE((
+    SELECT active::text
+    FROM pg_replication_slots
+    WHERE slot_name = $(ConvertTo-SqlLiteral $SlotName)
+), '<missing>')
+"@
+        if ($last -eq 'false' -or $last -eq '<missing>') {
+            return
+        }
+
+        Start-Sleep -Milliseconds 250
+    }
+
+    throw "timed out waiting for replication slot $SlotName to become inactive on ${Database}; last result: $last"
+}
+
 function Wait-SqlEqual {
     param(
         [string] $Database,
@@ -1824,7 +1853,7 @@ SELECT pglogical.create_subscription(
     ARRAY['all']
 )
 "@ | Out-Null
-    $null = Wait-SubscriptionReady `
+    $cascadeTargetSlotName = Wait-SubscriptionReady `
         -SubscriberDatabase 'cascade' `
         -SubscriptionName 'sub_from_target' `
         -ProviderDatabase 'target' `
@@ -1895,7 +1924,7 @@ SELECT pglogical.create_subscription(
     ARRAY[]::text[]
 )
 "@ | Out-Null
-    $null = Wait-SubscriptionReady `
+    $cascadeProviderSlotName = Wait-SubscriptionReady `
         -SubscriberDatabase 'cascade' `
         -SubscriptionName 'sub_direct_provider' `
         -ProviderDatabase 'provider' `
@@ -2007,6 +2036,24 @@ SELECT (pgl_validate.compare_table(
     if ($replicatedRepairVerdict -ne 'match') {
         throw "unexpected post-replicate-repair compare_table verdict: $replicatedRepairVerdict"
     }
+
+    Write-Step 'Quiescing completed cascade pglogical subscriptions'
+    Invoke-Sql `
+        -Database 'cascade' `
+        -Port $script:CascadePort `
+        -Sql "SELECT pglogical.alter_subscription_disable('sub_direct_provider', true)" | Out-Null
+    Invoke-Sql `
+        -Database 'cascade' `
+        -Port $script:CascadePort `
+        -Sql "SELECT pglogical.alter_subscription_disable('sub_from_target', true)" | Out-Null
+    Wait-ReplicationSlotInactive `
+        -Database 'provider' `
+        -SlotName $cascadeProviderSlotName `
+        -TimeoutSeconds $TimeoutSeconds
+    Wait-ReplicationSlotInactive `
+        -Database 'target' `
+        -SlotName $cascadeTargetSlotName `
+        -TimeoutSeconds $TimeoutSeconds
 
     Write-Step 'Validating pglogical sequence buffer-window semantics in an isolated topology'
     Invoke-Sql -Database 'postgres' -Sql 'CREATE DATABASE seq_provider' | Out-Null
