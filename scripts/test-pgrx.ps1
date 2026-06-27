@@ -7,6 +7,9 @@ param(
     [ValidateRange(1, 86400)]
     [int] $TimeoutSeconds = 180,
 
+    [ValidateRange(1, 86400)]
+    [int] $BuildTimeoutSeconds = 600,
+
     [Parameter(ValueFromRemainingArguments = $true)]
     [string[]] $CargoPgrxArgs = @()
 )
@@ -33,6 +36,81 @@ function Stop-ProcessTree {
     param([int] $ProcessId)
 
     Stop-PglProcessTree -ProcessId $ProcessId
+}
+
+function Add-PglPgTestFeature {
+    <#
+    .SYNOPSIS
+        Adds pgrx's pg_test feature to a cargo-compatible feature argument list.
+    #>
+    param([string[]] $Arguments)
+
+    $updated = @()
+    $sawFeatures = $false
+    for ($index = 0; $index -lt $Arguments.Count; $index++) {
+        $argument = $Arguments[$index]
+        if ($argument -eq '--features' -and ($index + 1) -lt $Arguments.Count) {
+            $sawFeatures = $true
+            $features = $Arguments[$index + 1]
+            if ($features -notmatch '(^|[,\s])pg_test([,\s]|$)') {
+                $features = "$features pg_test"
+            }
+            $updated += @($argument, $features)
+            $index++
+            continue
+        }
+
+        if ($argument.StartsWith('--features=', [StringComparison]::Ordinal)) {
+            $sawFeatures = $true
+            $features = $argument.Substring('--features='.Length)
+            if ($features -notmatch '(^|[,\s])pg_test([,\s]|$)') {
+                $features = "$features pg_test"
+            }
+            $updated += "--features=$features"
+            continue
+        }
+
+        $updated += $argument
+    }
+
+    if (-not $sawFeatures) {
+        $updated += @('--features', "pg$PgMajor pg_test")
+    }
+
+    return $updated
+}
+
+function Invoke-PglTimedProcess {
+    <#
+    .SYNOPSIS
+        Runs a child process with a bounded wall-clock timeout and process-tree cleanup.
+    #>
+    param(
+        [string] $FilePath,
+        [string[]] $ArgumentList,
+        [string] $Context,
+        [int] $Seconds
+    )
+
+    $startArgs = @{
+        FilePath = $FilePath
+        ArgumentList = ($ArgumentList | ForEach-Object { ConvertTo-CommandLineArgument $_ }) -join ' '
+        WorkingDirectory = $root
+        PassThru = $true
+    }
+    if (Test-PglWindows) {
+        $startArgs.NoNewWindow = $true
+    }
+
+    $process = Start-Process @startArgs
+    if (-not $process.WaitForExit($Seconds * 1000)) {
+        Write-Warning "$Context exceeded ${Seconds}s; terminating the process tree and cleaning pgrx test clusters."
+        Stop-ProcessTree -ProcessId $process.Id
+        return 124
+    }
+
+    $process.Refresh()
+    return $process.ExitCode
 }
 
 function ConvertTo-CommandLineArgument {
@@ -98,30 +176,28 @@ try {
         throw "cargo pgrx schema failed while preparing $extensionSql."
     }
 
-    $command = @('cargo', 'pgrx', 'test', "pg$PgMajor") + $CargoPgrxArgs
     $powershell = Get-PglPowerShellExecutable
+    $prebuildCargoArgs = Add-PglPgTestFeature -Arguments $CargoPgrxArgs
+    $prebuildCommand = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $runner) +
+        @('cargo', 'test', '--lib', '--no-run') +
+        $prebuildCargoArgs
+    $exitCode = Invoke-PglTimedProcess `
+        -FilePath $powershell `
+        -ArgumentList $prebuildCommand `
+        -Context "cargo test --no-run pg$PgMajor" `
+        -Seconds $BuildTimeoutSeconds
+    if ($exitCode -ne 0) {
+        throw "cargo test --no-run pg$PgMajor exited with code $exitCode."
+    }
 
-    $arguments = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $runner) + $command
-    $argumentLine = ($arguments | ForEach-Object { ConvertTo-CommandLineArgument $_ }) -join ' '
-    $startArgs = @{
-        FilePath = $powershell
-        ArgumentList = $argumentLine
-        PassThru = $true
-    }
-    if (Test-PglWindows) {
-        $startArgs.NoNewWindow = $true
-    }
-    $process = Start-Process @startArgs
-
-    if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
-        Write-Warning "cargo pgrx test pg$PgMajor exceeded ${TimeoutSeconds}s; terminating the process tree and cleaning pgrx test clusters."
-        Stop-ProcessTree -ProcessId $process.Id
-        $exitCode = 124
-    }
-    else {
-        $process.Refresh()
-        $exitCode = $process.ExitCode
-    }
+    $testCommand = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $runner) +
+        @('cargo', 'pgrx', 'test', "pg$PgMajor") +
+        $CargoPgrxArgs
+    $exitCode = Invoke-PglTimedProcess `
+        -FilePath $powershell `
+        -ArgumentList $testCommand `
+        -Context "cargo pgrx test pg$PgMajor" `
+        -Seconds $TimeoutSeconds
 }
 catch {
     Write-Error $_

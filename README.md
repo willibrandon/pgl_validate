@@ -53,8 +53,12 @@ environment; on other platforms it runs the command directly.
 `target\native-test-pgdata`, `target\standby-primary-pgdata`,
 `target\standby-replica-pgdata`, and `target\diag-pgdata`, even when a pg_test
 fails. It also runs pg_tests serially because they share one PostgreSQL cluster
-and extension catalog state. Local pgrx test runs default to a 180-second
-timeout; pass `-TimeoutSeconds` only when deliberately debugging a slow run.
+and extension catalog state. The script prebuilds the Rust test binary before
+starting the pg_test watchdog, so no-cache compilation is bounded separately
+from the running PostgreSQL tests. Local pgrx test runs default to a
+180-second test timeout and a 600-second build-preflight timeout; pass
+`-TimeoutSeconds` or `-BuildTimeoutSeconds` only when deliberately debugging a
+slow run.
 
 pglogical is a required part of the test environment. Install the packaged
 release into the target pgrx PostgreSQL; do not build from a local pglogical
