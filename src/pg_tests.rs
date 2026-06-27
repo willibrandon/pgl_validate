@@ -6526,6 +6526,115 @@ mod tests {
     }
 
     #[pg_test]
+    fn conflict_history_absence_is_vanilla_pglogical_compatible() {
+        let backend_pid = Spi::get_one::<i32>("SELECT pg_backend_pid()")
+            .unwrap()
+            .unwrap();
+        let peer_db = identifier(&format!("pgl_validate_no_conflict_history_{backend_pid}"));
+        let table_name = identifier(&format!("pgl_validate_no_conflict_{backend_pid}"));
+        let local_dsn = local_dsn();
+        let remote_dsn = peer_dsn(&peer_db);
+
+        let _ = crate::transport::libpq::execute_command(
+            &local_dsn,
+            &format!("DROP DATABASE IF EXISTS {peer_db} WITH (FORCE)"),
+        );
+        crate::transport::libpq::execute_command(&local_dsn, &format!("CREATE DATABASE {peer_db}"))
+            .unwrap();
+        crate::transport::libpq::execute_command(&remote_dsn, "CREATE SCHEMA pglogical").unwrap();
+
+        Spi::run(&format!(
+            "
+            CREATE TABLE public.{table_name}(id int PRIMARY KEY, value text);
+            INSERT INTO pgl_validate.peer(name, dsn, backend, subscription_name)
+            VALUES ('target_without_history', {remote_dsn}, 'pglogical', 'sub');
+            ",
+            remote_dsn = sql_literal(&remote_dsn)
+        ))
+        .unwrap();
+
+        let fetched_conflicts = Spi::get_one::<i64>(&format!(
+            "
+            SELECT count(*)
+            FROM pgl_validate.remote_pglogical_conflict_history(
+                {remote_dsn},
+                'sub',
+                'public',
+                {table_name},
+                (now() - interval '24 hours')::text,
+                10
+            )
+            ",
+            remote_dsn = sql_literal(&remote_dsn),
+            table_name = sql_literal(&table_name)
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(fetched_conflicts, 0);
+
+        let run_id = Spi::get_one::<i64>(&format!(
+            "
+            WITH run AS (
+                INSERT INTO pgl_validate.run(status, started_at)
+                VALUES ('completed', now() - interval '1 hour')
+                RETURNING run_id
+            ), epoch AS (
+                INSERT INTO pgl_validate.fence_epoch(run_id, epoch_seq)
+                SELECT run_id, 1 FROM run
+                RETURNING run_id
+            ), plan AS (
+                INSERT INTO pgl_validate.table_plan(
+                    run_id, schema_name, table_name, key_cols, att_list,
+                    validated_property
+                )
+                SELECT run_id, 'public', {table_name}, ARRAY['id'], ARRAY['id','value'], 'full'
+                FROM run
+                RETURNING run_id
+            ), divergence AS (
+                INSERT INTO pgl_validate.divergence(
+                    run_id, schema_name, table_name, key_text, key_bytes,
+                    classification, node, status, detected_epoch, tuple
+                )
+                SELECT run_id, 'public', {table_name},
+                       '{{\"id\": 1}}',
+                       decode('01', 'hex'),
+                       'differs',
+                       'target_without_history',
+                       'confirmed',
+                       1,
+                       '{{\"local\": {{\"id\": 1, \"value\": \"local\"}},
+                          \"peer\": {{\"id\": 1, \"value\": \"remote\"}}}}'::jsonb
+                FROM run
+            )
+            SELECT run_id
+            FROM run
+            ",
+            table_name = sql_literal(&table_name)
+        ))
+        .unwrap()
+        .unwrap();
+
+        let evidence_count = Spi::get_one::<i64>(&format!(
+            "SELECT pgl_validate.correlate_conflict_history({run_id}, interval '24 hours', 10)::bigint"
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(evidence_count, 0);
+
+        let stored_evidence = Spi::get_one::<i64>(&format!(
+            "SELECT count(*)::bigint FROM pgl_validate.conflict_evidence({run_id})"
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(stored_evidence, 0);
+
+        let _ = crate::transport::libpq::execute_command(
+            &local_dsn,
+            &format!("DROP DATABASE IF EXISTS {peer_db} WITH (FORCE)"),
+        );
+    }
+
+    #[pg_test]
     fn run_progress_reports_phase_epoch_scan_counters_and_eta() {
         let run_id = Spi::get_one::<i64>(
             "

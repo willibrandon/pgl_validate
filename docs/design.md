@@ -616,6 +616,7 @@ State is persisted (typed, normalized, FK-linked) so runs are resumable and audi
 - `divergence` — per key: `classification (missing_on|extra_on|differs)`, `node`, `key_text`, `key_bytes`, `status (candidate|confirmed|cleared|indeterminate|advisory)`, detection epoch FK, optional `tuple jsonb` (capped). The `advisory` status carries the §9.4 filtered-table presence differences that the contract permits and that are therefore **never** promoted to `confirmed`.
 - `divergence_recheck` — per (divergence, epoch_seq): outcome.
 - `conflict_evidence` — optional pglogical conflict-history rows correlated to confirmed divergences by subscription, relation, time window, and tuple JSON containing the divergent key. This is explanatory evidence (`update_update` + `keep_local`, `skip`, etc.), never a source of validation truth.
+  Vanilla pglogical deployments may not expose `pglogical.conflict_history`; absence of that table is a normal, supported state that must return zero conflict evidence without weakening or failing validation. Queryable conflict history from the willibrandon pglogical fork enriches reports only.
 - `sequence_result` — per sequence: provider/subscriber `last_value`, `cache_size`, `within_contract boolean`, verdict.
 - `schema_issue` — per precondition failure (FKs).
 
