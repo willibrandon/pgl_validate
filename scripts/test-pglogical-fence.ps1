@@ -41,7 +41,12 @@ function Assert-UnderRoot {
 }
 
 function Stop-ProcessTree {
+    [CmdletBinding(SupportsShouldProcess)]
     param([int] $ProcessId)
+
+    if (-not $PSCmdlet.ShouldProcess($MyInvocation.MyCommand.Name, 'Run')) {
+        return
+    }
 
     Stop-PglProcessTree -ProcessId $ProcessId
 }
@@ -96,10 +101,15 @@ function Get-ExtensionSqlPath {
 }
 
 function Stop-TestCluster {
+    [CmdletBinding(SupportsShouldProcess)]
     param(
         [string] $Data,
         [string] $PgCtl
     )
+
+    if (-not $PSCmdlet.ShouldProcess($MyInvocation.MyCommand.Name, 'Run')) {
+        return
+    }
 
     if (Test-Path -LiteralPath $Data) {
         try {
@@ -120,6 +130,7 @@ function Stop-TestCluster {
 }
 
 function Remove-TestData {
+    [CmdletBinding(SupportsShouldProcess)]
     param([string] $Data)
 
     if (Test-Path -LiteralPath $Data) {
@@ -141,12 +152,15 @@ function Remove-TestData {
 }
 
 function Start-CleanupWatchdog {
+    [CmdletBinding(SupportsShouldProcess)]
     param(
         [int] $ParentPid,
-        [string] $Data,
-        [string] $PgCtl,
         [switch] $RemoveData
     )
+
+    if (-not $PSCmdlet.ShouldProcess($MyInvocation.MyCommand.Name, 'Run')) {
+        return
+    }
 
     $powershell = Get-PglPowerShellExecutable
 
@@ -176,6 +190,13 @@ else {
 }
 
 function New-FreePort {
+    [CmdletBinding(SupportsShouldProcess)]
+    param()
+
+    if (-not $PSCmdlet.ShouldProcess($MyInvocation.MyCommand.Name, 'Run')) {
+        return
+    }
+
     $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
     $listener.Start()
     try {
@@ -208,10 +229,15 @@ function Invoke-Sql {
 }
 
 function Start-AsyncSql {
+    [CmdletBinding(SupportsShouldProcess)]
     param(
         [string] $Database,
         [string] $Sql
     )
+
+    if (-not $PSCmdlet.ShouldProcess($MyInvocation.MyCommand.Name, 'Run')) {
+        return
+    }
 
     $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
     $startInfo.FileName = $script:Psql
@@ -326,7 +352,7 @@ SELECT COALESCE((
     throw "timed out waiting for pglogical subscription $SubscriptionName readiness on ${SubscriberDatabase}: $last"
 }
 
-function Wait-SqlEquals {
+function Wait-SqlEqual {
     param(
         [string] $Database,
         [string] $Sql,
@@ -359,7 +385,7 @@ function Wait-AdvisoryLockHeld {
         [int] $TimeoutSeconds
     )
 
-    Wait-SqlEquals `
+    Wait-SqlEqual `
         -Database $Database `
         -Sql "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE locktype = 'advisory' AND classid = $ClassId AND objid = $ObjectId AND granted)::text" `
         -Expected 'true' `
@@ -376,7 +402,7 @@ do {
     $script:CascadePort = New-FreePort
 } while ($script:CascadePort -eq $script:Port)
 $extensionSql = Get-ExtensionSqlPath -PgConfig $pgConfig
-$watchdog = Start-CleanupWatchdog -ParentPid $PID -Data $data -PgCtl $script:PgCtl -RemoveData:(-not $KeepData)
+$watchdog = Start-CleanupWatchdog -ParentPid $PID -RemoveData:(-not $KeepData)
 
 try {
     Write-Step "Cleaning prior pglogical fence test cluster"
@@ -553,17 +579,17 @@ SELECT pglogical.create_subscription(
 
     Write-Step 'Replicating user table row for compare_table validation'
     Invoke-Sql -Database 'provider' -Sql "INSERT INTO public.accounts VALUES (1, 'same')" | Out-Null
-    Wait-SqlEquals `
+    Wait-SqlEqual `
         -Database 'target' `
         -Sql 'SELECT count(*)::text FROM public.accounts WHERE id = 1 AND value = ''same''' `
         -Expected '1' `
         -TimeoutSeconds $TimeoutSeconds
-    Wait-SqlEquals `
+    Wait-SqlEqual `
         -Database 'fanout' `
         -Sql 'SELECT count(*)::text FROM public.accounts WHERE id = 1 AND value = ''same''' `
         -Expected '1' `
         -TimeoutSeconds $TimeoutSeconds
-    Wait-SqlEquals `
+    Wait-SqlEqual `
         -Database 'degraded' `
         -Sql 'SELECT count(*)::text FROM public.accounts WHERE id = 1 AND value = ''same''' `
         -Expected '1' `
@@ -784,18 +810,18 @@ END
 
     Write-Step 'Validating pglogical non-replicated TRUNCATE semantics'
     Invoke-Sql -Database 'provider' -Sql "INSERT INTO public.truncate_accounts VALUES (1, 'left-behind')" | Out-Null
-    Wait-SqlEquals `
+    Wait-SqlEqual `
         -Database 'target' `
         -Sql "SELECT count(*)::text FROM public.truncate_accounts WHERE id = 1 AND value = 'left-behind'" `
         -Expected '1' `
         -TimeoutSeconds $TimeoutSeconds
     Invoke-Sql -Database 'provider' -Sql 'TRUNCATE public.truncate_accounts' | Out-Null
-    Wait-SqlEquals `
+    Wait-SqlEqual `
         -Database 'provider' `
         -Sql 'SELECT count(*)::text FROM public.truncate_accounts' `
         -Expected '0' `
         -TimeoutSeconds $TimeoutSeconds
-    Wait-SqlEquals `
+    Wait-SqlEqual `
         -Database 'target' `
         -Sql 'SELECT count(*)::text FROM public.truncate_accounts' `
         -Expected '1' `
@@ -891,12 +917,12 @@ SELECT pglogical.create_subscription(
         -SubscriptionName 'sub_from_fanout' `
         -ProviderDatabase 'fanout' `
         -TimeoutSeconds $TimeoutSeconds
-    Wait-SqlEquals `
+    Wait-SqlEqual `
         -Database 'provider' `
         -Sql "SELECT COALESCE((SELECT left(status, 1) FROM pglogical.show_subscription_table('sub_from_target'::name, 'public.bidir_accounts'::regclass)), '<missing>')" `
         -Expected 'r' `
         -TimeoutSeconds $TimeoutSeconds
-    Wait-SqlEquals `
+    Wait-SqlEqual `
         -Database 'provider' `
         -Sql "SELECT COALESCE((SELECT left(status, 1) FROM pglogical.show_subscription_table('sub_from_fanout'::name, 'public.bidir_accounts'::regclass)), '<missing>')" `
         -Expected 'r' `
@@ -1167,7 +1193,7 @@ SET include_row = true,
     value = 'entered-filter'
 WHERE id = 6;
 "@ | Out-Null
-    Wait-SqlEquals `
+    Wait-SqlEqual `
         -Database 'target' `
         -Sql 'SELECT count(*)::text FROM public.filtered_accounts WHERE id = 1 AND include_row AND value = ''same''' `
         -Expected '1' `
@@ -1280,7 +1306,7 @@ CREATE TABLE public.post_fence_update_accounts(
 )
 "@ | Out-Null
     Invoke-Sql -Database 'provider' -Sql "INSERT INTO public.post_fence_update_accounts VALUES (1, 'before-update')" | Out-Null
-    Wait-SqlEquals `
+    Wait-SqlEqual `
         -Database 'target' `
         -Sql "SELECT value FROM public.post_fence_update_accounts WHERE id = 1" `
         -Expected 'before-update' `
@@ -1314,7 +1340,7 @@ FROM pgl_validate.compare_table(
             -TimeoutSeconds $clearedTimeoutSeconds
 
         Invoke-Sql -Database 'provider' -Sql "UPDATE public.post_fence_update_accounts SET value = 'after-update' WHERE id = 1" | Out-Null
-        Wait-SqlEquals `
+        Wait-SqlEqual `
             -Database 'target' `
             -Sql "SELECT value FROM public.post_fence_update_accounts WHERE id = 1" `
             -Expected 'after-update' `
@@ -1386,7 +1412,7 @@ CREATE TABLE public.post_fence_delete_accounts(
 )
 "@ | Out-Null
     Invoke-Sql -Database 'provider' -Sql "INSERT INTO public.post_fence_delete_accounts VALUES (1, 'before-delete')" | Out-Null
-    Wait-SqlEquals `
+    Wait-SqlEqual `
         -Database 'target' `
         -Sql "SELECT value FROM public.post_fence_delete_accounts WHERE id = 1" `
         -Expected 'before-delete' `
@@ -1420,7 +1446,7 @@ FROM pgl_validate.compare_table(
             -TimeoutSeconds $clearedTimeoutSeconds
 
         Invoke-Sql -Database 'provider' -Sql "DELETE FROM public.post_fence_delete_accounts WHERE id = 1" | Out-Null
-        Wait-SqlEquals `
+        Wait-SqlEqual `
             -Database 'target' `
             -Sql "SELECT count(*)::text FROM public.post_fence_delete_accounts WHERE id = 1" `
             -Expected '0' `
@@ -1511,7 +1537,7 @@ CREATE TABLE public.post_fence_hot_accounts(
 )
 "@ | Out-Null
     Invoke-Sql -Database 'provider' -Sql "INSERT INTO public.post_fence_hot_accounts VALUES (1, 'hot-before')" | Out-Null
-    Wait-SqlEquals `
+    Wait-SqlEqual `
         -Database 'target' `
         -Sql "SELECT value FROM public.post_fence_hot_accounts WHERE id = 1" `
         -Expected 'hot-before' `
@@ -1545,7 +1571,7 @@ FROM pgl_validate.compare_table(
             -TimeoutSeconds $clearedTimeoutSeconds
 
         Invoke-Sql -Database 'provider' -Sql "UPDATE public.post_fence_hot_accounts SET value = 'hot-after' WHERE id = 1" | Out-Null
-        Wait-SqlEquals `
+        Wait-SqlEqual `
             -Database 'target' `
             -Sql "SELECT value FROM public.post_fence_hot_accounts WHERE id = 1" `
             -Expected 'hot-after' `
@@ -1823,7 +1849,7 @@ FROM pgl_validate.remote_inject_barrier(
     $cascadedOnlyLsn = $cascadedOnlyParts[1]
     $cascadedOnlyTokenSql = ConvertTo-SqlLiteral $cascadedOnlyToken
     $cascadedOnlyLsnSql = ConvertTo-SqlLiteral $cascadedOnlyLsn
-    Wait-SqlEquals `
+    Wait-SqlEqual `
         -Database 'cascade' `
         -Sql "SELECT count(*)::text FROM pgl_validate.fence_barrier WHERE token = ${cascadedOnlyTokenSql}::uuid" `
         -Expected '1' `
@@ -1889,7 +1915,7 @@ FROM pgl_validate.remote_inject_barrier(
         throw "unexpected duplicate barrier result: $duplicateBarrier"
     }
     $duplicateTokenSql = ConvertTo-SqlLiteral $duplicateParts[0]
-    Wait-SqlEquals `
+    Wait-SqlEqual `
         -Database 'cascade' `
         -Sql "SELECT count(*)::text FROM pgl_validate.fence_barrier WHERE token = ${duplicateTokenSql}::uuid" `
         -Expected '2' `
@@ -1972,7 +1998,7 @@ VALUES ('seq_target', $sequenceTargetDsnSql, 'pglogical', 'seq_sub', ARRAY['defa
 SELECT setval('public.account_seq'::regclass, 10, true);
 SELECT pglogical.synchronize_sequence('public.account_seq'::regclass);
 "@ | Out-Null
-    Wait-SqlEquals `
+    Wait-SqlEqual `
         -Database 'seq_target' `
         -Sql 'SELECT (last_value >= 10)::text FROM public.account_seq' `
         -Expected 'true' `

@@ -9,6 +9,9 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
+$script:CiPgMajor = $PgMajor
+$script:CiCargoPgrxVersion = $CargoPgrxVersion
+$script:CiLlvmVersion = $LlvmVersion
 
 $common = Join-Path $PSScriptRoot 'pgrx-common.ps1'
 . $common
@@ -117,7 +120,7 @@ function Test-LibclangArchitecture {
     return $false
 }
 
-function Get-VisualStudioLibclangCandidates {
+function Get-VisualStudioLibclangCandidate {
     param([string] $Architecture)
 
     $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
@@ -168,10 +171,10 @@ function Install-WindowsLlvm {
     $installer = Join-Path ([IO.Path]::GetTempPath()) "LLVM-$LlvmVersion-win64.exe"
     $uri = "https://github.com/llvm/llvm-project/releases/download/llvmorg-$LlvmVersion/LLVM-$LlvmVersion-win64.exe"
 
-    Write-Host "+ Invoke-WebRequest $uri"
+    Write-Information -MessageData "+ Invoke-WebRequest $uri" -InformationAction Continue
     Invoke-WebRequest -Uri $uri -OutFile $installer
 
-    Write-Host "+ $installer /S /D=$installRoot"
+    Write-Information -MessageData "+ $installer /S /D=$installRoot" -InformationAction Continue
     $process = Start-Process -FilePath $installer -ArgumentList @('/S', "/D=$installRoot") -Wait -PassThru -WindowStyle Hidden
     if ($process.ExitCode -ne 0) {
         throw "LLVM installer exited with code $($process.ExitCode)."
@@ -187,7 +190,7 @@ function Resolve-WindowsLibclangPath {
         [void] $candidateDirs.Add($candidate)
     }
     if ($architecture -ne 'x64') {
-        foreach ($candidate in Get-VisualStudioLibclangCandidates -Architecture $architecture) {
+        foreach ($candidate in Get-VisualStudioLibclangCandidate -Architecture $architecture) {
             [void] $candidateDirs.Add($candidate)
         }
     }
@@ -223,7 +226,7 @@ function Invoke-Logged {
         }
     }
 
-    Write-Host "+ $FilePath $($Arguments -join ' ')"
+    Write-Information -MessageData "+ $FilePath $($Arguments -join ' ')" -InformationAction Continue
     & $FilePath @Arguments
     if ($LASTEXITCODE -ne 0) {
         throw "$FilePath exited with code $LASTEXITCODE."
@@ -241,8 +244,8 @@ function Install-HomebrewFormula {
     foreach ($formula in $Formulae) {
         $installed = & $brew list --versions $formula 2>$null
         if ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace(($installed -join ''))) {
-            Write-Host "+ brew list --versions $formula"
-            Write-Host ($installed -join [Environment]::NewLine)
+            Write-Information -MessageData "+ brew list --versions $formula" -InformationAction Continue
+            Write-Information -MessageData ($installed -join [Environment]::NewLine) -InformationAction Continue
             continue
         }
 
@@ -304,7 +307,7 @@ function Invoke-PostgresBinaryDownload {
     $maxAttempts = 4
     for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
         try {
-            Write-Host "+ Invoke-WebRequest $Uri"
+            Write-Information -MessageData "+ Invoke-WebRequest $Uri" -InformationAction Continue
             Invoke-WebRequest `
                 -Uri $Uri `
                 -OutFile $OutFile `
@@ -317,7 +320,7 @@ function Invoke-PostgresBinaryDownload {
             }
 
             $delaySeconds = 10 * $attempt
-            Write-Host "PostgreSQL binary download attempt $attempt failed: $($_.Exception.Message). Retrying in $delaySeconds seconds."
+            Write-Information -MessageData "PostgreSQL binary download attempt $attempt failed: $($_.Exception.Message). Retrying in $delaySeconds seconds." -InformationAction Continue
             Start-Sleep -Seconds $delaySeconds
         }
     }
@@ -366,7 +369,7 @@ function Install-WindowsPostgresBinary {
     }
 
     Invoke-Logged -FilePath 'cargo' -Arguments @('pgrx', 'init', "--pg$PgMajor", $pgConfig)
-    Enable-PostgresInstallWrites -PgConfig $pgConfig
+    Enable-PostgresInstallWriteAccess -PgConfig $pgConfig
 }
 
 <#
@@ -391,7 +394,7 @@ Installs cargo-pgrx with retries for transient registry transport failures.
 #>
 function Install-CargoPgrx {
     if (Test-CargoPgrxVersion -Version $CargoPgrxVersion) {
-        Write-Host "cargo-pgrx $CargoPgrxVersion is already installed"
+        Write-Information -MessageData "cargo-pgrx $CargoPgrxVersion is already installed" -InformationAction Continue
         return
     }
 
@@ -448,10 +451,12 @@ function Invoke-CargoDependencyFetch {
                 $metadataArguments = @("+$env:PGL_VALIDATE_RUST_TOOLCHAIN") + $metadataArguments
             }
 
-            Write-Host "+ cargo $($metadataArguments -join ' ')"
+            Write-Information -MessageData "+ cargo $($metadataArguments -join ' ')" -InformationAction Continue
             $metadataOutput = & cargo @metadataArguments 2>&1
             if ($LASTEXITCODE -ne 0) {
-                $metadataOutput | Write-Host
+                $metadataOutput | ForEach-Object {
+                    Write-Information -MessageData $_ -InformationAction Continue
+                }
                 throw "cargo metadata exited with code $LASTEXITCODE."
             }
 
@@ -501,7 +506,7 @@ function Install-ChocolateyPackage {
     }
 }
 
-function Enable-PostgresInstallWrites {
+function Enable-PostgresInstallWriteAccess {
     param([string] $PgConfig)
 
     if (Test-PglWindows) {
@@ -521,7 +526,14 @@ function Enable-PostgresInstallWrites {
 .SYNOPSIS
 Removes runner-provided Homebrew taps that fail current tap-trust checks.
 #>
-function Remove-UntrustedHomebrewTaps {
+function Remove-UntrustedHomebrewTap {
+    [CmdletBinding(SupportsShouldProcess)]
+    param()
+
+    if (-not $PSCmdlet.ShouldProcess($MyInvocation.MyCommand.Name, 'Run')) {
+        return
+    }
+
     $brew = Get-PglCommandSource -Name 'brew'
     if (-not $brew) {
         return
@@ -533,7 +545,7 @@ function Remove-UntrustedHomebrewTaps {
     }
 
     if ($taps -contains 'aws/tap') {
-        Write-Host '+ brew untap aws/tap'
+        Write-Information -MessageData '+ brew untap aws/tap' -InformationAction Continue
         & $brew untap aws/tap
         if ($LASTEXITCODE -ne 0) {
             Write-Warning 'Could not untap aws/tap; continuing because it is unrelated to PostgreSQL setup.'
@@ -541,7 +553,7 @@ function Remove-UntrustedHomebrewTaps {
     }
 }
 
-function Initialize-LinuxPostgres {
+function Initialize-LinuxPostgreSql {
     $packages = @(
         'build-essential',
         'ca-certificates',
@@ -589,11 +601,11 @@ function Initialize-LinuxPostgres {
 
     $pgConfig = "/usr/lib/postgresql/$PgMajor/bin/pg_config"
     Invoke-Logged -FilePath 'cargo' -Arguments @('pgrx', 'init', "--pg$PgMajor", $pgConfig)
-    Enable-PostgresInstallWrites -PgConfig $pgConfig
+    Enable-PostgresInstallWriteAccess -PgConfig $pgConfig
 }
 
-function Initialize-MacPostgres {
-    Remove-UntrustedHomebrewTaps
+function Initialize-MacPostgreSql {
+    Remove-UntrustedHomebrewTap
     Install-HomebrewFormula -Formulae @('llvm', 'icu4c', 'pkg-config')
 
     $llvmPrefix = (& brew --prefix llvm).Trim()
@@ -614,10 +626,10 @@ function Initialize-MacPostgres {
     Invoke-Logged -FilePath 'cargo' -Arguments @('pgrx', 'init', "--pg$PgMajor", 'download')
     $pgConfig = Get-PglPgrxPgConfig -PgMajor $PgMajor
     Invoke-Logged -FilePath 'cargo' -Arguments @('pgrx', 'init', "--pg$PgMajor", $pgConfig)
-    Enable-PostgresInstallWrites -PgConfig $pgConfig
+    Enable-PostgresInstallWriteAccess -PgConfig $pgConfig
 }
 
-function Initialize-WindowsPostgres {
+function Initialize-WindowsPostgreSql {
     $libclang = Resolve-WindowsLibclangPath
     Add-GitHubPath -Path $libclang
     Add-GitHubEnv -Name 'LIBCLANG_PATH' -Value $libclang
@@ -634,8 +646,8 @@ function Initialize-WindowsPostgres {
         Invoke-Logged -FilePath 'cargo' -Arguments @('pgrx', 'init', "--pg$PgMajor", 'download')
     }
     catch {
-        Write-Host "cargo-pgrx PostgreSQL download failed; installing PostgreSQL $PgMajor from the official Windows binary zip instead."
-        Write-Host $_.Exception.Message
+        Write-Information -MessageData "cargo-pgrx PostgreSQL download failed; installing PostgreSQL $PgMajor from the official Windows binary zip instead." -InformationAction Continue
+        Write-Information -MessageData $_.Exception.Message -InformationAction Continue
         Install-WindowsPostgresBinary
     }
 }
@@ -643,13 +655,13 @@ function Initialize-WindowsPostgres {
 Install-CargoPgrx
 
 if (Test-PglWindows) {
-    Initialize-WindowsPostgres
+    Initialize-WindowsPostgreSql
 }
 elseif (Test-PglMacOS) {
-    Initialize-MacPostgres
+    Initialize-MacPostgreSql
 }
 elseif (Test-PglLinux) {
-    Initialize-LinuxPostgres
+    Initialize-LinuxPostgreSql
 }
 else {
     throw 'Unsupported CI operating system.'

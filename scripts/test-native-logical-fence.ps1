@@ -39,7 +39,12 @@ function Assert-UnderRoot {
 }
 
 function Stop-ProcessTree {
+    [CmdletBinding(SupportsShouldProcess)]
     param([int] $ProcessId)
+
+    if (-not $PSCmdlet.ShouldProcess($MyInvocation.MyCommand.Name, 'Run')) {
+        return
+    }
 
     Stop-PglProcessTree -ProcessId $ProcessId
 }
@@ -94,10 +99,15 @@ function Get-ExtensionSqlPath {
 }
 
 function Stop-TestCluster {
+    [CmdletBinding(SupportsShouldProcess)]
     param(
         [string] $Data,
         [string] $PgCtl
     )
+
+    if (-not $PSCmdlet.ShouldProcess($MyInvocation.MyCommand.Name, 'Run')) {
+        return
+    }
 
     if (Test-Path -LiteralPath $Data) {
         try {
@@ -118,6 +128,7 @@ function Stop-TestCluster {
 }
 
 function Remove-TestData {
+    [CmdletBinding(SupportsShouldProcess)]
     param([string] $Data)
 
     if (Test-Path -LiteralPath $Data) {
@@ -139,10 +150,15 @@ function Remove-TestData {
 }
 
 function Start-CleanupWatchdog {
+    [CmdletBinding(SupportsShouldProcess)]
     param(
         [int] $ParentPid,
         [switch] $RemoveData
     )
+
+    if (-not $PSCmdlet.ShouldProcess($MyInvocation.MyCommand.Name, 'Run')) {
+        return
+    }
 
     $powershell = Get-PglPowerShellExecutable
 
@@ -172,6 +188,13 @@ else {
 }
 
 function New-FreePort {
+    [CmdletBinding(SupportsShouldProcess)]
+    param()
+
+    if (-not $PSCmdlet.ShouldProcess($MyInvocation.MyCommand.Name, 'Run')) {
+        return
+    }
+
     $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
     $listener.Start()
     try {
@@ -261,7 +284,7 @@ SELECT COALESCE((
     throw "timed out waiting for native subscription $SubscriptionName readiness on ${SubscriberDatabase}: $last"
 }
 
-function Wait-SqlEquals {
+function Wait-SqlEqual {
     param(
         [string] $Database,
         [string] $Sql,
@@ -379,7 +402,7 @@ WITH (copy_data = false, create_slot = false, slot_name = 'native_sub', enabled 
 
     Write-Step 'Replicating user table row for native compare_table validation'
     Invoke-Sql -Database 'provider' -Sql "INSERT INTO public.accounts VALUES (1, 'same')" | Out-Null
-    Wait-SqlEquals `
+    Wait-SqlEqual `
         -Database 'target' `
         -Sql 'SELECT count(*)::text FROM public.accounts WHERE id = 1 AND value = ''same''' `
         -Expected '1' `
@@ -514,7 +537,7 @@ INSERT INTO public.native_filtered_accounts
 VALUES (6, false, 'insert-filtered-out');
 SELECT pg_current_wal_lsn()::text;
 "@
-    Wait-SqlEquals `
+    Wait-SqlEqual `
         -Database 'provider' `
         -Sql "SELECT COALESCE((SELECT (confirmed_flush_lsn >= '$filteredOutLsn'::pg_lsn)::text FROM pg_replication_slots WHERE slot_name = 'native_sub'), 'false')" `
         -Expected 'true' `
@@ -530,7 +553,7 @@ SET include_row = true,
     value = 'entered-filter-through-update'
 WHERE id = 6;
 "@ | Out-Null
-    Wait-SqlEquals `
+    Wait-SqlEqual `
         -Database 'target' `
         -Sql "SELECT count(*)::text FROM public.native_filtered_accounts WHERE id = 6 AND include_row AND value = 'entered-filter-through-update'" `
         -Expected '1' `

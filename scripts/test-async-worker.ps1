@@ -39,7 +39,12 @@ function Assert-UnderRoot {
 }
 
 function Stop-ProcessTree {
+    [CmdletBinding(SupportsShouldProcess)]
     param([int] $ProcessId)
+
+    if (-not $PSCmdlet.ShouldProcess($MyInvocation.MyCommand.Name, 'Run')) {
+        return
+    }
 
     Stop-PglProcessTree -ProcessId $ProcessId
 }
@@ -82,10 +87,15 @@ function ConvertTo-EncodedCommand {
 }
 
 function Stop-TestCluster {
+    [CmdletBinding(SupportsShouldProcess)]
     param(
         [string] $Data,
         [string] $PgCtl
     )
+
+    if (-not $PSCmdlet.ShouldProcess($MyInvocation.MyCommand.Name, 'Run')) {
+        return
+    }
 
     if (Test-Path -LiteralPath $Data) {
         try {
@@ -105,6 +115,7 @@ function Stop-TestCluster {
 }
 
 function Remove-TestData {
+    [CmdletBinding(SupportsShouldProcess)]
     param([string] $Data)
 
     if (Test-Path -LiteralPath $Data) {
@@ -126,10 +137,15 @@ function Remove-TestData {
 }
 
 function Start-CleanupWatchdog {
+    [CmdletBinding(SupportsShouldProcess)]
     param(
         [int] $ParentPid,
         [switch] $RemoveData
     )
+
+    if (-not $PSCmdlet.ShouldProcess($MyInvocation.MyCommand.Name, 'Run')) {
+        return
+    }
 
     $powershell = Get-PglPowerShellExecutable
     $cleanupScript = Join-Path $PSScriptRoot 'stop-pgrx-test-clusters.ps1'
@@ -158,6 +174,13 @@ else {
 }
 
 function New-FreePort {
+    [CmdletBinding(SupportsShouldProcess)]
+    param()
+
+    if (-not $PSCmdlet.ShouldProcess($MyInvocation.MyCommand.Name, 'Run')) {
+        return
+    }
+
     $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
     $listener.Start()
     try {
@@ -403,9 +426,14 @@ function Wait-WorkerPidGone {
 }
 
 function Stop-WorkerProcess {
+    [CmdletBinding(SupportsShouldProcess)]
     param([string] $WorkerPid)
 
-    Stop-Process -Id ([int] $WorkerPid) -Force -ErrorAction Stop
+    if (-not $PSCmdlet.ShouldProcess($MyInvocation.MyCommand.Name, 'Run')) {
+        return
+    }
+
+Stop-Process -Id ([int] $WorkerPid) -Force -ErrorAction Stop
 }
 
 function Wait-DatabaseReady {

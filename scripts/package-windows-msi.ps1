@@ -300,4 +300,4 @@ if ($env:GITHUB_OUTPUT) {
     "msi_artifact_path=$msiPath" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
 }
 
-Write-Host "MSI: $msiPath"
+Write-Information -MessageData "MSI: $msiPath" -InformationAction Continue

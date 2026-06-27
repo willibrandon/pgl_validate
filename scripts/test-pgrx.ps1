@@ -33,7 +33,12 @@ if (-not $CargoPgrxArgs -or $CargoPgrxArgs.Count -eq 0) {
 $env:RUST_TEST_THREADS = '1'
 
 function Stop-ProcessTree {
+    [CmdletBinding(SupportsShouldProcess)]
     param([int] $ProcessId)
+
+    if (-not $PSCmdlet.ShouldProcess($MyInvocation.MyCommand.Name, 'Run')) {
+        return
+    }
 
     Stop-PglProcessTree -ProcessId $ProcessId
 }
@@ -125,7 +130,6 @@ function ConvertTo-CommandLineArgument {
 
 function Get-PgrxPgConfig {
     param(
-        [string] $Root,
         [int] $PgMajor
     )
 
@@ -167,7 +171,7 @@ try {
     & (Join-Path $PSScriptRoot 'stop-pgrx-test-clusters.ps1') @stopArgs
 
     $runner = Join-Path $PSScriptRoot 'pgrx-vs.ps1'
-    $pgConfig = Get-PgrxPgConfig -Root $root -PgMajor $PgMajor
+    $pgConfig = Get-PgrxPgConfig -PgMajor $PgMajor
     $extensionSql = Get-ExtensionSqlPath -Root $root -PgConfig $pgConfig
     Assert-PglogicalInstalled -PgConfig $pgConfig -PgMajor $PgMajor
 

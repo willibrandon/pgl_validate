@@ -75,7 +75,7 @@ function Get-PglogicalReleaseTag {
 .SYNOPSIS
 Returns GitHub API headers, authenticated when CI provides a token.
 #>
-function Get-GitHubApiHeaders {
+function Get-GitHubApiHeader {
     $headers = @{ 'User-Agent' = 'pgl_validate-ci/1.0' }
     if (-not [string]::IsNullOrWhiteSpace($env:GITHUB_TOKEN)) {
         $headers['Authorization'] = "Bearer $env:GITHUB_TOKEN"
@@ -95,7 +95,7 @@ function Get-GitHubRefCommit {
         [string] $Ref
     )
 
-    $headers = Get-GitHubApiHeaders
+    $headers = Get-GitHubApiHeader
     $refUri = "https://api.github.com/repos/$Repository/git/ref/tags/$Ref"
     try {
         $refObject = Invoke-RestMethod -Uri $refUri -Headers $headers
@@ -140,8 +140,8 @@ function Save-GitHubSourceArchive {
     }
 
     $tarballUri = "https://api.github.com/repos/$Repository/tarball/$Ref"
-    Invoke-WebRequest -Uri $tarballUri -OutFile $Destination -Headers (Get-GitHubApiHeaders)
-    Write-Host "Downloaded $Repository@$Ref ($commit)"
+    Invoke-WebRequest -Uri $tarballUri -OutFile $Destination -Headers (Get-GitHubApiHeader)
+    Write-Information -MessageData "Downloaded $Repository@$Ref ($commit)" -InformationAction Continue
 }
 
 function Save-CheckedReleaseAsset {
@@ -241,13 +241,18 @@ function Install-PglogicalPackage {
         }
     }
 
-    Update-PglogicalMacDylibReferences -PgConfig $PgConfig
+    Update-PglogicalMacDylibReference -PgConfig $PgConfig
 }
 
-function Update-PglogicalMacDylibReferences {
+function Update-PglogicalMacDylibReference {
+    [CmdletBinding(SupportsShouldProcess)]
     param([string] $PgConfig)
 
-    if (-not (Test-PglMacOS)) {
+    if (-not $PSCmdlet.ShouldProcess($MyInvocation.MyCommand.Name, 'Run')) {
+        return
+    }
+
+if (-not (Test-PglMacOS)) {
         return
     }
 
@@ -308,7 +313,7 @@ function Update-PglogicalMacDylibReferences {
                 throw "install_name_tool failed while changing $dependency to $replacement in $($library.FullName)."
             }
 
-            Write-Host "Relocated $dependencyName for $($library.Name) to $replacement"
+            Write-Information -MessageData "Relocated $dependencyName for $($library.Name) to $replacement" -InformationAction Continue
         }
     }
 }
@@ -461,6 +466,7 @@ function Assert-PglogicalInstalled {
 }
 
 function Set-PglogicalInstallMarker {
+    [CmdletBinding(SupportsShouldProcess)]
     param(
         [string] $PgConfig,
         [string] $Version
@@ -486,10 +492,10 @@ $releaseTag = Get-PglogicalReleaseTag -Repository $Repository -Version $Version
 $markerVersion = "$Repository@$releaseTag"
 
 if (Test-PglogicalInstalled -PgConfig $PgConfig -Version $markerVersion) {
-    Update-PglogicalMacDylibReferences -PgConfig $PgConfig
+    Update-PglogicalMacDylibReference -PgConfig $PgConfig
     Assert-PglogicalInstalled -PgConfig $PgConfig
-    Write-Host "pglogical $markerVersion is already installed for $pgVersion"
-    Write-Host "pg_config: $PgConfig"
+    Write-Information -MessageData "pglogical $markerVersion is already installed for $pgVersion" -InformationAction Continue
+    Write-Information -MessageData "pg_config: $PgConfig" -InformationAction Continue
     return
 }
 
@@ -520,7 +526,7 @@ try {
         Save-CheckedReleaseAsset -BaseUri $baseUri -Asset $asset -Destination $archivePath -ChecksumsPath $checksumsPath
         Expand-ReleaseAsset -ArchivePath $archivePath -ExtractDir $extractDir
         Install-PglogicalPackage -ExtractDir $extractDir -PgConfig $PgConfig
-        Write-Host "Installed pglogical $Version package $asset for $pgVersion"
+        Write-Information -MessageData "Installed pglogical $Version package $asset for $pgVersion" -InformationAction Continue
     }
     elseif ($InstallMode -eq 'package') {
         $architecture = [Runtime.InteropServices.RuntimeInformation]::OSArchitecture
@@ -546,12 +552,12 @@ try {
         }
         Expand-ReleaseAsset -ArchivePath $archivePath -ExtractDir $extractDir
         Install-PglogicalSource -ExtractDir $extractDir -PgConfig $PgConfig
-        Write-Host "Built and installed pglogical $markerVersion from source for $pgVersion"
+        Write-Information -MessageData "Built and installed pglogical $markerVersion from source for $pgVersion" -InformationAction Continue
     }
 
     Assert-PglogicalInstalled -PgConfig $PgConfig
     Set-PglogicalInstallMarker -PgConfig $PgConfig -Version $markerVersion
-    Write-Host "pg_config: $PgConfig"
+    Write-Information -MessageData "pg_config: $PgConfig" -InformationAction Continue
 } finally {
     Remove-Item -LiteralPath $workDir -Recurse -Force -ErrorAction SilentlyContinue
 }

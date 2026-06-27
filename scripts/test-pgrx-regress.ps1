@@ -12,6 +12,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+$script:PglRegressTimeoutSeconds = $TimeoutSeconds
 
 $common = Join-Path $PSScriptRoot 'pgrx-common.ps1'
 . $common
@@ -29,7 +30,12 @@ if (-not $CargoPgrxArgs -or $CargoPgrxArgs.Count -eq 0) {
 }
 
 function Stop-ProcessTree {
+    [CmdletBinding(SupportsShouldProcess)]
     param([int] $ProcessId)
+
+    if (-not $PSCmdlet.ShouldProcess($MyInvocation.MyCommand.Name, 'Run')) {
+        return
+    }
 
     Stop-PglProcessTree -ProcessId $ProcessId
 }
@@ -39,7 +45,7 @@ function Invoke-PglTimedProcess {
         [string] $FilePath,
         [string[]] $ArgumentList,
         [string] $WorkingDirectory = $root,
-        [int] $Seconds = $TimeoutSeconds
+        [int] $Seconds = $script:PglRegressTimeoutSeconds
     )
 
     $startArgs = @{
@@ -68,10 +74,15 @@ function Remove-PglPgrxAutoConfSetting {
     .SYNOPSIS
         Removes a generated ALTER SYSTEM setting from the pgrx test cluster.
     #>
+    [CmdletBinding(SupportsShouldProcess)]
     param(
         [int] $PgMajor,
         [string] $Name
     )
+
+    if (-not $PSCmdlet.ShouldProcess("pg$PgMajor postgresql.auto.conf", "Remove $Name")) {
+        return
+    }
 
     $dataDirectory = Join-Path (Get-PglPgrxHome) "data-$PgMajor"
     $autoConf = Join-Path $dataDirectory 'postgresql.auto.conf'
@@ -122,8 +133,8 @@ function Get-PglPgRegressPath {
 }
 
 function New-PglRegressLauncher {
+    [CmdletBinding(SupportsShouldProcess)]
     param(
-        [string] $PsqlPath,
         [string] $Directory
     )
 
@@ -195,7 +206,7 @@ exec "$PGL_VALIDATE_REAL_PSQL" "$@" -v VERBOSITY=terse
     return (Resolve-Path -LiteralPath $launcherPath).Path
 }
 
-function Get-PglRegressTests {
+function Get-PglRegressTest {
     param([string] $Directory)
 
     $sqlDirectory = Join-Path $Directory 'sql'
@@ -220,6 +231,7 @@ function Get-PglRegressTests {
 }
 
 function New-PglRegressSchedule {
+    [CmdletBinding(SupportsShouldProcess)]
     param(
         [string[]] $Tests,
         [string] $Directory
@@ -232,13 +244,13 @@ function New-PglRegressSchedule {
     return (Resolve-Path -LiteralPath $schedulePath).Path
 }
 
-function Write-PglRegressDiffs {
+function Write-PglRegressDiff {
     $diffsPath = Join-Path $regressDirectory 'regression.diffs'
     if (Test-Path -LiteralPath $diffsPath) {
-        Write-Host ''
-        Write-Host "----- regression.diffs -----"
+        Write-Information -MessageData '' -InformationAction Continue
+        Write-Information -MessageData "----- regression.diffs -----" -InformationAction Continue
         Get-Content -LiteralPath $diffsPath
-        Write-Host "----- end regression.diffs -----"
+        Write-Information -MessageData "----- end regression.diffs -----" -InformationAction Continue
     }
 }
 
@@ -258,7 +270,7 @@ try {
             $CargoPgrxArgs
         $exitCode = Invoke-PglTimedProcess -FilePath $powershell -ArgumentList $regressCommand
         if ($exitCode -ne 0) {
-            Write-PglRegressDiffs
+            Write-PglRegressDiff
             throw "cargo pgrx regress exited with code $exitCode."
         }
 
@@ -285,8 +297,8 @@ try {
     $dropdb = Get-PglToolPath -PgConfig $pgConfig -Name 'dropdb'
     $createdb = Get-PglToolPath -PgConfig $pgConfig -Name 'createdb'
     $port = 28800 + $PgMajor
-    $launcher = New-PglRegressLauncher -PsqlPath $psql -Directory $launcherDirectory
-    $tests = Get-PglRegressTests -Directory $regressDirectory
+    $launcher = New-PglRegressLauncher -Directory $launcherDirectory
+    $tests = Get-PglRegressTest -Directory $regressDirectory
     $schedule = New-PglRegressSchedule -Tests $tests -Directory $launcherDirectory
     $databaseUser = [Environment]::UserName
     Remove-Item -LiteralPath Env:PGDATABASE -ErrorAction SilentlyContinue
@@ -340,7 +352,7 @@ try {
     )
     $exitCode = Invoke-PglTimedProcess -FilePath $pgRegress -ArgumentList $regressArgs -WorkingDirectory $regressDirectory
     if ($exitCode -ne 0) {
-        Write-PglRegressDiffs
+        Write-PglRegressDiff
         throw "pg_regress exited with code $exitCode."
     }
 }

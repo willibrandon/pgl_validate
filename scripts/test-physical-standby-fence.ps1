@@ -41,7 +41,12 @@ function Assert-UnderRoot {
 }
 
 function Stop-ProcessTree {
+    [CmdletBinding(SupportsShouldProcess)]
     param([int] $ProcessId)
+
+    if (-not $PSCmdlet.ShouldProcess($MyInvocation.MyCommand.Name, 'Run')) {
+        return
+    }
 
     Stop-PglProcessTree -ProcessId $ProcessId
 }
@@ -53,13 +58,13 @@ function Write-LogTail {
     )
 
     if (-not (Test-Path -LiteralPath $Path)) {
-        Write-Host "--- log tail unavailable: $Path does not exist ---"
+        Write-Information -MessageData "--- log tail unavailable: $Path does not exist ---" -InformationAction Continue
         return
     }
 
-    Write-Host "--- log tail: $Path ---"
+    Write-Information -MessageData "--- log tail: $Path ---" -InformationAction Continue
     Get-Content -LiteralPath $Path -Tail $Lines | ForEach-Object {
-        Write-Host $_
+        Write-Information -MessageData $_ -InformationAction Continue
     }
 }
 
@@ -119,12 +124,12 @@ function Write-WindowsPathAccess {
     }
 
     $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
-    Write-Host "--- Windows path access: $Path ---"
-    Write-Host "identity: $($identity.Name)"
-    Write-Host "sid: $($identity.User.Value)"
+    Write-Information -MessageData "--- Windows path access: $Path ---" -InformationAction Continue
+    Write-Information -MessageData "identity: $($identity.Name)" -InformationAction Continue
+    Write-Information -MessageData "sid: $($identity.User.Value)" -InformationAction Continue
 
     if (-not (Test-Path -LiteralPath $Path)) {
-        Write-Host 'path does not exist'
+        Write-Information -MessageData 'path does not exist' -InformationAction Continue
         return
     }
 
@@ -171,10 +176,15 @@ function Get-ExtensionSqlPath {
 }
 
 function Stop-TestCluster {
+    [CmdletBinding(SupportsShouldProcess)]
     param(
         [string] $Data,
         [string] $PgCtl
     )
+
+    if (-not $PSCmdlet.ShouldProcess($MyInvocation.MyCommand.Name, 'Run')) {
+        return
+    }
 
     if (Test-Path -LiteralPath $Data) {
         try {
@@ -195,6 +205,7 @@ function Stop-TestCluster {
 }
 
 function Remove-TestData {
+    [CmdletBinding(SupportsShouldProcess)]
     param([string] $Data)
 
     if (Test-Path -LiteralPath $Data) {
@@ -216,10 +227,15 @@ function Remove-TestData {
 }
 
 function Start-CleanupWatchdog {
+    [CmdletBinding(SupportsShouldProcess)]
     param(
         [int] $ParentPid,
         [switch] $RemoveData
     )
+
+    if (-not $PSCmdlet.ShouldProcess($MyInvocation.MyCommand.Name, 'Run')) {
+        return
+    }
 
     $powershell = Get-PglPowerShellExecutable
 
@@ -249,6 +265,13 @@ else {
 }
 
 function New-FreePort {
+    [CmdletBinding(SupportsShouldProcess)]
+    param()
+
+    if (-not $PSCmdlet.ShouldProcess($MyInvocation.MyCommand.Name, 'Run')) {
+        return
+    }
+
     $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
     $listener.Start()
     try {
@@ -280,7 +303,7 @@ function Invoke-Sql {
     return ($output -join "`n").Trim()
 }
 
-function Wait-SqlEquals {
+function Wait-SqlEqual {
     param(
         [string] $Database,
         [string] $Sql,
@@ -417,13 +440,13 @@ SELECT pg_create_physical_replication_slot('pgl_validate_standby_slot');
         -TimeoutSeconds 60 | Out-Null
 
     Write-Step 'Waiting for standby recovery and streaming replay'
-    Wait-SqlEquals `
+    Wait-SqlEqual `
         -Database 'postgres' `
         -Port $script:StandbyPort `
         -Sql 'SELECT pg_is_in_recovery()::text' `
         -Expected 'true' `
         -TimeoutSeconds $TimeoutSeconds
-    Wait-SqlEquals `
+    Wait-SqlEqual `
         -Database 'postgres' `
         -Sql "SELECT count(*)::text FROM pg_stat_replication WHERE state IN ('streaming','catchup')" `
         -Expected '1' `
@@ -431,7 +454,7 @@ SELECT pg_create_physical_replication_slot('pgl_validate_standby_slot');
 
     Write-Step 'Replicating a post-basebackup row to prove live physical replay'
     Invoke-Sql -Database 'postgres' -Sql "INSERT INTO public.accounts VALUES (2, 'streamed')" | Out-Null
-    Wait-SqlEquals `
+    Wait-SqlEqual `
         -Database 'postgres' `
         -Port $script:StandbyPort `
         -Sql "SELECT count(*)::text FROM public.accounts WHERE id = 2 AND value = 'streamed'" `

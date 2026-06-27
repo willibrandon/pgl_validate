@@ -51,7 +51,12 @@ function Assert-UnderRoot {
 }
 
 function Stop-ProcessTree {
+    [CmdletBinding(SupportsShouldProcess)]
     param([int] $ProcessId)
+
+    if (-not $PSCmdlet.ShouldProcess($MyInvocation.MyCommand.Name, 'Run')) {
+        return
+    }
 
     Stop-PglProcessTree -ProcessId $ProcessId
 }
@@ -86,7 +91,7 @@ function Invoke-CheckedProcess {
     return $process.ExitCode
 }
 
-function Invoke-PgrxVs {
+function Invoke-PgrxVisualStudio {
     param(
         [string[]] $Arguments,
         [int] $TimeoutSeconds
@@ -116,6 +121,13 @@ function ConvertTo-PowerShellLiteral {
 }
 
 function New-FreePort {
+    [CmdletBinding(SupportsShouldProcess)]
+    param()
+
+    if (-not $PSCmdlet.ShouldProcess($MyInvocation.MyCommand.Name, 'Run')) {
+        return
+    }
+
     $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
     $listener.Start()
     try {
@@ -149,7 +161,7 @@ function Invoke-Sql {
     return ($output -join "`n").Trim()
 }
 
-function Wait-SqlEquals {
+function Wait-SqlEqual {
     param(
         [string] $Psql,
         [int] $Port,
@@ -229,10 +241,15 @@ SELECT COALESCE((
 }
 
 function Stop-TestCluster {
+    [CmdletBinding(SupportsShouldProcess)]
     param(
         [string] $Data,
         [string] $PgCtl
     )
+
+    if (-not $PSCmdlet.ShouldProcess($MyInvocation.MyCommand.Name, 'Run')) {
+        return
+    }
 
     if (Test-Path -LiteralPath $Data) {
         try {
@@ -248,14 +265,22 @@ function Stop-TestCluster {
     }
 }
 
-function Stop-TestClusters {
-    Stop-TestCluster -Data $providerData -PgCtl $script:ProviderPgCtl
+function Stop-TestClusterGroup {
+    [CmdletBinding(SupportsShouldProcess)]
+    param()
+
+    if (-not $PSCmdlet.ShouldProcess($MyInvocation.MyCommand.Name, 'Run')) {
+        return
+    }
+
+Stop-TestCluster -Data $providerData -PgCtl $script:ProviderPgCtl
     Stop-TestCluster -Data $targetData -PgCtl $script:TargetPgCtl
     & $cleanupScript -Root $root
     Start-Sleep -Milliseconds 500
 }
 
 function Remove-TestData {
+    [CmdletBinding(SupportsShouldProcess)]
     param([string[]] $Paths)
 
     foreach ($path in $Paths) {
@@ -279,7 +304,12 @@ function Remove-TestData {
 }
 
 function Start-CleanupWatchdog {
+    [CmdletBinding(SupportsShouldProcess)]
     param([int] $ParentPid)
+
+    if (-not $PSCmdlet.ShouldProcess($MyInvocation.MyCommand.Name, 'Run')) {
+        return
+    }
 
     $powershell = Get-PglPowerShellExecutable
     $removeFlag = if ($KeepData) { '$false' } else { '$true' }
@@ -331,14 +361,14 @@ $watchdog = Start-CleanupWatchdog -ParentPid $PID
 
 try {
     Write-Step "Cleaning prior mixed-major pglogical clusters"
-    Stop-TestClusters
+    Stop-TestClusterGroup
     if (-not $KeepData) {
         Remove-TestData -Paths @($providerData, $targetData)
     }
     Remove-Item -LiteralPath $providerLog, $targetLog -Force -ErrorAction SilentlyContinue
 
     Write-Step "Installing pglogical $PglogicalVersion release for pg$ProviderPgMajor and pg$TargetPgMajor"
-    Invoke-PgrxVs `
+    Invoke-PgrxVisualStudio `
         -Arguments @(
             'pwsh',
             '-NoProfile',
@@ -354,7 +384,7 @@ try {
             $providerPgConfig
         ) `
         -TimeoutSeconds $BuildTimeoutSeconds
-    Invoke-PgrxVs `
+    Invoke-PgrxVisualStudio `
         -Arguments @(
             'pwsh',
             '-NoProfile',
@@ -372,18 +402,18 @@ try {
         -TimeoutSeconds $BuildTimeoutSeconds
 
     Write-Step "Installing pgl_validate for pg$ProviderPgMajor and pg$TargetPgMajor"
-    Invoke-PgrxVs `
+    Invoke-PgrxVisualStudio `
         -Arguments @('cargo', 'pgrx', 'install', '--pg-config', $providerPgConfig, '--no-default-features', '--features', "pg$ProviderPgMajor") `
         -TimeoutSeconds $BuildTimeoutSeconds
-    Invoke-PgrxVs `
+    Invoke-PgrxVisualStudio `
         -Arguments @('cargo', 'pgrx', 'install', '--pg-config', $targetPgConfig, '--no-default-features', '--features', "pg$TargetPgMajor") `
         -TimeoutSeconds $BuildTimeoutSeconds
 
     Write-Step "Generating extension SQL for pg$ProviderPgMajor and pg$TargetPgMajor"
-    Invoke-PgrxVs `
+    Invoke-PgrxVisualStudio `
         -Arguments @('cargo', 'pgrx', 'schema', '--pg-config', $providerPgConfig, '--no-default-features', '--features', "pg$ProviderPgMajor", '--out', $providerExtensionSql) `
         -TimeoutSeconds 120
-    Invoke-PgrxVs `
+    Invoke-PgrxVisualStudio `
         -Arguments @('cargo', 'pgrx', 'schema', '--pg-config', $targetPgConfig, '--no-default-features', '--features', "pg$TargetPgMajor", '--out', $targetExtensionSql) `
         -TimeoutSeconds 120
 
@@ -514,7 +544,7 @@ VALUES
     (1, 'same', '{"kind":"primary","n":1}', 42.500000, TIMESTAMPTZ '2026-06-26 12:00:00+00'),
     (2, 'unicode-free', '{"kind":"secondary","items":[1,2,3]}', -7.125000, TIMESTAMPTZ '2020-01-02 03:04:05+00')
 "@ | Out-Null
-    Wait-SqlEquals `
+    Wait-SqlEqual `
         -Psql $script:TargetPsql `
         -Port $targetPort `
         -Database 'target' `
@@ -595,7 +625,7 @@ FROM participants, node_results
 }
 finally {
     try {
-        Stop-TestClusters
+        Stop-TestClusterGroup
     }
     finally {
         if (-not $KeepData) {

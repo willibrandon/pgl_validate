@@ -38,7 +38,12 @@ function Assert-WorkspaceTargetPath {
 }
 
 function Stop-ProcessTree {
+    [CmdletBinding(SupportsShouldProcess)]
     param([int] $ProcessId)
+
+    if (-not $PSCmdlet.ShouldProcess($MyInvocation.MyCommand.Name, 'Run')) {
+        return
+    }
 
     Stop-PglProcessTree -ProcessId $ProcessId
 }
@@ -86,6 +91,7 @@ function Get-PgCtl {
             return Get-PglToolPath -PgConfig $pgConfig -Name 'pg_ctl'
         }
         catch {
+            Write-Verbose "Could not resolve pg_ctl from pgrx pg$major; falling back to PATH."
         }
     }
 
@@ -98,7 +104,12 @@ function Get-PgCtl {
 }
 
 function Stop-DataDirectoryCluster {
+    [CmdletBinding(SupportsShouldProcess)]
     param([string] $DataDirectory)
+
+    if (-not $PSCmdlet.ShouldProcess($MyInvocation.MyCommand.Name, 'Run')) {
+        return
+    }
 
     if (-not (Test-Path -LiteralPath $DataDirectory)) {
         return
@@ -116,7 +127,7 @@ function Stop-DataDirectoryCluster {
     }
 }
 
-function Get-RepoClusterDataDirectories {
+function Get-RepoClusterDataDirectory {
     $known = @($configuredTargets | Where-Object { Test-Path -LiteralPath $_ })
 
     $mixedMajorTargets = @()
@@ -148,7 +159,7 @@ function Get-RepoClusterDataDirectories {
         Sort-Object -Unique
 }
 
-$targets = Get-RepoClusterDataDirectories
+$targets = Get-RepoClusterDataDirectory
 
 foreach ($target in $targets) {
     Stop-DataDirectoryCluster -DataDirectory $target

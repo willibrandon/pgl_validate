@@ -5,7 +5,7 @@ Checks that design contract sections mirror installable sources.
 .DESCRIPTION
 The design document names Appendix A as the catalog DDL reference. This check
 keeps that appendix synchronized with sql/bootstrap/001_catalog.sql while
-ignoring platform line-ending differences. It also verifies that the §19.1 GUC
+ignoring platform line-ending differences. It also verifies that the section 19.1 GUC
 table lists exactly the `pgl_validate.*` GUCs registered by src/lib.rs.
 #>
 [CmdletBinding()]
@@ -56,7 +56,7 @@ Write-Output 'docs/design.md Appendix A matches sql/bootstrap/001_catalog.sql.'
 
 $gucSection = [regex]::Match($design, '(?s)### 19\.1 GUCs(.*?)### 19\.2 Governance')
 if (-not $gucSection.Success) {
-    Write-Error 'docs/design.md is missing the §19.1 GUCs section.'
+    Write-Error 'docs/design.md is missing the section 19.1 GUCs section.'
 }
 
 $registeredGucs = [regex]::Matches($lib, 'c"(pgl_validate\.[^"]+)"') |
@@ -70,11 +70,11 @@ $missingGucs = $registeredGucs | Where-Object { $documentedGucs -notcontains $_ 
 $extraGucs = $documentedGucs | Where-Object { $registeredGucs -notcontains $_ }
 if ($missingGucs -or $extraGucs) {
     if ($missingGucs) {
-        Write-Error "docs/design.md §19.1 is missing registered GUCs: $($missingGucs -join ', ')"
+        Write-Error "docs/design.md section 19.1 is missing registered GUCs: $($missingGucs -join ', ')"
     }
     if ($extraGucs) {
-        Write-Error "docs/design.md §19.1 lists unregistered GUCs: $($extraGucs -join ', ')"
+        Write-Error "docs/design.md section 19.1 lists unregistered GUCs: $($extraGucs -join ', ')"
     }
 }
 
-Write-Output 'docs/design.md §19.1 GUC table matches src/lib.rs.'
+Write-Output 'docs/design.md section 19.1 GUC table matches src/lib.rs.'

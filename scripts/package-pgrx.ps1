@@ -11,6 +11,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
+$script:PackagePlatformOverride = $Platform
 
 $common = Join-Path $PSScriptRoot 'pgrx-common.ps1'
 . $common
@@ -35,8 +36,8 @@ function ConvertTo-PglPackageArchitecture {
 }
 
 function Get-PglPackagePlatform {
-    if (-not [string]::IsNullOrWhiteSpace($Platform)) {
-        return $Platform
+    if (-not [string]::IsNullOrWhiteSpace($script:PackagePlatformOverride)) {
+        return $script:PackagePlatformOverride
     }
 
     $architecture = ConvertTo-PglPackageArchitecture -Architecture ([Runtime.InteropServices.RuntimeInformation]::OSArchitecture)
@@ -175,5 +176,5 @@ if ($env:GITHUB_OUTPUT) {
     "package_dir=$packageDirectory" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
 }
 
-Write-Host "Packaged $packageName"
-Write-Host "Archive: $archivePath"
+Write-Information -MessageData "Packaged $packageName" -InformationAction Continue
+Write-Information -MessageData "Archive: $archivePath" -InformationAction Continue

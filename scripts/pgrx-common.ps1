@@ -192,6 +192,7 @@ function Get-PglExtensionSqlPath {
 }
 
 function Stop-PglProcessTree {
+    [CmdletBinding(SupportsShouldProcess)]
     param([int] $ProcessId)
 
     if (-not (Get-Process -Id $ProcessId -ErrorAction SilentlyContinue)) {
@@ -254,6 +255,7 @@ function Get-PglUnixSocketOption {
 }
 
 function Start-PglHiddenProcess {
+    [CmdletBinding(SupportsShouldProcess)]
     param(
         [string] $FilePath,
         [string[]] $ArgumentList
