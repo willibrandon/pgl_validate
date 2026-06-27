@@ -451,18 +451,21 @@ try {
     Write-Step 'Creating coordinator/provider/target databases and extensions'
     Invoke-Sql -Database 'postgres' -Sql 'CREATE DATABASE provider' | Out-Null
     Invoke-Sql -Database 'postgres' -Sql 'CREATE DATABASE target' | Out-Null
+    Invoke-Sql -Database 'postgres' -Sql 'CREATE DATABASE fanout' | Out-Null
     Invoke-Sql -Database 'postgres' -Sql 'CREATE DATABASE degraded' | Out-Null
     Invoke-Sql -Database 'postgres' -Port $script:CascadePort -Sql 'CREATE DATABASE cascade' | Out-Null
     Invoke-Sql -Database 'postgres' -Sql 'CREATE EXTENSION pgl_validate' | Out-Null
 
     $providerDsn = "host=localhost port=$script:Port dbname=provider user=postgres connect_timeout=5 application_name=pgl_validate_pglogical"
     $targetDsn = "host=localhost port=$script:Port dbname=target user=postgres connect_timeout=5 application_name=pgl_validate_pglogical"
+    $fanoutDsn = "host=localhost port=$script:Port dbname=fanout user=postgres connect_timeout=5 application_name=pgl_validate_pglogical"
     $degradedDsn = "host=localhost port=$script:Port dbname=degraded user=postgres connect_timeout=5 application_name=pgl_validate_pglogical"
     $cascadeDsn = "host=localhost port=$script:CascadePort dbname=cascade user=postgres connect_timeout=5 application_name=pgl_validate_pglogical"
     $sequenceProviderDsn = "host=localhost port=$script:Port dbname=seq_provider user=postgres connect_timeout=5 application_name=pgl_validate_pglogical"
     $sequenceTargetDsn = "host=localhost port=$script:Port dbname=seq_target user=postgres connect_timeout=5 application_name=pgl_validate_pglogical"
     $providerDsnSql = ConvertTo-SqlLiteral $providerDsn
     $targetDsnSql = ConvertTo-SqlLiteral $targetDsn
+    $fanoutDsnSql = ConvertTo-SqlLiteral $fanoutDsn
     $degradedDsnSql = ConvertTo-SqlLiteral $degradedDsn
     $cascadeDsnSql = ConvertTo-SqlLiteral $cascadeDsn
     $sequenceProviderDsnSql = ConvertTo-SqlLiteral $sequenceProviderDsn
@@ -506,6 +509,27 @@ SELECT pglogical.create_subscription(
     $slotName = Wait-SubscriptionReady -TimeoutSeconds $TimeoutSeconds
     $slotNameSql = ConvertTo-SqlLiteral $slotName
 
+    Write-Step 'Creating second direct pglogical target for fan-out validation'
+    Invoke-Sql -Database 'fanout' -Sql 'CREATE EXTENSION pgl_validate' | Out-Null
+    Invoke-Sql -Database 'fanout' -Sql 'CREATE EXTENSION pglogical' | Out-Null
+    Invoke-Sql -Database 'fanout' -Sql 'CREATE TABLE public.accounts(id int PRIMARY KEY, value text)' | Out-Null
+    Invoke-Sql -Database 'fanout' -Sql "SELECT pglogical.create_node('fanout', $fanoutDsnSql)" | Out-Null
+    Invoke-Sql -Database 'fanout' -Sql @"
+SELECT pglogical.create_subscription(
+    'sub_fanout',
+    $providerDsnSql,
+    ARRAY['default','pgl_validate_barrier'],
+    false,
+    false,
+    ARRAY[]::text[]
+)
+"@ | Out-Null
+    $fanoutSlotName = Wait-SubscriptionReady `
+        -SubscriberDatabase 'fanout' `
+        -SubscriptionName 'sub_fanout' `
+        -ProviderDatabase 'provider' `
+        -TimeoutSeconds $TimeoutSeconds
+
     Write-Step 'Creating degraded pglogical target without the barrier repset'
     Invoke-Sql -Database 'degraded' -Sql 'CREATE EXTENSION pgl_validate' | Out-Null
     Invoke-Sql -Database 'degraded' -Sql 'CREATE EXTENSION pglogical' | Out-Null
@@ -531,6 +555,11 @@ SELECT pglogical.create_subscription(
     Invoke-Sql -Database 'provider' -Sql "INSERT INTO public.accounts VALUES (1, 'same')" | Out-Null
     Wait-SqlEquals `
         -Database 'target' `
+        -Sql 'SELECT count(*)::text FROM public.accounts WHERE id = 1 AND value = ''same''' `
+        -Expected '1' `
+        -TimeoutSeconds $TimeoutSeconds
+    Wait-SqlEquals `
+        -Database 'fanout' `
         -Sql 'SELECT count(*)::text FROM public.accounts WHERE id = 1 AND value = ''same''' `
         -Expected '1' `
         -TimeoutSeconds $TimeoutSeconds
@@ -596,8 +625,9 @@ SELECT EXISTS (
 INSERT INTO pgl_validate.peer(name, dsn, backend, subscription_name, replication_sets)
 VALUES ('target', $targetDsnSql, 'pglogical', 'sub', ARRAY['default'])
 "@ | Out-Null
-    $compareVerdict = Invoke-Sql -Database 'provider' -Sql @"
-SELECT (pgl_validate.compare_table(
+    $compareResult = Invoke-Sql -Database 'provider' -Sql @"
+SELECT run_id::text || ';' || verdict
+FROM pgl_validate.compare_table(
     'public.accounts'::regclass,
     ARRAY['target'],
     jsonb_build_object(
@@ -607,8 +637,14 @@ SELECT (pgl_validate.compare_table(
         'fence_timeout_ms', 30000,
         'fence_poll_interval_ms', 100
     )
-)).verdict
+)
 "@
+    $compareParts = $compareResult.Split(';', 2)
+    if ($compareParts.Count -ne 2) {
+        throw "unexpected compare_table result: $compareResult"
+    }
+    $compareRunId = $compareParts[0]
+    $compareVerdict = $compareParts[1]
     if ($compareVerdict -ne 'match') {
         throw "unexpected compare_table verdict: $compareVerdict"
     }
@@ -618,7 +654,8 @@ SELECT EXISTS (
     SELECT 1
     FROM pgl_validate.table_result tr
     JOIN pgl_validate.fence_attempt fa USING (run_id)
-    WHERE tr.schema_name = 'public'
+    WHERE tr.run_id = $compareRunId
+      AND tr.schema_name = 'public'
       AND tr.table_name = 'accounts'
       AND tr.verdict = 'match'
       AND fa.status = 'converged'
@@ -626,6 +663,80 @@ SELECT EXISTS (
 "@
     if ($compareFenceRecorded -ne 'true') {
         throw 'compare_table did not record a converged fence'
+    }
+
+    Write-Step "Validating pglogical direct fan-out through slots $slotName and $fanoutSlotName"
+    Invoke-Sql -Database 'provider' -Sql @"
+INSERT INTO pgl_validate.peer(name, dsn, backend, subscription_name, replication_sets)
+VALUES ('fanout', $fanoutDsnSql, 'pglogical', 'sub_fanout', ARRAY['default'])
+ON CONFLICT (name) DO UPDATE
+SET dsn = EXCLUDED.dsn,
+    backend = EXCLUDED.backend,
+    subscription_name = EXCLUDED.subscription_name,
+    replication_sets = EXCLUDED.replication_sets
+"@ | Out-Null
+    $fanoutResult = Invoke-Sql -Database 'provider' -Sql @"
+SELECT run_id::text || ';' || verdict
+FROM pgl_validate.compare_table(
+    'public.accounts'::regclass,
+    ARRAY['target','fanout'],
+    jsonb_build_object(
+        'provider_dsn', $providerDsnSql,
+        'provider_node', 'provider',
+        'repsets', jsonb_build_array('default'),
+        'fence_timeout_ms', 30000,
+        'fence_poll_interval_ms', 100
+    )
+)
+"@
+    $fanoutParts = $fanoutResult.Split(';', 2)
+    if ($fanoutParts.Count -ne 2) {
+        throw "unexpected fan-out compare_table result: $fanoutResult"
+    }
+    $fanoutRunId = $fanoutParts[0]
+    $fanoutVerdict = $fanoutParts[1]
+    if ($fanoutVerdict -ne 'match') {
+        throw "unexpected fan-out compare_table verdict: $fanoutVerdict"
+    }
+
+    $fanoutFenceShape = Invoke-Sql -Database 'provider' -Sql @"
+SELECT
+    count(*) FILTER (
+        WHERE re.provider_node = 'provider'
+          AND re.target_node IN ('target','fanout')
+          AND fa.status = 'converged'
+    )::text || ';' ||
+    count(DISTINCT re.target_node) FILTER (
+        WHERE re.provider_node = 'provider'
+          AND re.target_node IN ('target','fanout')
+          AND fa.status = 'converged'
+    )::text || ';' ||
+    count(*) FILTER (
+        WHERE br.origin_node = 'provider'
+    )::text
+FROM pgl_validate.run_edge re
+JOIN pgl_validate.fence_attempt fa USING (run_id, edge_id)
+LEFT JOIN pgl_validate.fence_barrier_run br USING (run_id, epoch_seq, edge_id)
+WHERE re.run_id = $fanoutRunId
+  AND re.backend = 'pglogical'
+  AND fa.epoch_seq = 1
+"@
+    if ($fanoutFenceShape -ne '2;2;2') {
+        throw "pglogical fan-out fence vector was not recorded correctly: $fanoutFenceShape"
+    }
+
+    $fanoutNodeShape = Invoke-Sql -Database 'provider' -Sql @"
+SELECT tr.verdict || ';' ||
+       string_agg(tnr.node || ':' || tnr.n_rows::text, ',' ORDER BY tnr.node)
+FROM pgl_validate.table_result tr
+JOIN pgl_validate.table_node_result tnr USING (run_id, schema_name, table_name)
+WHERE tr.run_id = $fanoutRunId
+  AND tr.schema_name = 'public'
+  AND tr.table_name = 'accounts'
+GROUP BY tr.verdict
+"@
+    if ($fanoutNodeShape -ne 'match;fanout:1,local:1,target:1') {
+        throw "pglogical fan-out node results were incomplete: $fanoutNodeShape"
     }
 
     Write-Step 'Re-fencing the recorded pglogical edge vector'
@@ -636,14 +747,7 @@ DECLARE
     v_epoch int;
     v_edges int;
 BEGIN
-    SELECT tr.run_id
-    INTO v_run_id
-    FROM pgl_validate.table_result tr
-    WHERE tr.schema_name = 'public'
-      AND tr.table_name = 'accounts'
-      AND tr.verdict = 'match'
-    ORDER BY tr.run_id DESC
-    LIMIT 1;
+    v_run_id := $compareRunId;
 
     SELECT COALESCE(max(fe.epoch_seq), 0) + 1
     INTO v_epoch
