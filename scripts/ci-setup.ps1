@@ -331,19 +331,18 @@ function Get-WindowsPostgresArchitecture {
 
 <#
 .SYNOPSIS
-Returns the official PostgreSQL Windows binary zip URL for the requested major.
+Returns the pglogical-hosted PostgreSQL Windows binary zip URL for the requested major.
 #>
 function Get-WindowsPostgresBinaryUri {
     param([int] $Major)
 
-    $postgresVersion = Get-PostgresReleaseVersion -Major $Major
     $architecture = Get-WindowsPostgresArchitecture
-    return "https://get.enterprisedb.com/postgresql/postgresql-$postgresVersion-1-windows-$architecture-binaries.zip"
+    return "https://github.com/willibrandon/pglogical/releases/download/pg-binaries/postgresql-$Major-windows-$architecture.zip"
 }
 
 <#
 .SYNOPSIS
-Downloads an official PostgreSQL Windows binary zip with bounded retries.
+Downloads a PostgreSQL Windows binary zip with bounded retries.
 #>
 function Invoke-PostgresBinaryDownload {
     param(
@@ -375,7 +374,7 @@ function Invoke-PostgresBinaryDownload {
 
 <#
 .SYNOPSIS
-Installs PostgreSQL from the same official Windows binary zip that cargo-pgrx expects.
+Installs PostgreSQL from the pglogical-hosted Windows binary zip.
 #>
 function Install-WindowsPostgresBinary {
     $postgresVersion = Get-PostgresReleaseVersion -Major $PgMajor
@@ -693,14 +692,8 @@ function Initialize-WindowsPostgreSql {
         Invoke-Logged -FilePath $choco -Arguments @('install', 'cmake', '-y', '--no-progress')
     }
 
-    try {
-        Invoke-Logged -FilePath 'cargo' -Arguments @('pgrx', 'init', "--pg$PgMajor", 'download')
-    }
-    catch {
-        Write-Information -MessageData "cargo-pgrx PostgreSQL download failed; installing PostgreSQL $PgMajor from the official Windows binary zip instead." -InformationAction Continue
-        Write-Information -MessageData $_.Exception.Message -InformationAction Continue
-        Install-WindowsPostgresBinary
-    }
+    Write-Information -MessageData "Installing PostgreSQL $PgMajor from the pglogical-hosted Windows binary zip." -InformationAction Continue
+    Install-WindowsPostgresBinary
 }
 
 Install-CargoPgrx
