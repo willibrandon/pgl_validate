@@ -111,7 +111,21 @@ It writes a pgrx install tree and a zip archive under `target`:
 ```
 
 Tagged releases run the same packaging path for PostgreSQL 15-18 on Linux
-x64/arm64, Windows x64, Windows ARM64-hosted x64, and macOS ARM64.
+x64/arm64, Windows x64, Windows ARM64-hosted x64, and macOS ARM64. Windows x64
+releases also publish an MSI installer for each PostgreSQL major.
+
+```powershell
+.\scripts\package-windows-msi.ps1 -PgMajor 18
+```
+
+For local pgrx installs, pass the PostgreSQL root explicitly:
+
+```powershell
+msiexec /i .\target\package-artifacts\pgl_validate-0.1.0-pg18-windows-x64.msi `
+  POSTGRESQLDIR="$env:USERPROFILE\.pgrx\18.4" `
+  WIXUI_DONTSETPATH=1 ALLUSERS=2 MSIINSTALLPERUSER=1 `
+  /qn /norestart
+```
 
 If `cargo check` is launched by an editor, start that editor from a Visual
 Studio developer shell, or use the checked-in VS Code workspace settings. They
@@ -186,3 +200,7 @@ optional automatic schedule dispatch, dynamic-worker async run orchestration
 with durable paused-task resume, and
 fenced paths exercised against real pglogical, native logical, and physical
 standby replication.
+
+## License
+
+MIT. Copyright (c) 2026 Brandon Williams.

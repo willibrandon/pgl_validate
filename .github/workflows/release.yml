@@ -109,11 +109,39 @@ jobs:
           PGL_VALIDATE_MSVC_ARCH: ${{ matrix.target.msvc_arch }}
         run: ./scripts/pgrx-vs.ps1 pwsh -NoProfile -ExecutionPolicy Bypass -File ./scripts/package-pgrx.ps1 -PgMajor ${{ matrix.pg }} -Platform ${{ matrix.target.platform }}
 
+      - name: Install WiX v5
+        if: matrix.target.platform == 'windows-x64'
+        run: |
+          dotnet tool install --global wix --version 5.0.2
+          & "$env:USERPROFILE\.dotnet\tools\wix.exe" extension add -g WixToolset.UI.wixext/5.0.2
+          "$env:USERPROFILE\.dotnet\tools" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+
+      - name: Build Windows MSI
+        if: matrix.target.platform == 'windows-x64'
+        id: msi
+        env:
+          PGL_VALIDATE_MSVC_ARCH: ${{ matrix.target.msvc_arch }}
+        run: >
+          ./scripts/pgrx-vs.ps1 pwsh -NoProfile -ExecutionPolicy Bypass
+          -File ./scripts/package-windows-msi.ps1
+          -PgMajor ${{ matrix.pg }}
+          -Platform windows-x64
+          -PackageDirectory "${{ steps.package.outputs.package_dir }}"
+          -VerifyInstall
+
       - name: Upload package artifact
         uses: actions/upload-artifact@v7
         with:
           name: ${{ steps.package.outputs.artifact_name }}
           path: ${{ steps.package.outputs.artifact_path }}
+          if-no-files-found: error
+
+      - name: Upload MSI artifact
+        if: matrix.target.platform == 'windows-x64'
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.msi.outputs.msi_artifact_name }}
+          path: ${{ steps.msi.outputs.msi_artifact_path }}
           if-no-files-found: error
 
   publish-github-release:
@@ -137,9 +165,33 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
-          $files = Get-ChildItem -LiteralPath release-artifacts -Recurse -Filter '*.zip' | Select-Object -ExpandProperty FullName
+          $assetDir = Join-Path (Get-Location) 'release-assets'
+          New-Item -ItemType Directory -Force -Path $assetDir | Out-Null
+
+          Get-ChildItem -LiteralPath release-artifacts -Recurse -File |
+            Where-Object { $_.Extension -in @('.zip', '.msi') } |
+            ForEach-Object {
+              Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $assetDir $_.Name) -Force
+            }
+
+          $assets = Get-ChildItem -LiteralPath $assetDir -File | Sort-Object Name
+          if (-not $assets) {
+            throw 'No release package archives or installers were downloaded.'
+          }
+
+          Push-Location $assetDir
+          try {
+            Get-FileHash -Algorithm SHA256 -LiteralPath ($assets | Select-Object -ExpandProperty FullName) |
+              ForEach-Object { "$($_.Hash.ToLowerInvariant())  $([IO.Path]::GetFileName($_.Path))" } |
+              Set-Content -LiteralPath 'checksums.txt' -Encoding ascii
+          }
+          finally {
+            Pop-Location
+          }
+
+          $files = Get-ChildItem -LiteralPath $assetDir -File | Select-Object -ExpandProperty FullName
           if (-not $files) {
-            throw 'No release package archives were downloaded.'
+            throw 'No release assets were prepared.'
           }
 
           gh release view $env:RELEASE_TAG *> $null

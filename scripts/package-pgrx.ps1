@@ -131,6 +131,13 @@ function Test-PglPackageLayout {
     if (-not $library) {
         throw "Package is missing the pgl_validate shared library under $libraryDirectory."
     }
+
+    foreach ($rootFile in @('LICENSE', 'README.md')) {
+        $path = Join-Path $PackageDirectory $rootFile
+        if (-not (Test-Path -LiteralPath $path)) {
+            throw "Package is missing $path."
+        }
+    }
 }
 
 $pgConfig = Get-PglPgrxPgConfig -PgMajor $PgMajor
@@ -155,6 +162,8 @@ New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
 New-Item -ItemType Directory -Force -Path $ArtifactDir | Out-Null
 
 Invoke-PglPackage -PgConfig $pgConfig -PackageDirectory $packageDirectory
+Copy-Item -LiteralPath (Join-Path $root 'LICENSE') -Destination (Join-Path $packageDirectory 'LICENSE') -Force
+Copy-Item -LiteralPath (Join-Path $root 'README.md') -Destination (Join-Path $packageDirectory 'README.md') -Force
 Test-PglPackageLayout -PackageDirectory $packageDirectory
 
 Compress-Archive -LiteralPath $packageDirectory -DestinationPath $archivePath -CompressionLevel Optimal
@@ -162,6 +171,8 @@ Compress-Archive -LiteralPath $packageDirectory -DestinationPath $archivePath -C
 if ($env:GITHUB_OUTPUT) {
     "artifact_name=$packageName" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
     "artifact_path=$archivePath" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+    "package_name=$packageName" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+    "package_dir=$packageDirectory" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
 }
 
 Write-Host "Packaged $packageName"

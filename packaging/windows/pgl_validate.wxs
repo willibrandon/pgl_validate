@@ -1,0 +1,135 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  pgl_validate MSI installer for Windows, built with WiX Toolset v5.
+
+  Variables:
+    VERSION      Display version, including any prerelease suffix.
+    MSI_VERSION  Numeric MSI version, without prerelease suffix.
+    PG_VERSION   PostgreSQL major version.
+    PackageDir   Absolute path to the cargo-pgrx package directory.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
+
+  <?ifndef VERSION ?>
+    <?define VERSION = "0.1.0" ?>
+  <?endif?>
+  <?ifndef MSI_VERSION ?>
+    <?define MSI_VERSION = "0.1.0" ?>
+  <?endif?>
+  <?ifndef PG_VERSION ?>
+    <?define PG_VERSION = "18" ?>
+  <?endif?>
+  <?ifndef PackageDir ?>
+    <?define PackageDir = "..\..\target\package\pgl_validate-0.1.0-pg18-windows-x64" ?>
+  <?endif?>
+  <?ifndef LicenseRtf ?>
+    <?define LicenseRtf = "packaging\windows\license.rtf" ?>
+  <?endif?>
+
+  <!-- Stable per-major UpgradeCode GUIDs allow side-by-side PG major installs. -->
+  <?if $(var.PG_VERSION) = 15 ?>
+    <?define UpgradeGuid = "{7685D277-1D82-45CA-ADA3-924A03CC8EB7}" ?>
+  <?elseif $(var.PG_VERSION) = 16 ?>
+    <?define UpgradeGuid = "{326F3FA9-9210-41AA-AA6A-0A0DE9AA094D}" ?>
+  <?elseif $(var.PG_VERSION) = 17 ?>
+    <?define UpgradeGuid = "{053B1447-A146-45F0-AFF0-9CBD48C11EC9}" ?>
+  <?elseif $(var.PG_VERSION) = 18 ?>
+    <?define UpgradeGuid = "{E1AA9F54-016B-454D-8674-AD47CFD32E2B}" ?>
+  <?else?>
+    <?define UpgradeGuid = "{6F38DE37-A994-4CB7-9FA6-F7725E067FD9}" ?>
+  <?endif?>
+
+  <Package Name="pgl_validate $(var.VERSION) for PostgreSQL $(var.PG_VERSION)"
+           Language="1033"
+           Version="$(var.MSI_VERSION)"
+           Manufacturer="Brandon Williams"
+           UpgradeCode="$(var.UpgradeGuid)"
+           InstallerVersion="500"
+           Compressed="yes"
+           Scope="perUserOrMachine">
+
+    <SummaryInformation Description="Cross-node validation extension for PostgreSQL $(var.PG_VERSION)"
+                        Manufacturer="Brandon Williams" />
+
+    <MajorUpgrade AllowSameVersionUpgrades="yes"
+                  Schedule="afterInstallValidate"
+                  DowngradeErrorMessage="A newer version of [ProductName] is already installed." />
+
+    <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
+
+    <Property Id="POSTGRESQLDIR_REGISTRY64">
+      <RegistrySearch Id="PostgreSQLSearch64"
+                      Root="HKLM"
+                      Key="SOFTWARE\PostgreSQL\Installations\postgresql-x64-$(var.PG_VERSION)"
+                      Name="Base Directory"
+                      Type="raw"
+                      Bitness="always64" />
+    </Property>
+
+    <Property Id="POSTGRESQLDIR32">
+      <RegistrySearch Id="PostgreSQLSearch32"
+                      Root="HKLM"
+                      Key="SOFTWARE\PostgreSQL\Installations\postgresql-$(var.PG_VERSION)"
+                      Name="Base Directory"
+                      Type="raw"
+                      Bitness="always32" />
+    </Property>
+
+    <SetProperty Id="POSTGRESQLDIR" Action="SetPOSTGRESQLDIR_From64" After="AppSearch" Sequence="both"
+                 Value="[POSTGRESQLDIR_REGISTRY64]"
+                 Condition="NOT WIXUI_DONTSETPATH AND NOT POSTGRESQLDIR AND POSTGRESQLDIR_REGISTRY64" />
+
+    <SetProperty Id="POSTGRESQLDIR" Action="SetPOSTGRESQLDIR_From32" After="SetPOSTGRESQLDIR_From64" Sequence="both"
+                 Value="[POSTGRESQLDIR32]"
+                 Condition="NOT WIXUI_DONTSETPATH AND NOT POSTGRESQLDIR AND POSTGRESQLDIR32" />
+
+    <SetProperty Id="POSTGRESQLDIR" Action="SetPOSTGRESQLDIR_Default" After="SetPOSTGRESQLDIR_From32" Sequence="both"
+                 Value="[ProgramFiles64Folder]PostgreSQL\$(var.PG_VERSION)"
+                 Condition="NOT WIXUI_DONTSETPATH AND NOT POSTGRESQLDIR" />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="POSTGRESQLDIR" Name="PostgreSQL">
+        <Directory Id="LIBDIR" Name="lib" />
+        <Directory Id="SHAREDIR" Name="share">
+          <Directory Id="EXTENSIONDIR" Name="extension" />
+        </Directory>
+      </Directory>
+    </StandardDirectory>
+
+    <ComponentGroup Id="Libraries" Directory="LIBDIR">
+      <Component Id="PglValidateDll" Guid="*">
+        <File Id="PglValidateDllFile"
+              Source="$(var.PackageDir)\lib\pgl_validate.dll"
+              KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+
+    <ComponentGroup Id="ExtensionControl" Directory="EXTENSIONDIR">
+      <Component Id="PglValidateControl" Guid="*">
+        <File Id="PglValidateControlFile"
+              Source="$(var.PackageDir)\share\extension\pgl_validate.control"
+              KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+
+    <ComponentGroup Id="ExtensionSql" Directory="EXTENSIONDIR">
+      <Files Include="$(var.PackageDir)\share\extension\pgl_validate--*.sql" />
+    </ComponentGroup>
+
+    <Feature Id="Complete"
+             Title="pgl_validate Extension"
+             Description="Installs pgl_validate for PostgreSQL $(var.PG_VERSION)."
+             Level="1"
+             ConfigurableDirectory="POSTGRESQLDIR">
+      <ComponentGroupRef Id="Libraries" />
+      <ComponentGroupRef Id="ExtensionControl" />
+      <ComponentGroupRef Id="ExtensionSql" />
+    </Feature>
+
+    <ui:WixUI Id="WixUI_InstallDir" InstallDirectory="POSTGRESQLDIR" />
+    <WixVariable Id="WixUILicenseRtf" Value="$(var.LicenseRtf)" />
+
+  </Package>
+
+</Wix>
