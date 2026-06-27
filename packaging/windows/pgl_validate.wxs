@@ -47,7 +47,7 @@
            UpgradeCode="$(var.UpgradeGuid)"
            InstallerVersion="500"
            Compressed="yes"
-           Scope="perUserOrMachine">
+           Scope="perMachine">
 
     <SummaryInformation Description="Cross-node validation extension for PostgreSQL $(var.PG_VERSION)"
                         Manufacturer="Brandon Williams" />

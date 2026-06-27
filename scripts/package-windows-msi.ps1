@@ -131,6 +131,16 @@ function Get-PglMsiProductState {
     return $installer.ProductState($ProductCode)
 }
 
+function Test-PglProcessElevated {
+    <#
+    .SYNOPSIS
+        Checks whether the current Windows process has an elevated admin token.
+    #>
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = [Security.Principal.WindowsPrincipal]::new($identity)
+    return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
 function Get-PglMsiProductCodeFromUninstallEntry {
     <#
     .SYNOPSIS
@@ -198,6 +208,9 @@ function Invoke-PglMsiInstallVerification {
     $installLog = Join-Path $ArtifactDir "pgl_validate-pg$PgMajor-msi-install.log"
     $uninstallLog = Join-Path $ArtifactDir "pgl_validate-pg$PgMajor-msi-uninstall.log"
     $productCode = Get-PglMsiProductCode -MsiPath $MsiPath
+    if (-not (Test-PglProcessElevated)) {
+        throw '-VerifyInstall requires an elevated shell because the MSI is per-machine.'
+    }
     Assert-PglNoInstalledMsiProduct
 
     if (Test-Path -LiteralPath $pgRoot) {
@@ -208,7 +221,7 @@ function Invoke-PglMsiInstallVerification {
 
     $install = Start-Process `
         -FilePath 'msiexec.exe' `
-        -ArgumentList @('/i', $MsiPath, "POSTGRESQLDIR=$pgRoot", 'WIXUI_DONTSETPATH=1', 'ALLUSERS=2', 'MSIINSTALLPERUSER=1', '/qn', '/norestart', '/l*v', $installLog) `
+        -ArgumentList @('/i', $MsiPath, "POSTGRESQLDIR=$pgRoot", 'WIXUI_DONTSETPATH=1', 'ALLUSERS=1', '/qn', '/norestart', '/l*v', $installLog) `
         -Wait `
         -PassThru
     if ($install.ExitCode -ne 0) {
@@ -229,7 +242,7 @@ function Invoke-PglMsiInstallVerification {
 
     $uninstall = Start-Process `
         -FilePath 'msiexec.exe' `
-        -ArgumentList @('/x', $productCode, 'ALLUSERS=2', 'MSIINSTALLPERUSER=1', '/qn', '/norestart', '/l*v', $uninstallLog) `
+        -ArgumentList @('/x', $productCode, 'ALLUSERS=1', '/qn', '/norestart', '/l*v', $uninstallLog) `
         -Wait `
         -PassThru
     if ($uninstall.ExitCode -ne 0) {

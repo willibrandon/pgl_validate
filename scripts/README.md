@@ -37,9 +37,9 @@ Use `stop-pgrx-test-clusters.ps1 -RemoveData` when a local run is interrupted.
 
 - `package-pgrx.ps1` builds the release zip from `cargo pgrx package`.
 - `package-windows-msi.ps1` builds the Windows x64 MSI from the pgrx package
-  directory using WiX v5. Use `-VerifyInstall` to run a silent per-user
-  install/uninstall into a temporary PostgreSQL root; it refuses to run when
-  the same PostgreSQL-major MSI is already installed.
+  directory using WiX v5. Use `-VerifyInstall` to run a silent per-machine
+  install/uninstall into a temporary PostgreSQL root from an elevated shell; it
+  refuses to run when the same PostgreSQL-major MSI is already installed.
 - `check-release-version.ps1` verifies that a release tag matches `Cargo.toml`
   and `pgl_validate.control`.
 
