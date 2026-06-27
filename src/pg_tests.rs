@@ -157,6 +157,45 @@ mod tests {
     }
 
     #[pg_test]
+    fn row_digest_normalizes_float_array_elements_by_default() {
+        let negative_digest = Spi::get_one::<Vec<u8>>(
+            "SELECT pgl_validate.row_digest(ARRAY[1], ARRAY['-0'::float4, '-0'::float4])",
+        )
+        .unwrap()
+        .unwrap();
+        let positive_digest = Spi::get_one::<Vec<u8>>(
+            "SELECT pgl_validate.row_digest(ARRAY[1], ARRAY['0'::float4, '0'::float4])",
+        )
+        .unwrap()
+        .unwrap();
+        let shifted_lower_bound_digest = Spi::get_one::<Vec<u8>>(
+            "SELECT pgl_validate.row_digest(ARRAY[1], '[0:1]={0,0}'::float4[])",
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(negative_digest, positive_digest);
+        assert_ne!(positive_digest, shifted_lower_bound_digest);
+    }
+
+    #[pg_test]
+    fn row_digest_can_distinguish_float_array_signed_zero() {
+        Spi::run("SET LOCAL pgl_validate.float_signed_zero_distinct = on").unwrap();
+
+        let negative_digest = Spi::get_one::<Vec<u8>>(
+            "SELECT pgl_validate.row_digest(ARRAY[1], ARRAY['-0'::float8])",
+        )
+        .unwrap()
+        .unwrap();
+        let positive_digest =
+            Spi::get_one::<Vec<u8>>("SELECT pgl_validate.row_digest(ARRAY[1], ARRAY['0'::float8])")
+                .unwrap()
+                .unwrap();
+
+        assert_ne!(negative_digest, positive_digest);
+    }
+
+    #[pg_test]
     fn row_digest_preserves_json_exact_text_by_default() {
         let compact_digest = Spi::get_one::<Vec<u8>>(
             r#"SELECT pgl_validate.row_digest(ARRAY[2], '{"a":1,"b":2}'::json)"#,
@@ -216,11 +255,13 @@ mod tests {
             .unwrap();
         let domain_name = identifier(&format!("pgl_validate_numeric_domain_{backend_pid}"));
         let composite_name = identifier(&format!("pgl_validate_composite_{backend_pid}"));
+        let enum_name = identifier(&format!("pgl_validate_enum_{backend_pid}"));
 
         Spi::run(&format!(
             "
             CREATE DOMAIN public.{domain_name} AS numeric;
             CREATE TYPE public.{composite_name} AS (amount numeric);
+            CREATE TYPE public.{enum_name} AS ENUM ('a', 'b');
             SET LOCAL pgl_validate.json_normalize = on;
             "
         ))
@@ -233,13 +274,16 @@ mod tests {
                    pgl_validate.column_encoding_mode('json[]'::regtype::oid)::text || ';' ||
                    pgl_validate.column_encoding_mode('public.{domain_name}'::regtype::oid)::text || ';' ||
                    pgl_validate.column_encoding_mode('public.{composite_name}'::regtype::oid)::text || ';' ||
-                   pgl_validate.column_encoding_mode('int4range'::regtype::oid)::text
+                   pgl_validate.column_encoding_mode('int4range'::regtype::oid)::text || ';' ||
+                   pgl_validate.column_encoding_mode('point'::regtype::oid)::text || ';' ||
+                   pgl_validate.column_encoding_mode('float8[]'::regtype::oid)::text || ';' ||
+                   pgl_validate.column_encoding_mode('public.{enum_name}'::regtype::oid)::text
             "
         ))
         .unwrap()
         .unwrap();
 
-        assert_eq!(modes, "1;2;2;2;2;2");
+        assert_eq!(modes, "1;2;2;2;2;2;2;1;1");
     }
 
     #[pg_test]

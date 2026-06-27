@@ -1,6 +1,7 @@
 use core::ffi::CStr;
 use pgrx::prelude::*;
 use std::ffi::CString;
+use std::slice;
 
 /// Encoding selected by the coordinator for one row_digest column position.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -51,6 +52,12 @@ pub unsafe fn encode_datum(
     datum: pg_sys::Datum,
     mode: EncodingMode,
 ) -> Vec<u8> {
+    if mode == EncodingMode::Send {
+        if let Some(encoded) = unsafe { encode_float_array(type_oid, datum) } {
+            return encoded;
+        }
+    }
+
     let datum = unsafe { normalize_float_datum(type_oid, datum) };
     match mode {
         EncodingMode::Send => unsafe { encode_send(type_oid, datum) },
@@ -105,6 +112,129 @@ unsafe fn normalize_float_datum(type_oid: pg_sys::Oid, datum: pg_sys::Datum) -> 
     }
 
     datum
+}
+
+unsafe fn encode_float_array(type_oid: pg_sys::Oid, datum: pg_sys::Datum) -> Option<Vec<u8>> {
+    if type_oid == pg_sys::FLOAT4ARRAYOID {
+        return Some(unsafe {
+            encode_float_array_with(
+                datum,
+                pg_sys::FLOAT4OID,
+                4,
+                b'i' as core::ffi::c_char,
+                b"f4",
+                encode_float4_array_element,
+            )
+        });
+    }
+
+    if type_oid == pg_sys::FLOAT8ARRAYOID {
+        return Some(unsafe {
+            encode_float_array_with(
+                datum,
+                pg_sys::FLOAT8OID,
+                8,
+                b'd' as core::ffi::c_char,
+                b"f8",
+                encode_float8_array_element,
+            )
+        });
+    }
+
+    None
+}
+
+unsafe fn encode_float_array_with(
+    datum: pg_sys::Datum,
+    element_type_oid: pg_sys::Oid,
+    element_len: i32,
+    element_align: core::ffi::c_char,
+    element_tag: &[u8],
+    encode_element: unsafe fn(pg_sys::Datum) -> Vec<u8>,
+) -> Vec<u8> {
+    let array =
+        unsafe { pg_sys::pg_detoast_datum_copy(datum.cast_mut_ptr()) }.cast::<pg_sys::ArrayType>();
+    if array.is_null() {
+        pgrx::error!("float array detoast returned NULL");
+    }
+
+    if unsafe { (*array).elemtype } != element_type_oid {
+        pgrx::error!("float array element type did not match declared type oid");
+    }
+
+    let ndim = unsafe { (*array).ndim };
+    let ndim_usize = usize::try_from(ndim).expect("array ndim must be non-negative");
+    // PostgreSQL stores dimensions immediately after ArrayType, then lower bounds.
+    let dims_ptr = unsafe {
+        array
+            .cast::<u8>()
+            .add(std::mem::size_of::<pg_sys::ArrayType>())
+    }
+    .cast::<i32>();
+    let dims = unsafe { slice::from_raw_parts(dims_ptr, ndim_usize) };
+    let lower_bounds = unsafe { slice::from_raw_parts(dims_ptr.add(ndim_usize), ndim_usize) };
+
+    let mut elements = std::ptr::null_mut();
+    let mut nulls = std::ptr::null_mut();
+    let mut nelems = 0;
+    unsafe {
+        pg_sys::deconstruct_array(
+            array,
+            element_type_oid,
+            element_len,
+            true,
+            element_align,
+            &mut elements,
+            &mut nulls,
+            &mut nelems,
+        );
+    }
+
+    let nelems_usize = usize::try_from(nelems).expect("array element count must be non-negative");
+    let mut out =
+        Vec::with_capacity(32 + dims.len() * 8 + nelems_usize * (1 + element_len as usize));
+    out.extend_from_slice(b"pgl_validate.float_array.v1");
+    out.extend_from_slice(element_tag);
+    out.extend_from_slice(&ndim.to_le_bytes());
+    out.extend_from_slice(&nelems.to_le_bytes());
+    for dim in dims {
+        out.extend_from_slice(&dim.to_le_bytes());
+    }
+    for lower_bound in lower_bounds {
+        out.extend_from_slice(&lower_bound.to_le_bytes());
+    }
+
+    for index in 0..nelems_usize {
+        let is_null = unsafe { !nulls.is_null() && *nulls.add(index) };
+        if is_null {
+            out.push(0x00);
+        } else {
+            out.push(0x01);
+            out.extend_from_slice(&unsafe { encode_element(*elements.add(index)) });
+        }
+    }
+
+    unsafe {
+        pg_sys::pfree(array.cast());
+        if !elements.is_null() {
+            pg_sys::pfree(elements.cast());
+        }
+        if !nulls.is_null() {
+            pg_sys::pfree(nulls.cast());
+        }
+    }
+
+    out
+}
+
+unsafe fn encode_float4_array_element(datum: pg_sys::Datum) -> Vec<u8> {
+    let value = unsafe { f32::from_datum(datum, false) }.expect("non-null float4 array element");
+    normalize_f32(value).to_bits().to_le_bytes().to_vec()
+}
+
+unsafe fn encode_float8_array_element(datum: pg_sys::Datum) -> Vec<u8> {
+    let value = unsafe { f64::from_datum(datum, false) }.expect("non-null float8 array element");
+    normalize_f64(value).to_bits().to_le_bytes().to_vec()
 }
 
 fn normalize_f32(value: f32) -> f32 {

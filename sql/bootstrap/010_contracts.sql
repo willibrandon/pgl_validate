@@ -7,7 +7,53 @@ RETURNS int
 LANGUAGE sql
 STABLE
 AS $$
-    WITH RECURSIVE expanded_type AS (
+    WITH RECURSIVE stable_send_type(type_oid) AS (
+        VALUES
+            ('bool'::regtype::oid),
+            ('bytea'::regtype::oid),
+            ('"char"'::regtype::oid),
+            ('name'::regtype::oid),
+            ('int2'::regtype::oid),
+            ('int4'::regtype::oid),
+            ('int8'::regtype::oid),
+            ('oid'::regtype::oid),
+            ('regclass'::regtype::oid),
+            ('regcollation'::regtype::oid),
+            ('regconfig'::regtype::oid),
+            ('regdictionary'::regtype::oid),
+            ('regnamespace'::regtype::oid),
+            ('regoper'::regtype::oid),
+            ('regoperator'::regtype::oid),
+            ('regproc'::regtype::oid),
+            ('regprocedure'::regtype::oid),
+            ('regrole'::regtype::oid),
+            ('regtype'::regtype::oid),
+            ('xid'::regtype::oid),
+            ('xid8'::regtype::oid),
+            ('cid'::regtype::oid),
+            ('tid'::regtype::oid),
+            ('pg_lsn'::regtype::oid),
+            ('text'::regtype::oid),
+            ('varchar'::regtype::oid),
+            ('bpchar'::regtype::oid),
+            ('uuid'::regtype::oid),
+            ('date'::regtype::oid),
+            ('time'::regtype::oid),
+            ('timetz'::regtype::oid),
+            ('timestamp'::regtype::oid),
+            ('timestamptz'::regtype::oid),
+            ('interval'::regtype::oid),
+            ('float4'::regtype::oid),
+            ('float8'::regtype::oid),
+            ('jsonb'::regtype::oid),
+            ('inet'::regtype::oid),
+            ('cidr'::regtype::oid),
+            ('macaddr'::regtype::oid),
+            ('macaddr8'::regtype::oid),
+            ('bit'::regtype::oid),
+            ('varbit'::regtype::oid)
+    ),
+    expanded_type AS (
         SELECT t.oid, t.typtype, t.typcategory, t.typbasetype, t.typelem, t.typsend
         FROM pg_type t
         WHERE t.oid = type_oid
@@ -35,6 +81,14 @@ AS $$
             WHERE e.oid IN ('json'::regtype::oid, 'numeric'::regtype::oid)
                OR e.typtype IN ('c', 'd', 'm', 'p', 'r')
                OR e.typsend = 0
+        ) THEN 2
+        WHEN EXISTS (
+            SELECT 1
+            FROM expanded_type e
+            LEFT JOIN stable_send_type s ON s.type_oid = e.oid
+            WHERE e.typcategory <> 'A'
+              AND e.typtype <> 'e'
+              AND s.type_oid IS NULL
         ) THEN 2
         ELSE 1
     END
