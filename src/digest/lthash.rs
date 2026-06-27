@@ -1,15 +1,15 @@
 use super::algorithm::HashAlgorithm;
 
 /// Number of 16-bit lanes in the LtHash accumulator.
-pub const LANES: usize = 1024;
+pub(crate) const LANES: usize = 1024;
 const LANE_BYTES: usize = 2;
 const STATE_BYTES: usize = LANES * LANE_BYTES;
 
 /// Core LtHash accumulator used before conversion to the PostgreSQL varlena type.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct LtHashCore {
+pub(crate) struct LtHashCore {
     /// Accumulator lanes, each updated with wrapping addition.
-    pub lanes: [u16; LANES],
+    pub(crate) lanes: [u16; LANES],
 }
 
 impl Default for LtHashCore {
@@ -19,7 +19,7 @@ impl Default for LtHashCore {
 }
 
 /// Add one row digest to an LtHash accumulator.
-pub fn add_row_digest(state: &mut LtHashCore, row_digest: &[u8]) {
+pub(crate) fn add_row_digest(state: &mut LtHashCore, row_digest: &[u8]) {
     if row_digest.is_empty() {
         return;
     }
@@ -39,7 +39,7 @@ pub fn add_row_digest(state: &mut LtHashCore, row_digest: &[u8]) {
 }
 
 /// Combine two LtHash states with lane-wise wrapping addition.
-pub fn combine(left: LtHashCore, right: LtHashCore) -> LtHashCore {
+pub(crate) fn combine(left: LtHashCore, right: LtHashCore) -> LtHashCore {
     let mut out = LtHashCore::default();
     for ((dst, l), r) in out.lanes.iter_mut().zip(left.lanes).zip(right.lanes) {
         *dst = l.wrapping_add(r);
@@ -58,7 +58,7 @@ pub(crate) fn hash_digest_array(sorted_row_digests: &[&[u8]], algorithm: HashAlg
 
 impl LtHashCore {
     /// Serialize the accumulator lanes in little-endian order.
-    pub fn to_bytes(self) -> Vec<u8> {
+    pub(crate) fn to_bytes(self) -> Vec<u8> {
         let mut out = Vec::with_capacity(STATE_BYTES);
         for lane in self.lanes {
             out.extend_from_slice(&lane.to_le_bytes());
@@ -67,7 +67,7 @@ impl LtHashCore {
     }
 
     /// Parse the canonical byte representation of an LtHash accumulator.
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self, String> {
+    pub(crate) fn from_bytes(bytes: &[u8]) -> Result<Self, String> {
         if bytes.len() != STATE_BYTES {
             return Err(format!(
                 "lthash_state must be {STATE_BYTES} bytes, got {}",
@@ -83,7 +83,7 @@ impl LtHashCore {
     }
 
     /// Render the canonical byte representation as lowercase hexadecimal.
-    pub fn to_hex(self) -> String {
+    pub(crate) fn to_hex(self) -> String {
         let bytes = self.to_bytes();
         let mut out = String::with_capacity(bytes.len() * 2);
         for byte in bytes {
@@ -94,7 +94,7 @@ impl LtHashCore {
     }
 
     /// Parse either the aggregate initial condition `0` or hexadecimal state text.
-    pub fn parse_text(input: &str) -> Result<Self, String> {
+    pub(crate) fn parse_text(input: &str) -> Result<Self, String> {
         if input == "0" {
             return Ok(Self::default());
         }

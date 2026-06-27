@@ -7,7 +7,7 @@ use pgrx::prelude::*;
 ///
 /// `fcinfo` must be a valid PostgreSQL `FunctionCallInfo` for
 /// `row_digest(enc int[], VARIADIC "any")`.
-pub unsafe fn row_digest_fcinfo(fcinfo: pg_sys::FunctionCallInfo) -> Vec<u8> {
+pub(crate) unsafe fn row_digest_fcinfo(fcinfo: pg_sys::FunctionCallInfo) -> Vec<u8> {
     let nargs = unsafe { (*fcinfo).nargs as usize };
     if nargs == 0 {
         pgrx::error!("row_digest requires enc int[] followed by variadic column values");

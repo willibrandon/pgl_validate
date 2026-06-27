@@ -5,7 +5,7 @@ use std::slice;
 
 /// Encoding selected by the coordinator for one row_digest column position.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub enum EncodingMode {
+pub(crate) enum EncodingMode {
     /// Use the type's binary send function.
     Send = 1,
     /// Use the type's text output function.
@@ -28,7 +28,7 @@ impl TryFrom<i32> for EncodingMode {
 }
 
 /// Add a NULL-aware length-delimited value frame to a row digest hasher.
-pub fn frame_value(hasher: &mut blake3::Hasher, value: Option<&[u8]>) {
+pub(crate) fn frame_value(hasher: &mut blake3::Hasher, value: Option<&[u8]>) {
     match value {
         None => {
             hasher.update(&[0x00]);
@@ -47,7 +47,7 @@ pub fn frame_value(hasher: &mut blake3::Hasher, value: Option<&[u8]>) {
 ///
 /// `datum` must be a valid non-null datum for `type_oid` in the current
 /// PostgreSQL memory context.
-pub unsafe fn encode_datum(
+pub(crate) unsafe fn encode_datum(
     type_oid: pg_sys::Oid,
     datum: pg_sys::Datum,
     mode: EncodingMode,
