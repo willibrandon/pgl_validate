@@ -682,7 +682,6 @@ In active-active, repairing a conflicted key requires designating an authority. 
 | GUC | Default | Purpose |
 |---|---|---|
 | `hash_algorithm` | `blake3_256` | row and set digest width / algo (`blake3_256`\|`blake3_512`) |
-| `lthash_lanes` / `lthash_lane_bits` | `1024` / `16` | set-hash collision bound vs state size |
 | `paranoid_confirm` | `off` | run the cryptographic `hash_digest_array` confirm on **every** clean chunk. Bounded by `paranoid_confirm_max_rows` (default = `localize_threshold`): a clean chunk larger than this is **subdivided** so `array_agg(ORDER BY)` never materializes an unbounded array; an external/streaming sorted-hash path is used above the in-memory cap |
 | `paranoid_confirm_max_rows` | `1000` | per-statement row cap for the sorted-set confirm; larger chunks are split or stream-sorted (memory/spill bound) |
 | `chunk_target_rows` | `50000` | adaptive chunk sizing |
@@ -690,18 +689,29 @@ In active-active, repairing a conflicted key requires designating an authority. 
 | `split_fanout` | `4` | Merkle children per level |
 | `localize_threshold` | `1000` | switch to row-level localization |
 | `max_parallel_chunks` | `4` | concurrent chunk subtrees |
-| `fence_convergence_timeout` | `5min` | wait for a peer to reach a fence |
-| `on_fence_timeout` | `abort_run` | `abort_run` (default — a requested comparison that loses a peer is **not** silently downgraded) \| `skip_peer` (explicit opt-in; the run is then stamped `partial`, never plain `match`) |
+| `fence_timeout_ms` | `300000` | wait for a peer to reach a fence |
+| `fence_poll_interval_ms` | `100` | poll interval while waiting for fence convergence |
 | `require_barrier` | `on` | abort an edge that cannot be barrier-fenced; set `allow_degraded_fence` to opt into `degraded` verdicts instead |
+| `allow_degraded_fence` | `off` | opt into degraded fence verdicts when an exact barrier is unavailable |
+| `allow_approximate_filters` | `off` | opt into diagnostic pglogical filter evaluation that is never G-SOUND |
 | `recheck_passes` | `3` | epochs before confirm/indeterminate |
 | `max_snapshot_age` | `5min` | re-fence to bound vacuum impact |
 | `statement_timeout_per_chunk` | `30s` | hard per-chunk cap |
 | `throttle_max_lag` | `off` | pause if any peer's lag exceeds this |
 | `json_normalize` | `off` | normalize `json` via `jsonb` (semantics-changing) |
-| `float_signed_zero_distinct` / `float_nan_distinct` | `off` | float normalization policy |
+| `float_signed_zero_distinct` | `off` | distinguish `-0.0` from `+0.0` in row digests |
+| `float_nan_distinct` | `off` | preserve distinct NaN bit patterns in row digests |
 | `sequence_buffer_multiplier` | `2` | sequence window tolerance × `cache_size` |
 | `max_reported_tuple_bytes` | `8192` | cap captured divergent tuples |
-| `read_role` | (unset) | T1 role to use on peers |
+| `max_reported_divergences` | `1000` | cap persisted key-level divergences per table and peer |
+| `correlate_conflict_history` | `on` | attach fork-provided pglogical conflict-history rows when available |
+| `conflict_history_max_rows` | `1000` | cap conflict-history rows fetched per peer |
+| `scheduler_database` | (unset) | database where the static scheduler worker dispatches schedules |
+| `scheduler_interval_ms` | `60000` | scheduler polling interval |
+
+LtHash uses a fixed 1024 × 16-bit accumulator. Those parameters are part of the `lthash_state` binary/text representation and are not GUCs.
+
+Per-run `options` add policy choices that should be explicit on each validation request: `on_fence_timeout = 'abort_run' | 'skip_peer'` and `on_precondition_fail = 'skip_table' | 'abort_run'`. A requested comparison that loses a peer defaults to aborting; `skip_peer` stamps the run `partial`, never plain `match`.
 
 ### 19.2 Governance
 
