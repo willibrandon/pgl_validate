@@ -851,15 +851,26 @@ Each milestone is independently shippable and fully tested before the next (no d
 
 ## Appendix A: Catalog DDL
 
+This appendix mirrors [`sql/bootstrap/001_catalog.sql`](../sql/bootstrap/001_catalog.sql), the authoritative install DDL. Keep them in sync whenever catalog objects change.
+
 ```sql
-CREATE SCHEMA pgl_validate;
+CREATE SCHEMA IF NOT EXISTS pgl_validate;
 
 CREATE TABLE pgl_validate.peer (
-    name      text PRIMARY KEY,
-    dsn       text NOT NULL,
-    backend   text NOT NULL DEFAULT 'pglogical'
-              CHECK (backend IN ('pglogical','native','standby')),
-    added_at  timestamptz NOT NULL DEFAULT now()
+    name                    text PRIMARY KEY,
+    dsn                     text NOT NULL,
+    backend                 text NOT NULL DEFAULT 'pglogical'
+                            CHECK (backend IN ('pglogical','native','standby')),
+    subscription_name       name,
+    reverse_subscription_name name,
+    replication_sets        text[],
+    connect_timeout_seconds int NOT NULL DEFAULT 10
+                            CHECK (connect_timeout_seconds > 0),
+    statement_timeout_ms    int NOT NULL DEFAULT 600000
+                            CHECK (statement_timeout_ms > 0),
+    lock_timeout_ms         int NOT NULL DEFAULT 30000
+                            CHECK (lock_timeout_ms > 0),
+    added_at                timestamptz NOT NULL DEFAULT now()
 );
 REVOKE ALL ON pgl_validate.peer FROM PUBLIC;
 
@@ -873,7 +884,9 @@ CREATE TABLE pgl_validate.run (
     launched_by    name NOT NULL DEFAULT current_user,
     started_at     timestamptz NOT NULL DEFAULT now(),
     finished_at    timestamptz,
-    tables_total   int, tables_matched int, tables_differ int,
+    tables_total   int,
+    tables_matched int,
+    tables_differ  int,
     error          text
 );
 
@@ -885,7 +898,7 @@ CREATE TABLE pgl_validate.run_participant (
     pg_version int  NOT NULL,
     dsn_ref    text,
     status     text NOT NULL DEFAULT 'pending'
-               CHECK (status IN ('pending','connected','converged','unreachable','done','error')),
+               CHECK (status IN ('pending','connected','converged','skipped','unreachable','done','error')),
     PRIMARY KEY (run_id, node)
 );
 
@@ -896,57 +909,47 @@ CREATE TABLE pgl_validate.fence_epoch (
     PRIMARY KEY (run_id, epoch_seq)
 );
 
--- Normalized edge identity: 'A->B' text is insufficient when two nodes share several
--- DBs/subscriptions/slots/repsets/origins. Each directed replication stream is one row.
 CREATE TABLE pgl_validate.run_edge (
     run_id        bigint NOT NULL REFERENCES pgl_validate.run(run_id) ON DELETE CASCADE,
     edge_id       int NOT NULL,
     provider_node text NOT NULL,
     target_node   text NOT NULL,
     backend       text NOT NULL CHECK (backend IN ('pglogical','native','standby')),
-    subscription  text,                  -- subscription name on the target (NULL for standby)
-    slot_name     text,                  -- provider-side logical slot for this edge
-    origin_name   text,                  -- replication origin name on the target
-    repsets       text[],                -- repsets carried on this edge (pglogical/native)
+    subscription  text,
+    slot_name     text,
+    origin_name   text,
+    repsets       text[],
     PRIMARY KEY (run_id, edge_id)
 );
 
 CREATE TABLE pgl_validate.fence_edge (
-    run_id        bigint NOT NULL,
-    epoch_seq     int NOT NULL,
-    edge_id       int NOT NULL,
-    fence_kind    text NOT NULL CHECK (fence_kind IN ('barrier','standby_replay','degraded')),
-    barrier_token uuid,                  -- token in fence_barrier (NULL for standby_replay/degraded)
-    barrier_end_lsn pg_lsn,              -- exact L_b: barrier commit end LSN, or the standby's target replay LSN
+    run_id          bigint NOT NULL,
+    epoch_seq       int NOT NULL,
+    edge_id         int NOT NULL,
+    fence_kind      text NOT NULL CHECK (fence_kind IN ('barrier','standby_replay','degraded')),
+    barrier_token   uuid,
+    barrier_end_lsn pg_lsn,
     PRIMARY KEY (run_id, epoch_seq, edge_id),
-    -- An EXACT logical-edge fence requires both token and L_b; a standby fence requires L_b (no token);
-    -- only a degraded fence may have neither. This enforces the §8.1 contract structurally.
     CONSTRAINT fence_edge_required CHECK (
         (fence_kind = 'barrier'        AND barrier_token IS NOT NULL AND barrier_end_lsn IS NOT NULL) OR
         (fence_kind = 'standby_replay' AND barrier_token IS NULL     AND barrier_end_lsn IS NOT NULL) OR
         (fence_kind = 'degraded')
     ),
     FOREIGN KEY (run_id, epoch_seq) REFERENCES pgl_validate.fence_epoch(run_id, epoch_seq) ON DELETE CASCADE,
-    FOREIGN KEY (run_id, edge_id)     REFERENCES pgl_validate.run_edge(run_id, edge_id) ON DELETE CASCADE
+    FOREIGN KEY (run_id, edge_id) REFERENCES pgl_validate.run_edge(run_id, edge_id) ON DELETE CASCADE
 );
 
--- Convergence is tracked PER edge (a target may have several incoming edges).
 CREATE TABLE pgl_validate.fence_attempt (
-    run_id          bigint NOT NULL,
-    epoch_seq       int NOT NULL,
-    edge_id         int NOT NULL,
-    barrier_end_lsn pg_lsn,                           -- exact L_b for this edge (from last_commit_lsn())
-    origin_progress_lsn pg_lsn,                        -- AUTHORITATIVE: converged when >= barrier_end_lsn
-                                                       --   (for a standby edge, holds pg_last_wal_replay_lsn())
-    token_visible   boolean NOT NULL DEFAULT false,    -- corroborating liveness check (NOT load-bearing);
-                                                       --   set TRUE by convention for standby edges (no token)
-    confirmed_flush_lsn pg_lsn,                        -- provider-side wait_slot_confirm_lsn(slot, L_b) signal
-    converged_at    timestamptz,
-    status          text NOT NULL DEFAULT 'waiting'
-                    CHECK (status IN ('waiting','converged','timeout','degraded')),
-    -- The convergence condition is ENFORCED, not just documented: a row may be 'converged'
-    -- ONLY if origin progress has actually reached the barrier's exact end LSN and the token
-    -- is visible. 'degraded' rows are exempt (they are, by definition, not exact).
+    run_id              bigint NOT NULL,
+    epoch_seq           int NOT NULL,
+    edge_id             int NOT NULL,
+    barrier_end_lsn     pg_lsn,
+    origin_progress_lsn pg_lsn,
+    token_visible       boolean NOT NULL DEFAULT false,
+    confirmed_flush_lsn pg_lsn,
+    converged_at        timestamptz,
+    status              text NOT NULL DEFAULT 'waiting'
+                        CHECK (status IN ('waiting','converged','timeout','degraded')),
     CONSTRAINT fence_attempt_converged_truth CHECK (
         status <> 'converged'
         OR (barrier_end_lsn IS NOT NULL
@@ -959,53 +962,41 @@ CREATE TABLE pgl_validate.fence_attempt (
         REFERENCES pgl_validate.fence_edge(run_id, epoch_seq, edge_id) ON DELETE CASCADE
 );
 
--- Barrier tokens. This table IS replicated (the token must flow to the target), so it is
--- deliberately STANDALONE and FK-FREE: a replicated barrier row must be valid on a node that
--- has no corresponding local run. It is a NORMAL (logged) table — pglogical rejects UNLOGGED/TEMP
--- tables in a replication set (pglogical_repset.c:1028).
---
--- CRITICAL: there is NO primary key / unique constraint on `token`. Under forward_origins='{all}'
--- cascades (pglogical's default), the SAME token can arrive at T both directly (O->T) and via a
--- forwarded path (O->X->T). A UNIQUE token would turn the second arrival into an insert_insert
--- conflict — which, under conflict_resolution='error', STOPS apply. With no unique constraint the
--- duplicate is a harmless extra heap row; the surrogate `id` keeps rows distinct. The barrier
--- repset is insert-only so no UPDATE/DELETE replication (hence no replica-identity requirement).
 CREATE TABLE pgl_validate.fence_barrier (
-    id          bigint GENERATED BY DEFAULT AS IDENTITY, -- accepts explicit values replayed by pglogical
-    token       uuid NOT NULL,            -- gen_random_uuid(); NON-unique on purpose (see above)
+    id          bigint GENERATED BY DEFAULT AS IDENTITY,
+    token       uuid NOT NULL,
     injected_at timestamptz NOT NULL DEFAULT now()
-    -- no PK/unique on token; visibility test is EXISTS(SELECT 1 ... WHERE token = $1)
 );
-CREATE INDEX fence_barrier_token_idx ON pgl_validate.fence_barrier (token);  -- non-unique lookup
--- Coordinator-local bookkeeping (NOT added to any repset; never replicated).
--- NOTE: token is a plain UUID column with NO FK to fence_barrier — a barrier injected on a
--- non-coordinator origin (or on an edge not targeting the coordinator) may have no fence_barrier
--- row on the coordinator at all, so an FK would be unsatisfiable.
+CREATE INDEX fence_barrier_token_idx ON pgl_validate.fence_barrier (token);
+
 CREATE TABLE pgl_validate.fence_barrier_run (
-    token       uuid NOT NULL,           -- the injected token; no FK (barrier table is remote/replicated)
-    run_id      bigint NOT NULL REFERENCES pgl_validate.run(run_id) ON DELETE CASCADE,
-    epoch_seq   int NOT NULL,
-    edge_id     int NOT NULL,
-    origin_node text NOT NULL,           -- where the barrier was injected
-    barrier_end_lsn pg_lsn,              -- exact L_b for the edge's origin-progress check
+    token           uuid NOT NULL,
+    run_id          bigint NOT NULL REFERENCES pgl_validate.run(run_id) ON DELETE CASCADE,
+    epoch_seq       int NOT NULL,
+    edge_id         int NOT NULL,
+    origin_node     text NOT NULL,
+    barrier_end_lsn pg_lsn,
     PRIMARY KEY (run_id, epoch_seq, edge_id),
     FOREIGN KEY (run_id, edge_id) REFERENCES pgl_validate.run_edge(run_id, edge_id) ON DELETE CASCADE
 );
 
 CREATE TABLE pgl_validate.table_plan (
-    run_id        bigint NOT NULL REFERENCES pgl_validate.run(run_id) ON DELETE CASCADE,
-    schema_name   text NOT NULL,
-    table_name    text NOT NULL,
-    key_cols      text[],
-    att_list      text[],
-    repsets       text[],
-    repl_insert   boolean, repl_update boolean, repl_delete boolean, repl_truncate boolean,
-    has_row_filter boolean NOT NULL DEFAULT false,
-    sync_status   "char",
+    run_id             bigint NOT NULL REFERENCES pgl_validate.run(run_id) ON DELETE CASCADE,
+    schema_name        text NOT NULL,
+    table_name         text NOT NULL,
+    key_cols           text[],
+    att_list           text[],
+    repsets            text[],
+    repl_insert        boolean,
+    repl_update        boolean,
+    repl_delete        boolean,
+    repl_truncate      boolean,
+    has_row_filter     boolean NOT NULL DEFAULT false,
+    sync_status        "char",
     validated_property text NOT NULL
-                  CHECK (validated_property IN ('full','superset','keys_only',
-                         'filtered_intersection','filtered_advisory','keyless',
-                         'unsupported_mask','skipped')),
+                       CHECK (validated_property IN ('full','superset','keys_only',
+                              'filtered_intersection','filtered_advisory','keyless',
+                              'unsupported_mask','skipped')),
     PRIMARY KEY (run_id, schema_name, table_name)
 );
 
@@ -1043,7 +1034,8 @@ CREATE TABLE pgl_validate.chunk_result (
     table_name  text NOT NULL,
     chunk_id    bigint NOT NULL,
     parent_id   bigint,
-    lo          bytea, hi bytea,
+    lo          bytea,
+    hi          bytea,
     state       text NOT NULL CHECK (state IN
                 ('pending','running','clean','split','divergent','candidate')),
     updated_at  timestamptz NOT NULL DEFAULT now(),
@@ -1083,7 +1075,7 @@ CREATE TABLE pgl_validate.divergence (
     FOREIGN KEY (run_id, schema_name, table_name)
         REFERENCES pgl_validate.table_plan(run_id, schema_name, table_name) ON DELETE CASCADE,
     FOREIGN KEY (run_id, detected_epoch)
-        REFERENCES pgl_validate.fence_epoch(run_id, epoch_seq)   -- detection epoch is a real epoch
+        REFERENCES pgl_validate.fence_epoch(run_id, epoch_seq)
 );
 
 CREATE TABLE pgl_validate.divergence_recheck (
@@ -1136,16 +1128,16 @@ CREATE TABLE pgl_validate.conflict_evidence (
 );
 
 CREATE TABLE pgl_validate.sequence_result (
-    run_id              bigint NOT NULL REFERENCES pgl_validate.run(run_id) ON DELETE CASCADE,
-    schema_name         text NOT NULL,
-    seq_name            text NOT NULL,
-    provider_node       text NOT NULL,
-    provider_last_value bigint,
-    subscriber_node     text NOT NULL,
+    run_id                bigint NOT NULL REFERENCES pgl_validate.run(run_id) ON DELETE CASCADE,
+    schema_name           text NOT NULL,
+    seq_name              text NOT NULL,
+    provider_node         text NOT NULL,
+    provider_last_value   bigint,
+    subscriber_node       text NOT NULL,
     subscriber_last_value bigint,
-    cache_size          int,
-    within_contract     boolean,
-    verdict             text NOT NULL CHECK (verdict IN ('match','behind','ahead_of_window','error')),
+    cache_size            int,
+    within_contract       boolean,
+    verdict               text NOT NULL CHECK (verdict IN ('match','behind','ahead_of_window','error')),
     PRIMARY KEY (run_id, schema_name, seq_name, subscriber_node)
 );
 
@@ -1154,8 +1146,7 @@ CREATE TABLE pgl_validate.schema_issue (
     node        text NOT NULL,
     schema_name text NOT NULL,
     table_name  text NOT NULL,
-    issue_code  text NOT NULL,         -- MISSING_TABLE, TYPE_MISMATCH, NO_COMMIT_TS,
-                                        -- NO_KEY, ENCODING_MISMATCH, UNSTABLE_TYPE, NOT_READY
+    issue_code  text NOT NULL,
     detail      text,
     PRIMARY KEY (run_id, node, schema_name, table_name, issue_code)
 );
@@ -1163,21 +1154,41 @@ CREATE TABLE pgl_validate.schema_issue (
 CREATE TABLE pgl_validate.schedule (
     name        text PRIMARY KEY,
     cron        text NOT NULL,
-    tables      text[], repset text, peers text[],
+    tables      text[],
+    repset      text,
+    peers       text[],
     options     jsonb NOT NULL DEFAULT '{}',
     enabled     boolean NOT NULL DEFAULT true,
     last_run_id bigint REFERENCES pgl_validate.run(run_id) ON DELETE SET NULL
 );
 
--- Repair (§18). One repair_run per apply_repair() call; one repair_result row per repaired key.
+CREATE TABLE pgl_validate.worker_task (
+    task_id       integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    run_id        bigint NOT NULL REFERENCES pgl_validate.run(run_id) ON DELETE CASCADE,
+    task_kind     text NOT NULL CHECK (task_kind IN ('compare')),
+    request       jsonb NOT NULL,
+    status        text NOT NULL DEFAULT 'queued'
+                  CHECK (status IN ('queued','starting','running','paused','completed','failed','canceled')),
+    launched_by   name NOT NULL DEFAULT current_user,
+    database_name name NOT NULL DEFAULT current_database(),
+    worker_pid    integer,
+    enqueued_at   timestamptz NOT NULL DEFAULT now(),
+    started_at    timestamptz,
+    finished_at   timestamptz,
+    error         text
+);
+CREATE INDEX worker_task_run_idx ON pgl_validate.worker_task (run_id);
+CREATE INDEX worker_task_active_idx ON pgl_validate.worker_task (status, enqueued_at)
+WHERE status IN ('queued','starting','running');
+
 CREATE TABLE pgl_validate.repair_run (
     repair_id      bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     run_id         bigint NOT NULL REFERENCES pgl_validate.run(run_id) ON DELETE CASCADE,
     authoritative  text NOT NULL,
     target         text NOT NULL,
     propagation    text NOT NULL CHECK (propagation IN ('local_only','replicate')),
-    paused_subs    text[],                 -- reserved for future orchestrated topology operations
-    origin_name    text,                   -- e.g. 'pgl_validate_repair' (NULL for replicate mode)
+    paused_subs    text[],
+    origin_name    text,
     status         text NOT NULL DEFAULT 'running'
                    CHECK (status IN ('running','applied','revalidated','failed','rolled_back')),
     launched_by    name NOT NULL DEFAULT current_user,
@@ -1192,13 +1203,126 @@ CREATE TABLE pgl_validate.repair_result (
     table_name     text NOT NULL,
     key_bytes      bytea NOT NULL,
     action         text NOT NULL CHECK (action IN ('insert','update','delete','setval')),
-    statement      text NOT NULL,          -- the exact DML applied (audit)
+    statement      text NOT NULL,
     post_verdict   text CHECK (post_verdict IN ('match','still_differs','indeterminate')),
     PRIMARY KEY (repair_id, schema_name, table_name, key_bytes, action)
 );
-```
 
-Reporting views (`runs`, `run_progress`, `table_results`, `chunk_results`, `divergences`, `sequence_results`, `schema_issues`) are thin layers over these tables.
+CREATE OR REPLACE VIEW pgl_validate.runs AS
+SELECT * FROM pgl_validate.run;
+
+CREATE OR REPLACE VIEW pgl_validate.table_results AS
+SELECT * FROM pgl_validate.table_result;
+
+CREATE OR REPLACE VIEW pgl_validate.chunk_results AS
+SELECT * FROM pgl_validate.chunk_result;
+
+CREATE OR REPLACE VIEW pgl_validate.divergences AS
+SELECT * FROM pgl_validate.divergence;
+
+CREATE OR REPLACE VIEW pgl_validate.sequence_results AS
+SELECT * FROM pgl_validate.sequence_result;
+
+CREATE OR REPLACE VIEW pgl_validate.schema_issues AS
+SELECT * FROM pgl_validate.schema_issue;
+
+CREATE OR REPLACE VIEW pgl_validate.worker_tasks AS
+SELECT * FROM pgl_validate.worker_task;
+
+CREATE OR REPLACE VIEW pgl_validate.run_progress AS
+WITH chunk_counts AS (
+    SELECT
+        cr.run_id,
+        count(cr.*) FILTER (WHERE cr.state IN ('clean','divergent')) AS chunks_done,
+        count(cr.*) FILTER (WHERE cr.state <> 'split') AS chunks_total
+    FROM pgl_validate.chunk_result cr
+    GROUP BY cr.run_id
+),
+chunk_scan AS (
+    SELECT
+        cnr.run_id,
+        COALESCE(sum(cnr.n_rows), 0)::bigint AS rows_scanned
+    FROM pgl_validate.chunk_node_result cnr
+    GROUP BY cnr.run_id
+),
+table_progress AS (
+    SELECT
+        tnr.run_id,
+        COALESCE(sum(tnr.n_rows), 0)::bigint AS rows_scanned
+    FROM pgl_validate.table_node_result tnr
+    GROUP BY tnr.run_id
+),
+run_digest_width AS (
+    SELECT
+        r.run_id,
+        CASE COALESCE(r.options->>'hash_algorithm', 'blake3_256')
+            WHEN 'blake3_512' THEN 64
+            ELSE 32
+        END::bigint AS digest_width
+    FROM pgl_validate.run r
+),
+epoch_progress AS (
+    SELECT
+        fe.run_id,
+        max(fe.epoch_seq) AS current_epoch
+    FROM pgl_validate.fence_epoch fe
+    GROUP BY fe.run_id
+),
+fence_progress AS (
+    SELECT
+        fa.run_id,
+        bool_or(fa.status = 'waiting') AS has_waiting_fence
+    FROM pgl_validate.fence_attempt fa
+    GROUP BY fa.run_id
+),
+divergence_progress AS (
+    SELECT
+        d.run_id,
+        bool_or(d.status = 'candidate') AS has_candidate_divergence
+    FROM pgl_validate.divergence d
+    GROUP BY d.run_id
+)
+SELECT
+    r.run_id,
+    r.status,
+    CASE
+        WHEN r.status IN ('completed','failed','canceled','paused') THEN r.status
+        WHEN COALESCE(fp.has_waiting_fence, false) THEN 'fencing'
+        WHEN COALESCE(dp.has_candidate_divergence, false) THEN 'rechecking'
+        WHEN r.status = 'running' THEN 'running'
+        ELSE r.status
+    END AS phase,
+    ep.current_epoch,
+    COALESCE(cc.chunks_done, 0)::bigint AS chunks_done,
+    COALESCE(cc.chunks_total, 0)::bigint AS chunks_total,
+    (COALESCE(cs.rows_scanned, 0) + COALESCE(tp.rows_scanned, 0))::bigint AS rows_scanned,
+    (
+        (COALESCE(cs.rows_scanned, 0) + COALESCE(tp.rows_scanned, 0))
+        * COALESCE(rdw.digest_width, 32)
+    )::bigint AS bytes_scanned,
+    CASE
+        WHEN r.status IN ('completed','failed','canceled')
+          OR r.started_at IS NULL
+          OR COALESCE(cc.chunks_done, 0) <= 0
+          OR COALESCE(cc.chunks_total, 0) <= COALESCE(cc.chunks_done, 0)
+        THEN NULL::interval
+        ELSE make_interval(secs => (
+            extract(epoch FROM (clock_timestamp() - r.started_at))
+            * (COALESCE(cc.chunks_total, 0) - COALESCE(cc.chunks_done, 0))::double precision
+            / COALESCE(cc.chunks_done, 0)::double precision
+        ))
+    END AS eta,
+    r.started_at,
+    r.finished_at
+FROM pgl_validate.run r
+LEFT JOIN chunk_counts cc USING (run_id)
+LEFT JOIN chunk_scan cs USING (run_id)
+LEFT JOIN table_progress tp USING (run_id)
+LEFT JOIN run_digest_width rdw USING (run_id)
+LEFT JOIN epoch_progress ep USING (run_id)
+LEFT JOIN fence_progress fp USING (run_id)
+LEFT JOIN divergence_progress dp USING (run_id);
+```
 
 ---
 

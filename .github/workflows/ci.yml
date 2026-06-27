@@ -26,6 +26,18 @@ env:
   RUST_BACKTRACE: "1"
 
 jobs:
+  design-check:
+    name: design catalog DDL
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Check design catalog DDL
+        run: pwsh -NoProfile -ExecutionPolicy Bypass -File ./scripts/check-design-catalog-ddl.ps1
+
   pgrx-tests:
     name: pgrx pg${{ matrix.pg }} / ${{ matrix.target.platform }}
     runs-on: ${{ matrix.target.os }}
