@@ -17,8 +17,8 @@ scripts; invoke the task scripts directly rather than running it by hand.
 ## Setup
 
 - `ci-setup.ps1` installs or initializes the selected PostgreSQL major for pgrx.
-- `install-pglogical-release.ps1` installs the required pglogical release for
-  the selected PostgreSQL major. It does not depend on a local pglogical clone.
+- `install-pglogical-release.ps1` installs pglogical for pglogical test and
+  packaging jobs. It does not depend on a local pglogical clone.
 
 ## Tests
 
