@@ -217,6 +217,8 @@ function Write-PglRegressDiffs {
 }
 
 $exitCode = 0
+$previousPath = $env:PATH
+$pathWasAdjusted = $false
 try {
     & (Join-Path $PSScriptRoot 'stop-pgrx-test-clusters.ps1') @stopArgs
 
@@ -237,6 +239,20 @@ try {
     }
 
     $pgConfig = Get-PglPgrxPgConfig -PgMajor $PgMajor
+    $pgBin = Split-Path -Parent $pgConfig
+    $pgLib = & $pgConfig --libdir
+    if ($LASTEXITCODE -ne 0 -or -not $pgLib) {
+        throw "pg_config failed to report --libdir for $pgConfig."
+    }
+
+    $pathEntries = @($pgBin, $pgLib) |
+        Where-Object { $_ -and (Test-Path -LiteralPath $_) } |
+        ForEach-Object { (Resolve-Path -LiteralPath $_).Path }
+    if ($pathEntries) {
+        $env:PATH = ($pathEntries + @($env:PATH)) -join [IO.Path]::PathSeparator
+        $pathWasAdjusted = $true
+    }
+
     $pgRegress = Get-PglPgRegressPath -PgConfig $pgConfig
     $psql = Get-PglToolPath -PgConfig $pgConfig -Name 'psql'
     $dropdb = Get-PglToolPath -PgConfig $pgConfig -Name 'dropdb'
@@ -313,6 +329,9 @@ finally {
     Invoke-PglTimedProcess -FilePath (Get-PglPowerShellExecutable) -ArgumentList $stopCommand -Seconds 60 | Out-Null
     & (Join-Path $PSScriptRoot 'stop-pgrx-test-clusters.ps1') @stopArgs
     Remove-Item -LiteralPath Env:PGL_VALIDATE_REAL_PSQL -ErrorAction SilentlyContinue
+    if ($pathWasAdjusted) {
+        $env:PATH = $previousPath
+    }
 }
 
 exit $exitCode
