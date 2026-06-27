@@ -136,7 +136,7 @@ jobs:
 
       - name: Clean test clusters
         if: always()
-        run: pwsh -NoProfile -ExecutionPolicy Bypass -File ./scripts/stop-pgrx-test-clusters.ps1 -RemoveData
+        run: ./scripts/stop-pgrx-test-clusters.ps1 -RemoveData
 
   pglogical:
     name: pglogical pg${{ matrix.pg }} / ${{ matrix.target.platform }}
@@ -226,7 +226,7 @@ jobs:
 
       - name: Clean test clusters
         if: always()
-        run: pwsh -NoProfile -ExecutionPolicy Bypass -File ./scripts/stop-pgrx-test-clusters.ps1 -RemoveData
+        run: ./scripts/stop-pgrx-test-clusters.ps1 -RemoveData
 
   pglogical-vanilla:
     name: vanilla pglogical pg${{ matrix.pg }} / ${{ matrix.target.platform }}
@@ -290,7 +290,7 @@ jobs:
 
       - name: Clean test clusters
         if: always()
-        run: pwsh -NoProfile -ExecutionPolicy Bypass -File ./scripts/stop-pgrx-test-clusters.ps1 -RemoveData
+        run: ./scripts/stop-pgrx-test-clusters.ps1 -RemoveData
 
   pglogical-mixed-major:
     name: pglogical mixed pg15-to-pg18 / ${{ matrix.target.platform }}
@@ -379,7 +379,7 @@ jobs:
 
       - name: Clean test clusters
         if: always()
-        run: pwsh -NoProfile -ExecutionPolicy Bypass -File ./scripts/stop-pgrx-test-clusters.ps1 -RemoveData
+        run: ./scripts/stop-pgrx-test-clusters.ps1 -RemoveData
 
   replication-harnesses:
     name: ${{ matrix.backend }} pg${{ matrix.pg }} / ${{ matrix.target.platform }}
@@ -472,4 +472,4 @@ jobs:
 
       - name: Clean test clusters
         if: always()
-        run: pwsh -NoProfile -ExecutionPolicy Bypass -File ./scripts/stop-pgrx-test-clusters.ps1 -RemoveData
+        run: ./scripts/stop-pgrx-test-clusters.ps1 -RemoveData
