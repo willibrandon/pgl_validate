@@ -4,9 +4,7 @@ param(
 
     [string] $CargoPgrxVersion = '0.19.1',
 
-    [string] $LlvmVersion = '21.1.7',
-
-    [switch] $BuildPostgresFromSource
+    [string] $LlvmVersion = '21.1.7'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -252,7 +250,11 @@ function Install-HomebrewFormula {
     }
 }
 
-function Get-PostgresSourceVersion {
+<#
+.SYNOPSIS
+Returns the PostgreSQL patch release used by CI for a supported major version.
+#>
+function Get-PostgresReleaseVersion {
     param([int] $Major)
 
     switch ($Major) {
@@ -262,6 +264,109 @@ function Get-PostgresSourceVersion {
         18 { return '18.4' }
         default { throw "Unsupported PostgreSQL major: $Major" }
     }
+}
+
+<#
+.SYNOPSIS
+Returns the supported Windows PostgreSQL binary architecture for CI.
+#>
+function Get-WindowsPostgresArchitecture {
+    $architecture = ConvertTo-WindowsArchitecture -Architecture $env:PGL_VALIDATE_MSVC_ARCH
+    if ($architecture -ne 'x64') {
+        throw "The official PostgreSQL Windows binary fallback supports x64 only; requested $architecture."
+    }
+
+    return $architecture
+}
+
+<#
+.SYNOPSIS
+Returns the official PostgreSQL Windows binary zip URL for the requested major.
+#>
+function Get-WindowsPostgresBinaryUri {
+    param([int] $Major)
+
+    $postgresVersion = Get-PostgresReleaseVersion -Major $Major
+    $architecture = Get-WindowsPostgresArchitecture
+    return "https://get.enterprisedb.com/postgresql/postgresql-$postgresVersion-1-windows-$architecture-binaries.zip"
+}
+
+<#
+.SYNOPSIS
+Downloads an official PostgreSQL Windows binary zip with bounded retries.
+#>
+function Invoke-PostgresBinaryDownload {
+    param(
+        [string] $Uri,
+        [string] $OutFile
+    )
+
+    $maxAttempts = 4
+    for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+        try {
+            Write-Host "+ Invoke-WebRequest $Uri"
+            Invoke-WebRequest `
+                -Uri $Uri `
+                -OutFile $OutFile `
+                -UserAgent 'pgl_validate-ci/1.0'
+            return
+        }
+        catch {
+            if ($attempt -eq $maxAttempts) {
+                throw
+            }
+
+            $delaySeconds = 10 * $attempt
+            Write-Host "PostgreSQL binary download attempt $attempt failed: $($_.Exception.Message). Retrying in $delaySeconds seconds."
+            Start-Sleep -Seconds $delaySeconds
+        }
+    }
+}
+
+<#
+.SYNOPSIS
+Installs PostgreSQL from the same official Windows binary zip that cargo-pgrx expects.
+#>
+function Install-WindowsPostgresBinary {
+    $postgresVersion = Get-PostgresReleaseVersion -Major $PgMajor
+    $pgrxHome = Get-PglPgrxHome
+    $installRoot = Join-Path $pgrxHome $postgresVersion
+    $pgConfig = Join-Path (Join-Path $installRoot 'bin') 'pg_config.exe'
+
+    if (-not (Test-Path -LiteralPath $pgConfig)) {
+        $workDir = Join-Path ([IO.Path]::GetTempPath()) "pgl_validate-postgresql-$postgresVersion-$([guid]::NewGuid())"
+        $archivePath = Join-Path $workDir "postgresql-$postgresVersion-windows.zip"
+        $unpackDir = Join-Path $workDir 'unpack'
+        New-Item -ItemType Directory -Force -Path $unpackDir | Out-Null
+
+        try {
+            $uri = Get-WindowsPostgresBinaryUri -Major $PgMajor
+            Invoke-PostgresBinaryDownload -Uri $uri -OutFile $archivePath
+            Expand-Archive -LiteralPath $archivePath -DestinationPath $unpackDir -Force
+
+            $firstLevelDirs = @(Get-ChildItem -LiteralPath $unpackDir -Directory)
+            if ($firstLevelDirs.Count -ne 1) {
+                throw "Expected one top-level directory in PostgreSQL binary zip, found $($firstLevelDirs.Count)."
+            }
+
+            if (Test-Path -LiteralPath $installRoot) {
+                Remove-Item -LiteralPath $installRoot -Recurse -Force
+            }
+
+            New-Item -ItemType Directory -Force -Path $pgrxHome | Out-Null
+            Move-Item -LiteralPath $firstLevelDirs[0].FullName -Destination $installRoot
+        }
+        finally {
+            Remove-Item -LiteralPath $workDir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    if (-not (Test-Path -LiteralPath $pgConfig)) {
+        throw "PostgreSQL binary install did not produce $pgConfig."
+    }
+
+    Invoke-Logged -FilePath 'cargo' -Arguments @('pgrx', 'init', "--pg$PgMajor", $pgConfig)
+    Enable-PostgresInstallWrites -PgConfig $pgConfig
 }
 
 <#
@@ -529,84 +634,16 @@ function Initialize-WindowsPostgres {
         Invoke-Logged -FilePath 'cargo' -Arguments @('pgrx', 'init', "--pg$PgMajor", 'download')
     }
     catch {
-        Write-Host "cargo-pgrx PostgreSQL download failed; building PostgreSQL $PgMajor from source instead."
+        Write-Host "cargo-pgrx PostgreSQL download failed; installing PostgreSQL $PgMajor from the official Windows binary zip instead."
         Write-Host $_.Exception.Message
-        Initialize-WindowsSourcePostgres
+        Install-WindowsPostgresBinary
     }
-}
-
-function Initialize-WindowsSourcePostgres {
-    Install-ChocolateyPackage -CommandName 'perl' -PackageName 'strawberryperl'
-    Install-ChocolateyPackage -CommandName 'cmake' -PackageName 'cmake'
-
-    $postgresVersion = Get-PostgresSourceVersion -Major $PgMajor
-    $architecture = if ($env:PGL_VALIDATE_MSVC_ARCH) {
-        $env:PGL_VALIDATE_MSVC_ARCH.ToLowerInvariant()
-    }
-    else {
-        [Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString().ToLowerInvariant()
-    }
-    if ($architecture -eq 'arm64') {
-        throw 'Native Windows ARM64 PostgreSQL source builds are not supported by the PostgreSQL 15-18 MSVC build scripts used in this CI path. Use the Windows ARM64-hosted x64 matrix lane instead.'
-    }
-
-    $pgrxHome = Get-PglPgrxHome
-    $installRoot = Join-Path $pgrxHome "postgresql-$postgresVersion-$architecture"
-    $pgConfig = Join-Path (Join-Path $installRoot 'bin') 'pg_config.exe'
-
-    if (-not (Test-Path -LiteralPath $pgConfig)) {
-        $workDir = Join-Path ([IO.Path]::GetTempPath()) "pgl_validate-postgresql-$postgresVersion-$([guid]::NewGuid())"
-        $archivePath = Join-Path $workDir "postgresql-$postgresVersion.tar.gz"
-        $sourceUri = "https://ftp.postgresql.org/pub/source/v$postgresVersion/postgresql-$postgresVersion.tar.gz"
-        New-Item -ItemType Directory -Force -Path $workDir | Out-Null
-
-        try {
-            Invoke-WebRequest -Uri $sourceUri -OutFile $archivePath
-            $tar = Get-PglCommandSource -Name 'tar'
-            if (-not $tar) {
-                throw 'tar is required to extract PostgreSQL source.'
-            }
-
-            Invoke-Logged -FilePath $tar -Arguments @('-xzf', $archivePath, '-C', $workDir)
-            $sourceRoot = Join-Path $workDir "postgresql-$postgresVersion"
-            $msvcRoot = Join-Path (Join-Path (Join-Path $sourceRoot 'src') 'tools') 'msvc'
-            if (-not (Test-Path -LiteralPath $msvcRoot)) {
-                throw "PostgreSQL $postgresVersion source archive does not contain src/tools/msvc; this CI source build path cannot build it with MSVC."
-            }
-
-            Push-Location $sourceRoot
-            try {
-                $buildScript = Join-Path (Join-Path 'src' 'tools') (Join-Path 'msvc' 'build.pl')
-                $installScript = Join-Path (Join-Path 'src' 'tools') (Join-Path 'msvc' 'install.pl')
-                Invoke-Logged -FilePath 'perl' -Arguments @($buildScript)
-                Invoke-Logged -FilePath 'perl' -Arguments @($installScript, $installRoot)
-            }
-            finally {
-                Pop-Location
-            }
-        }
-        finally {
-            Remove-Item -LiteralPath $workDir -Recurse -Force -ErrorAction SilentlyContinue
-        }
-    }
-
-    if (-not (Test-Path -LiteralPath $pgConfig)) {
-        throw "PostgreSQL source build did not produce $pgConfig."
-    }
-
-    Invoke-Logged -FilePath 'cargo' -Arguments @('pgrx', 'init', "--pg$PgMajor", $pgConfig)
-    Enable-PostgresInstallWrites -PgConfig $pgConfig
 }
 
 Install-CargoPgrx
 
 if (Test-PglWindows) {
-    if ($BuildPostgresFromSource) {
-        Initialize-WindowsSourcePostgres
-    }
-    else {
-        Initialize-WindowsPostgres
-    }
+    Initialize-WindowsPostgres
 }
 elseif (Test-PglMacOS) {
     Initialize-MacPostgres
