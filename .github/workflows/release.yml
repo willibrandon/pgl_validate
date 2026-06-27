@@ -1,0 +1,149 @@
+name: Release Packages
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_HTTP_MULTIPLEXING: "false"
+  CARGO_HTTP_TIMEOUT: "120"
+  CARGO_NET_RETRY: "10"
+  PGL_VALIDATE_PGLOGICAL_VERSION: "2.5.3"
+  RUST_BACKTRACE: "1"
+
+jobs:
+  package:
+    name: package pg${{ matrix.pg }} / ${{ matrix.target.platform }}
+    runs-on: ${{ matrix.target.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: [15, 16, 17, 18]
+        target:
+          - os: ubuntu-24.04
+            platform: linux-x64
+          - os: ubuntu-24.04-arm
+            platform: linux-arm64
+          - os: windows-2025-vs2026
+            platform: windows-x64
+            msvc_arch: x64
+          - os: windows-11-vs2026-arm
+            platform: windows-arm64-hosted-x64
+            msvc_arch: x64
+            rust_toolchain: stable-x86_64-pc-windows-msvc
+          - os: macos-26
+            platform: macos-arm64
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        run: |
+          $toolchain = '${{ matrix.target.rust_toolchain }}'
+          $explicitToolchain = -not [string]::IsNullOrWhiteSpace($toolchain)
+          if ([string]::IsNullOrWhiteSpace($toolchain)) {
+            $toolchain = 'stable'
+          }
+          $installArgs = @('toolchain', 'install', $toolchain, '--profile', 'minimal')
+          if ($toolchain -like '*x86_64-pc-windows-msvc' -and [Runtime.InteropServices.RuntimeInformation]::OSArchitecture -eq [Runtime.InteropServices.Architecture]::Arm64) {
+            $installArgs += '--force-non-host'
+          }
+          rustup @installArgs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if ($explicitToolchain -and $env:GITHUB_ENV) {
+            "PGL_VALIDATE_RUST_TOOLCHAIN=$toolchain" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          }
+          if ($explicitToolchain) {
+            & rustc "+$toolchain" --version
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            & cargo "+$toolchain" --version
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+          else {
+            rustc --version
+            cargo --version
+          }
+
+      - name: Cache cargo artifacts
+        if: matrix.target.platform != 'windows-arm64-hosted-x64'
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/bin/cargo-pgrx*
+            ~/.cargo/.crates.toml
+            ~/.cargo/.crates2.json
+            ~/.pgrx
+            target
+          key: cargo-package-pg${{ matrix.pg }}-${{ matrix.target.platform }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-package-pg${{ matrix.pg }}-${{ matrix.target.platform }}-
+
+      - name: Set up PostgreSQL and pgrx
+        env:
+          PGL_VALIDATE_MSVC_ARCH: ${{ matrix.target.msvc_arch }}
+        run: ./scripts/pgrx-vs.ps1 pwsh -NoProfile -ExecutionPolicy Bypass -File ./scripts/ci-setup.ps1 -PgMajor ${{ matrix.pg }}
+
+      - name: Install pglogical release
+        env:
+          PGL_VALIDATE_MSVC_ARCH: ${{ matrix.target.msvc_arch }}
+        run: ./scripts/pgrx-vs.ps1 pwsh -NoProfile -ExecutionPolicy Bypass -File ./scripts/install-pglogical-release.ps1 -PgMajor ${{ matrix.pg }} -Version $env:PGL_VALIDATE_PGLOGICAL_VERSION
+
+      - name: Build pgrx package
+        id: package
+        env:
+          PGL_VALIDATE_MSVC_ARCH: ${{ matrix.target.msvc_arch }}
+        run: ./scripts/pgrx-vs.ps1 pwsh -NoProfile -ExecutionPolicy Bypass -File ./scripts/package-pgrx.ps1 -PgMajor ${{ matrix.pg }} -Platform ${{ matrix.target.platform }}
+
+      - name: Upload package artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.package.outputs.artifact_name }}
+          path: ${{ steps.package.outputs.artifact_path }}
+          if-no-files-found: error
+
+  publish-github-release:
+    name: publish GitHub release
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: package
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Download package artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: release-artifacts
+
+      - name: Upload release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          $files = Get-ChildItem -LiteralPath release-artifacts -Recurse -Filter '*.zip' | Select-Object -ExpandProperty FullName
+          if (-not $files) {
+            throw 'No release package archives were downloaded.'
+          }
+
+          gh release view $env:RELEASE_TAG *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $env:RELEASE_TAG @files --clobber
+          }
+          else {
+            gh release create $env:RELEASE_TAG @files --verify-tag --title $env:RELEASE_TAG --notes "pgl_validate $env:RELEASE_TAG packages."
+          }

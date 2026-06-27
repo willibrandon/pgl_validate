@@ -96,6 +96,16 @@ the replay-LSN fence path against a real read-only standby:
 .\scripts\test-physical-standby-fence.ps1 -PgMajor 18
 ```
 
+Release packages are built with `cargo pgrx package` through the wrapper script.
+It writes a pgrx install tree and a zip archive under `target`:
+
+```powershell
+.\scripts\pgrx-vs.ps1 pwsh -NoProfile -ExecutionPolicy Bypass -File .\scripts\package-pgrx.ps1 -PgMajor 18
+```
+
+Tagged releases run the same packaging path for PostgreSQL 15-18 on Linux
+x64/arm64, Windows x64, Windows ARM64-hosted x64, and macOS ARM64.
+
 If `cargo check` is launched by an editor, start that editor from a Visual
 Studio developer shell, or use the checked-in VS Code workspace settings. They
 route rust-analyzer flycheck through `scripts\pgrx-vs.ps1`, which loads the
