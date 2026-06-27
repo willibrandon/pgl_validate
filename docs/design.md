@@ -301,7 +301,7 @@ The bulk phase is one indexed scan per node (chunked); under load it incurs extr
 
 Equality is meaningful only relative to what the topology promises. `pgl_validate` reads the contract from pglogical catalogs and validates the **strongest sound property** per table.
 
-### 9.1 Sources (verified against pglogical 2.5.0 schema)
+### 9.1 Sources (verified against pglogical 2.5.3 schema)
 
 - `pglogical.replication_set(set_id, set_nodeid, set_name, replicate_insert, replicate_update, replicate_delete, replicate_truncate)` — the **action mask**.
 - `pglogical.replication_set_table(set_id, set_reloid, set_att_list text[], set_row_filter pg_node_tree)` — **column list** and **row filter**.
