@@ -825,14 +825,14 @@ proptest over encoding+LtHash+sorted-digest (equal multisets ⇒ equal hashes; s
 | Milestone | Deliverable | Tests gating completion |
 |---|---|---|
 | **M1 — Digest + set hash** | `encode.rs`, `row_digest.rs`, `lthash.rs` (LtHash + sorted-digest) | unit + property + `#[pg_test]` order/parallel/types |
-| **M2 — Generated SQL + two-node compare** | `sqlgen.rs`, sync `transport`, `compare_table` | two-node clean/missing/extra/differs; EXPLAIN shows index scans |
-| **M3 — Contract** | `contract/pglogical.rs` (mask/column/filter/sync/sequence) | row-filter, column-list, insert-only, no-delete, mid-sync, sequence scenarios |
-| **M4 — Vector fence + recheck** | `fence.rs` | post-fence UPDATE/DELETE cleared; live-load no false positive; bidirectional |
-| **M5 — Merkle + localization** | `merkle.rs`, `plan.rs` | localize-to-key; keyless; partitioned |
-| **M6 — Async fan-out + N-way** | async libpq | N-way + bidirectional fences |
-| **M7 — Orchestration + catalogs** | `worker.rs`, `catalog.rs`, views, resumability, scheduling | resume-after-crash; throttle/pause |
-| **M8 — Native + standby backends** | `contract/native.rs`, `contract/standby.rs` | native row-filter/pubactions; standby participant |
-| **M9 — Repair** | `repair.rs` (origin-aware, locked, FK-ordered) | generate/apply/revalidate; multi-table FK; no loop |
+| **M2 — Generated SQL + two-node compare** | `sql/bootstrap/040_planning.sql`, `sql/bootstrap/050_compare.sql`, `src/transport/libpq.rs` | two-node clean/missing/extra/differs; EXPLAIN shows index scans |
+| **M3 — Contract** | `sql/bootstrap/010_contracts.sql`, `sql/bootstrap/050_compare.sql` | row-filter, column-list, insert-only, no-delete, mid-sync, sequence scenarios |
+| **M4 — Vector fence + recheck** | `sql/bootstrap/020_barriers.sql`, `030_fencing.sql`, `036_re_fence.sql`, `050_compare.sql`, `src/transport/libpq.rs` | post-fence UPDATE/DELETE cleared; live-load no false positive; bidirectional |
+| **M5 — Merkle + localization** | `sql/bootstrap/040_planning.sql`, `050_compare.sql` | localize-to-key; keyless; partitioned |
+| **M6 — Async fan-out + N-way** | `src/transport/libpq.rs`, `sql/bootstrap/050_compare.sql` | N-way + bidirectional fences |
+| **M7 — Orchestration + catalogs** | `src/worker.rs`, `sql/bootstrap/001_catalog.sql`, `070_reporting.sql`, views, resumability, scheduling | resume-after-crash; throttle/pause |
+| **M8 — Native + standby backends** | `sql/bootstrap/010_contracts.sql`, `030_fencing.sql`, `035_throttle.sql`, `050_compare.sql`, `src/transport/libpq.rs` | native row-filter/pubactions; standby participant |
+| **M9 — Repair** | `sql/bootstrap/060_repair.sql`, `src/transport/libpq.rs` (origin-aware, locked, FK-ordered) | generate/apply/revalidate; multi-table FK; no loop |
 | **M10 — Hardening + release** | security tiers, observability, cross-version, packaging | full matrix PG15–18 × 3 OSes |
 
 Each milestone is independently shippable and fully tested before the next (no deferred work).
