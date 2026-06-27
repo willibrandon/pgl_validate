@@ -3272,13 +3272,23 @@ mod tests {
         )
         .unwrap();
 
+        crate::transport::libpq::execute_command(
+            &local_dsn,
+            &format!(
+                "DROP TABLE IF EXISTS public.{table_name};
+                 CREATE TABLE public.{table_name}(id int PRIMARY KEY, value text);
+                 INSERT INTO public.{table_name} VALUES
+                     (1, 'local'),
+                     (3, 'local-only');"
+            ),
+        )
+        .unwrap();
         Spi::run(&format!(
-            "CREATE TABLE public.{table_name}(id int PRIMARY KEY, value text);
-             INSERT INTO public.{table_name} VALUES
-                 (1, 'local'),
-                 (3, 'local-only');
-             INSERT INTO pgl_validate.peer(name, dsn, backend)
-             VALUES ('remote_diff', {}, 'native');",
+            "
+            DELETE FROM pgl_validate.peer WHERE name IN ('local', 'remote_diff');
+            INSERT INTO pgl_validate.peer(name, dsn, backend)
+            VALUES ('remote_diff', {}, 'native');
+            ",
             sql_literal(&remote_dsn)
         ))
         .unwrap();
@@ -3456,15 +3466,18 @@ mod tests {
         )
         .unwrap();
 
-        Spi::run(&format!(
-            "
-            UPDATE public.{table_name}
-            SET value = 'local-stale'
-            WHERE id = 1;
-            INSERT INTO public.{table_name}
-            VALUES (4, 'local-extra');
-            "
-        ))
+        crate::transport::libpq::execute_command(
+            &local_dsn,
+            &format!(
+                "
+                UPDATE public.{table_name}
+                SET value = 'local-stale'
+                WHERE id = 1;
+                INSERT INTO public.{table_name}
+                VALUES (4, 'local-extra');
+                "
+            ),
+        )
         .unwrap();
 
         let local_drift_run_id = Spi::get_one::<i64>(&run_sql).unwrap().unwrap();
@@ -3475,9 +3488,39 @@ mod tests {
         .unwrap();
         assert_eq!(local_drift_verdict, "differ");
 
+        let missing_loopback = Spi::get_one::<String>(&format!(
+            "
+            SELECT status || ';' || COALESCE(error, '')
+            FROM pgl_validate.apply_repair(
+                {local_drift_run_id},
+                'remote_diff',
+                'local',
+                'local'
+            )
+            "
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            missing_loopback,
+            "failed;local_only repair target local requires pgl_validate.peer row named local so the origin-aware repair transaction can run over libpq"
+        );
+
+        Spi::run(&format!(
+            "
+            INSERT INTO pgl_validate.peer(name, dsn, backend)
+            VALUES ('local', {local_dsn}, 'native')
+            ON CONFLICT (name) DO UPDATE
+            SET dsn = EXCLUDED.dsn,
+                backend = EXCLUDED.backend;
+            ",
+            local_dsn = sql_literal(&local_dsn)
+        ))
+        .unwrap();
+
         let local_repair_status = Spi::get_one::<String>(&format!(
             "
-            SELECT repair_id::text || ';' || status
+            SELECT repair_id::text || ';' || status || ';' || COALESCE(error, '')
             FROM pgl_validate.apply_repair(
                 {local_drift_run_id},
                 'remote_diff',
@@ -3491,7 +3534,11 @@ mod tests {
         let (local_repair_id, local_repair_status) = local_repair_status
             .split_once(';')
             .expect("local repair status should include id");
+        let (local_repair_status, local_repair_error) = local_repair_status
+            .split_once(';')
+            .expect("local repair status should include error");
         assert_eq!(local_repair_status, "revalidated");
+        assert_eq!(local_repair_error, "");
 
         let local_repair_actions = Spi::get_one::<String>(&format!(
             "
@@ -3521,6 +3568,10 @@ mod tests {
         let _ = crate::transport::libpq::execute_command(
             &local_dsn,
             &format!("DROP DATABASE IF EXISTS {peer_db} WITH (FORCE)"),
+        );
+        let _ = crate::transport::libpq::execute_command(
+            &local_dsn,
+            &format!("DROP TABLE IF EXISTS public.{table_name};"),
         );
     }
 

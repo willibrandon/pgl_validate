@@ -527,7 +527,6 @@ DECLARE
     sequence_stmt record;
     statement_count int;
     repair_error text;
-    local_origin_setup boolean := false;
     revalidation_options jsonb;
     revalidation_peers text[];
     revalidation_failed boolean := false;
@@ -711,6 +710,18 @@ BEGIN
             RETURN repair;
         END IF;
 
+        IF target = 'local' AND propagation = 'local_only' THEN
+            SELECT *
+            INTO target_peer
+            FROM pgl_validate.peer p
+            WHERE p.name = target;
+
+            IF NOT FOUND THEN
+                RAISE EXCEPTION 'local_only repair target local requires pgl_validate.peer row named local so the origin-aware repair transaction can run over libpq'
+                    USING ERRCODE = '55000';
+            END IF;
+        END IF;
+
         IF propagation = 'local_only' THEN
             forwarding_subscription_refs := ARRAY[]::text[];
 
@@ -764,24 +775,6 @@ BEGIN
                     array_to_string(forwarding_subscription_refs, ', ')
                     USING ERRCODE = '55000';
             END IF;
-        END IF;
-
-        IF target = 'local' AND propagation = 'local_only' THEN
-            IF pg_replication_origin_session_is_setup() THEN
-                RAISE EXCEPTION 'cannot apply local_only repair while another replication origin is active'
-                    USING ERRCODE = '55000';
-            END IF;
-
-            IF NOT EXISTS (
-                SELECT 1
-                FROM pg_replication_origin
-                WHERE roname = origin_name
-            ) THEN
-                PERFORM pg_replication_origin_create(origin_name);
-            END IF;
-
-            PERFORM pg_replication_origin_session_setup(origin_name);
-            local_origin_setup := true;
         END IF;
 
         SELECT string_agg(
@@ -844,7 +837,7 @@ BEGIN
           AND verify_statement IS NOT NULL;
 
         IF row_batch IS NOT NULL THEN
-            IF target = 'local' THEN
+            IF target = 'local' AND propagation <> 'local_only' THEN
                 FOR sequence_stmt IN
                     SELECT lock_statement
                     FROM pgl_validate_apply_statement
@@ -947,23 +940,34 @@ BEGIN
             WHERE action = 'setval'
             ORDER BY ord
         LOOP
-            IF target = 'local' THEN
+            IF target = 'local' AND propagation <> 'local_only' THEN
                 EXECUTE sequence_stmt.statement;
             ELSE
+                IF propagation = 'local_only' THEN
+                    remote_batch := session_role_check ||
+                        E'\n' || format(
+                        'DO $pgl_validate_origin$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_replication_origin WHERE roname = %L) THEN PERFORM pg_replication_origin_create(%L); END IF; END $pgl_validate_origin$;' ||
+                        E'\nDO $pgl_validate_origin$ BEGIN PERFORM pg_replication_origin_session_setup(%L); END $pgl_validate_origin$;' ||
+                        E'\n%s' ||
+                        E'\nDO $pgl_validate_origin$ BEGIN PERFORM pg_replication_origin_session_reset(); END $pgl_validate_origin$;',
+                        origin_name,
+                        origin_name,
+                        origin_name,
+                        sequence_stmt.statement
+                    );
+                ELSE
+                    remote_batch := sequence_stmt.statement;
+                END IF;
+
                 PERFORM pgl_validate.remote_execute(
                     target_peer.dsn,
-                    sequence_stmt.statement,
+                    remote_batch,
                     target_peer.connect_timeout_seconds,
                     target_peer.statement_timeout_ms,
                     target_peer.lock_timeout_ms
                 );
             END IF;
         END LOOP;
-
-        IF local_origin_setup THEN
-            PERFORM pg_replication_origin_session_reset();
-            local_origin_setup := false;
-        END IF;
 
         INSERT INTO pgl_validate.repair_result(
             repair_id, schema_name, table_name, key_bytes, action, statement, post_verdict
@@ -1120,11 +1124,6 @@ BEGIN
 
         RETURN repair;
     EXCEPTION WHEN others THEN
-        IF local_origin_setup THEN
-            PERFORM pg_replication_origin_session_reset();
-            local_origin_setup := false;
-        END IF;
-
         GET STACKED DIAGNOSTICS repair_error = MESSAGE_TEXT;
         UPDATE pgl_validate.repair_run
         SET status = 'failed',
