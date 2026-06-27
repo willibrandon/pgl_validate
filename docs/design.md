@@ -74,7 +74,7 @@
 22. [Edge Cases and Failure Modes](#22-edge-cases-and-failure-modes)
 23. [Cross-Version Compatibility and Packaging](#23-cross-version-compatibility-and-packaging)
 24. [Milestones](#24-milestones)
-25. [Open Questions and Future Work](#25-open-questions-and-future-work)
+25. [Post-0.1.0 Extensions](#25-post-010-extensions)
 26. [Appendix A: Catalog DDL](#appendix-a-catalog-ddl)
 27. [Appendix B: Worked Examples](#appendix-b-worked-examples)
 28. [Appendix C: Row Digest and Set-Hash Specification](#appendix-c-row-digest-and-set-hash-specification)
@@ -720,7 +720,7 @@ Bounded per-chunk statements (`chunk_max_duration`, `statement_timeout_per_chunk
 
 ### 19.3 Observability
 
-Reporting surfaces: `runs`, `run_progress` (chunks done/total, ETA, bytes scanned, phase, current epoch), `table_results`, `chunk_results`, `divergences`, `conflict_evidence`, `sequence_results`, `schema_issues`. `report(run_id)` returns a complete structured JSON verdict (per-table contract + property validated, counts per node, confirmed keys, correlated pglogical conflict evidence, sequence windows, timing, resource stats) suitable for CI gates. `metrics()` exposes stable counters/gauges (runs by status, tables matched/differing, last successful validation per table, rows scanned, bytes transferred) for scraping. Phase transitions, per-epoch fence vectors, convergence waits, throttle events, and re-fences are logged with the run id via `log!`/`ereport!`.
+Reporting surfaces: `runs`, `run_progress` (chunks done/total, ETA, bytes scanned, phase, current epoch), `table_results`, `chunk_results`, `divergences`, `conflict_evidence`, `sequence_results`, `schema_issues`. `report(run_id)` returns a complete structured JSON verdict (per-table contract + property validated, counts per node, confirmed keys, correlated pglogical conflict evidence, sequence windows, timing, resource stats) suitable for CI gates. `conflict_summary(run_id)` condenses optional pglogical conflict evidence by table, node, conflict type, and resolution, while `purge_conflict_evidence(before, run_id)` prunes raw conflict rows without deleting the validation result. `metrics()` exposes stable counters/gauges (runs by status, tables matched/differing, last successful validation per table, rows scanned, bytes transferred) for scraping. Phase transitions, per-epoch fence vectors, convergence waits, throttle events, and re-fences are logged with the run id via `log!`/`ereport!`.
 
 ---
 
@@ -852,12 +852,13 @@ Each milestone is independently shippable and fully tested before the next (no d
 
 ---
 
-## 25. Open Questions and Future Work
+## 25. Post-0.1.0 Extensions
 
-- **Incremental validation** — re-validate only key ranges whose `pg_xact_commit_timestamp` watermark advanced since the last clean run, for cheap continuous assurance (catalog already records per-chunk verdicts and epochs).
-- **Explicit sampling mode** — statistically-bounded partial validation for very large tables, with a *reported* confidence level (never silent scope reduction).
-- **Slot-peek fence** — derive an exact provider fence LSN from a logical slot peek instead of `pg_current_wal_lsn()`, if a future need arises.
-- **Conflict-history summaries and retention** — conflict-history correlation is part of the catalog/API path; `conflict_summary(run_id)` provides compact cause counts by table/node/conflict type/resolution, and `purge_conflict_evidence(before, run_id)` lets operators retain validation results while pruning raw evidence in long-running fleets.
+These are optional extensions beyond the exact validation, repair, packaging, and release gates for `v0.1.0`.
+
+- **Incremental validation** — re-validate only key ranges whose `pg_xact_commit_timestamp` watermark advanced since the last clean run, for cheaper continuous assurance. This is an optimization; the exact full validation path remains the release requirement.
+- **Explicit sampling mode** — statistically-bounded partial validation for very large tables, with a *reported* confidence level. Sampling must never be reported as an exact `match`.
+- **Alternative fence experiments** — any future slot-peek or decoding-based fence mechanism must preserve the current load-bearing property: edge-specific convergence proven by the subscriber's origin progress crossing the exact barrier LSN. The current barrier protocol is the required `v0.1.0` mechanism.
 
 ---
 
