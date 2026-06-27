@@ -11,6 +11,9 @@ Studio C++ environment before invoking Rust, pgrx, or PostgreSQL tools:
 .\scripts\pgrx-vs.ps1 cargo pgrx schema pg18 --no-default-features --features pg18
 ```
 
+`pgrx-common.ps1` is a shared helper loaded by the setup, test, and packaging
+scripts; invoke the task scripts directly rather than running it by hand.
+
 ## Setup
 
 - `ci-setup.ps1` installs or initializes the selected PostgreSQL major for pgrx.
