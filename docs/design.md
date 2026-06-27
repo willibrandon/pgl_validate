@@ -609,6 +609,7 @@ State is persisted (typed, normalized, FK-linked) so runs are resumable and audi
 - `fence_epoch` / `fence_edge` — the **vector fence per epoch** (`fence_edge(run_id, epoch_seq, edge_id, barrier_token, barrier_end_lsn, degraded)`), plus `fence_attempt` keyed **per (run, epoch, edge_id)**; each edge converges independently and records `origin_progress_lsn` vs `barrier_end_lsn` (**the authoritative, edge-specific condition** — origin progress ≥ the barrier's exact end LSN), `token_visible` (corroborating liveness), `confirmed_flush_lsn`, and `status` (incl. `degraded`).
 - `fence_barrier` — **standalone, FK-free, and deliberately NON-unique on `token`** (a cascade can deliver the same token twice; a unique constraint would cause an `insert_insert` conflict that `conflict_resolution = error` turns into an apply stall). A normal logged table (pglogical forbids UNLOGGED/TEMP in repsets); the only `fence_*` table added to a repset. Run/edge linkage lives in the **non-replicated** `fence_barrier_run`.
 - `table_plan` — per (run, table): key_cols, **contract** (repset action mask, has_row_filter, att_list, repsets), sync_status, and the `validated_property` actually checked (full / superset / keys_only / filtered_intersection / filtered_advisory / keyless / unsupported_mask).
+- `table_column_plan` — per planned column: local type identity, typmod, and the coordinator-selected `row_digest` encoding mode (`send` / `text` / `jsonb_normalize`) used to make mixed-version encoding decisions auditable.
 - `table_result` (FK→`table_plan`) — verdict `match|differ|indeterminate|partial|approximate|degraded|skipped|error|fence_timeout`.
 - `table_node_result` — per (run, table, node): `n_rows bigint`, `lthash bytea`, `set_hash bytea` (typed, not JSONB).
 - `chunk_result` — per (run, table, chunk_id, parent_id): `lo/hi bytea`, state enum `pending|running|clean|split|divergent|candidate`.
@@ -1009,6 +1010,28 @@ CREATE TABLE pgl_validate.table_plan (
                               'filtered_intersection','filtered_advisory','keyless',
                               'unsupported_mask','skipped')),
     PRIMARY KEY (run_id, schema_name, table_name)
+);
+
+CREATE TABLE pgl_validate.table_column_plan (
+    run_id        bigint NOT NULL,
+    schema_name   text NOT NULL,
+    table_name    text NOT NULL,
+    attnum        int NOT NULL,
+    attname       text NOT NULL,
+    type_oid      oid NOT NULL,
+    type_schema   name NOT NULL,
+    type_name     name NOT NULL,
+    typmod        int NOT NULL,
+    encoding_mode int NOT NULL CHECK (encoding_mode IN (1, 2, 3)),
+    encoding_name text NOT NULL CHECK (encoding_name IN ('send','text','jsonb_normalize')),
+    CONSTRAINT table_column_plan_encoding_consistent CHECK (
+        (encoding_mode = 1 AND encoding_name = 'send') OR
+        (encoding_mode = 2 AND encoding_name = 'text') OR
+        (encoding_mode = 3 AND encoding_name = 'jsonb_normalize')
+    ),
+    PRIMARY KEY (run_id, schema_name, table_name, attname),
+    FOREIGN KEY (run_id, schema_name, table_name)
+        REFERENCES pgl_validate.table_plan(run_id, schema_name, table_name) ON DELETE CASCADE
 );
 
 CREATE TABLE pgl_validate.table_result (

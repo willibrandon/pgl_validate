@@ -831,6 +831,14 @@ SELECT CASE
                         jsonb_build_object(
                             'plan', to_jsonb(tp),
                             'result', to_jsonb(tr),
+                            'columns',
+                                COALESCE((
+                                    SELECT jsonb_agg(to_jsonb(tcp) ORDER BY tcp.attname)
+                                    FROM pgl_validate.table_column_plan tcp
+                                    WHERE tcp.run_id = tp.run_id
+                                      AND tcp.schema_name = tp.schema_name
+                                      AND tcp.table_name = tp.table_name
+                                ), '[]'::jsonb),
                             'nodes',
                                 COALESCE((
                                     SELECT jsonb_agg(to_jsonb(tnr) ORDER BY tnr.node)

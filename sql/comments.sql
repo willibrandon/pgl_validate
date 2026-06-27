@@ -23,6 +23,8 @@ COMMENT ON TABLE pgl_validate.fence_barrier_run IS
     'Coordinator-local linkage between a barrier token and the run edge that injected it.';
 COMMENT ON TABLE pgl_validate.table_plan IS
     'Per-table validation plan and replication contract selected for a run.';
+COMMENT ON TABLE pgl_validate.table_column_plan IS
+    'Per-column digest encoding plan selected for a table in a validation run.';
 COMMENT ON TABLE pgl_validate.table_result IS
     'Per-table validation verdict for a run.';
 COMMENT ON TABLE pgl_validate.table_node_result IS
@@ -144,6 +146,18 @@ BEGIN
             ('table_plan', 'has_row_filter', 'Whether the table contract includes a row filter.'),
             ('table_plan', 'sync_status', 'Subscriber-side table synchronization state, when known.'),
             ('table_plan', 'validated_property', 'Strongest property that can be soundly validated for the table.'),
+
+            ('table_column_plan', 'run_id', 'Validation run that owns this column plan.'),
+            ('table_column_plan', 'schema_name', 'Schema name of the planned table.'),
+            ('table_column_plan', 'table_name', 'Relation name of the planned table.'),
+            ('table_column_plan', 'attnum', 'Local attribute number used for catalog traceability.'),
+            ('table_column_plan', 'attname', 'Column name included in row digests.'),
+            ('table_column_plan', 'type_oid', 'Local type OID used when the encoding mode was selected.'),
+            ('table_column_plan', 'type_schema', 'Schema name of the column type.'),
+            ('table_column_plan', 'type_name', 'Column type name.'),
+            ('table_column_plan', 'typmod', 'Column typmod used by the planned comparison.'),
+            ('table_column_plan', 'encoding_mode', 'Numeric row_digest encoding mode passed positionally in generated SQL.'),
+            ('table_column_plan', 'encoding_name', 'Human-readable encoding mode: send, text, or jsonb_normalize.'),
 
             ('table_result', 'run_id', 'Validation run that owns this table verdict.'),
             ('table_result', 'schema_name', 'Schema name of the validated table.'),

@@ -871,6 +871,63 @@ mod tests {
     }
 
     #[pg_test]
+    fn compare_table_records_column_encoding_plan() {
+        Spi::run(
+            r#"
+            CREATE TEMP TABLE column_plan_target(
+                id int PRIMARY KEY,
+                amount numeric,
+                status text
+            );
+            INSERT INTO column_plan_target VALUES
+                (1, 10.25, 'open'),
+                (2, 11.50, 'closed');
+            "#,
+        )
+        .unwrap();
+
+        let run_id = Spi::get_one::<i64>(
+            r#"
+            SELECT (pgl_validate.compare_table(
+                'column_plan_target'::regclass,
+                NULL,
+                '{}'::jsonb
+            )).run_id
+            "#,
+        )
+        .unwrap()
+        .unwrap();
+
+        let summary = Spi::get_one::<String>(&format!(
+            r#"
+            WITH report AS (
+                SELECT pgl_validate.report({run_id}) AS doc
+            )
+            SELECT (
+                       SELECT string_agg(attname || ':' || encoding_name, ';' ORDER BY attname)
+                       FROM pgl_validate.table_column_plan tcp
+                       WHERE tcp.run_id = {run_id}
+                         AND tcp.table_name = 'column_plan_target'
+                   )
+                   || '|'
+                   || (
+                       SELECT jsonb_array_length(doc->'tables'->0->'columns')::text
+                       FROM report
+                   )
+                   || '|'
+                   || (
+                       SELECT doc->'tables'->0->'columns'->0->>'encoding_name'
+                       FROM report
+                   )
+            "#,
+        ))
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(summary, "amount:text;id:send;status:send|3|text");
+    }
+
+    #[pg_test]
     fn security_tier_roles_gate_extension_surface() {
         Spi::run(
             r#"

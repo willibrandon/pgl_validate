@@ -144,6 +144,28 @@ CREATE TABLE pgl_validate.table_plan (
     PRIMARY KEY (run_id, schema_name, table_name)
 );
 
+CREATE TABLE pgl_validate.table_column_plan (
+    run_id        bigint NOT NULL,
+    schema_name   text NOT NULL,
+    table_name    text NOT NULL,
+    attnum        int NOT NULL,
+    attname       text NOT NULL,
+    type_oid      oid NOT NULL,
+    type_schema   name NOT NULL,
+    type_name     name NOT NULL,
+    typmod        int NOT NULL,
+    encoding_mode int NOT NULL CHECK (encoding_mode IN (1, 2, 3)),
+    encoding_name text NOT NULL CHECK (encoding_name IN ('send','text','jsonb_normalize')),
+    CONSTRAINT table_column_plan_encoding_consistent CHECK (
+        (encoding_mode = 1 AND encoding_name = 'send') OR
+        (encoding_mode = 2 AND encoding_name = 'text') OR
+        (encoding_mode = 3 AND encoding_name = 'jsonb_normalize')
+    ),
+    PRIMARY KEY (run_id, schema_name, table_name, attname),
+    FOREIGN KEY (run_id, schema_name, table_name)
+        REFERENCES pgl_validate.table_plan(run_id, schema_name, table_name) ON DELETE CASCADE
+);
+
 CREATE TABLE pgl_validate.table_result (
     run_id      bigint NOT NULL,
     schema_name text NOT NULL,

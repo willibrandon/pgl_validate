@@ -391,6 +391,44 @@ BEGIN
                         att_list = EXCLUDED.att_list,
                         validated_property = EXCLUDED.validated_property;
 
+                    DELETE FROM pgl_validate.table_column_plan tcp
+                    WHERE tcp.run_id = v_run_id
+                      AND tcp.schema_name = error_schema_name
+                      AND tcp.table_name = error_table_name;
+
+                    INSERT INTO pgl_validate.table_column_plan(
+                        run_id, schema_name, table_name, attnum, attname,
+                        type_oid, type_schema, type_name, typmod,
+                        encoding_mode, encoding_name
+                    )
+                    SELECT v_run_id,
+                           error_schema_name,
+                           error_table_name,
+                           a.attnum,
+                           a.attname,
+                           a.atttypid,
+                           tn.nspname::name,
+                           t.typname,
+                           a.atttypmod,
+                           pgl_validate.column_encoding_mode(a.atttypid),
+                           CASE pgl_validate.column_encoding_mode(a.atttypid)
+                               WHEN 1 THEN 'send'
+                               WHEN 2 THEN 'text'
+                               WHEN 3 THEN 'jsonb_normalize'
+                           END
+                    FROM pg_attribute a
+                    JOIN pg_type t ON t.oid = a.atttypid
+                    JOIN pg_namespace tn ON tn.oid = t.typnamespace
+                    WHERE a.attrelid = table_oid
+                      AND a.attnum > 0
+                      AND NOT a.attisdropped
+                      AND (
+                          error_cols IS NULL
+                          OR cardinality(error_cols) = 0
+                          OR a.attname = ANY (error_cols)
+                      )
+                    ORDER BY a.attname;
+
                     INSERT INTO pgl_validate.schema_issue(
                         run_id, node, schema_name, table_name, issue_code, detail
                     )
@@ -569,6 +607,44 @@ BEGIN
                 has_row_filter = EXCLUDED.has_row_filter,
                 sync_status = EXCLUDED.sync_status,
                 validated_property = EXCLUDED.validated_property;
+
+            DELETE FROM pgl_validate.table_column_plan tcp
+            WHERE tcp.run_id = v_run_id
+              AND tcp.schema_name = partition_parent_rec.parent_schema
+              AND tcp.table_name = partition_parent_rec.parent_table;
+
+            INSERT INTO pgl_validate.table_column_plan(
+                run_id, schema_name, table_name, attnum, attname,
+                type_oid, type_schema, type_name, typmod,
+                encoding_mode, encoding_name
+            )
+            SELECT v_run_id,
+                   partition_parent_rec.parent_schema,
+                   partition_parent_rec.parent_table,
+                   a.attnum,
+                   a.attname,
+                   a.atttypid,
+                   tn.nspname::name,
+                   t.typname,
+                   a.atttypmod,
+                   pgl_validate.column_encoding_mode(a.atttypid),
+                   CASE pgl_validate.column_encoding_mode(a.atttypid)
+                       WHEN 1 THEN 'send'
+                       WHEN 2 THEN 'text'
+                       WHEN 3 THEN 'jsonb_normalize'
+                   END
+            FROM pg_attribute a
+            JOIN pg_type t ON t.oid = a.atttypid
+            JOIN pg_namespace tn ON tn.oid = t.typnamespace
+            WHERE a.attrelid = partition_parent_rec.parent_oid
+              AND a.attnum > 0
+              AND NOT a.attisdropped
+              AND (
+                  partition_parent_cols IS NULL
+                  OR cardinality(partition_parent_cols) = 0
+                  OR a.attname = ANY (partition_parent_cols)
+              )
+            ORDER BY a.attname;
 
             INSERT INTO pgl_validate.table_result(
                 run_id, schema_name, table_name, verdict, reason, finished_at
@@ -1245,6 +1321,44 @@ BEGIN
         has_row_filter = EXCLUDED.has_row_filter,
         sync_status = EXCLUDED.sync_status,
         validated_property = EXCLUDED.validated_property;
+
+    DELETE FROM pgl_validate.table_column_plan tcp
+    WHERE tcp.run_id = v_run_id
+      AND tcp.schema_name = v_schema_name
+      AND tcp.table_name = v_rel_name;
+
+    INSERT INTO pgl_validate.table_column_plan(
+        run_id, schema_name, table_name, attnum, attname,
+        type_oid, type_schema, type_name, typmod,
+        encoding_mode, encoding_name
+    )
+    SELECT v_run_id,
+           v_schema_name,
+           v_rel_name,
+           a.attnum,
+           a.attname,
+           a.atttypid,
+           tn.nspname::name,
+           t.typname,
+           a.atttypmod,
+           pgl_validate.column_encoding_mode(a.atttypid),
+           CASE pgl_validate.column_encoding_mode(a.atttypid)
+               WHEN 1 THEN 'send'
+               WHEN 2 THEN 'text'
+               WHEN 3 THEN 'jsonb_normalize'
+           END
+    FROM pg_attribute a
+    JOIN pg_type t ON t.oid = a.atttypid
+    JOIN pg_namespace tn ON tn.oid = t.typnamespace
+    WHERE a.attrelid = p_table_name
+      AND a.attnum > 0
+      AND NOT a.attisdropped
+      AND (
+          cols IS NULL
+          OR cardinality(cols) = 0
+          OR a.attname = ANY (cols)
+      )
+    ORDER BY a.attname;
 
     IF current_setting('track_commit_timestamp', true) = 'off' THEN
         INSERT INTO pgl_validate.schema_issue(
