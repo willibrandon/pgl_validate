@@ -1456,7 +1456,14 @@ WHERE d.run_id = $hotRunId
 
     Write-Step 'Creating subscriber-side drift and applying audited pglogical repair'
     Invoke-Sql -Database 'target' -Sql "UPDATE public.accounts SET value = 'target-drift' WHERE id = 1" | Out-Null
-    Invoke-Sql -Database 'target' -Sql @"
+    $hasQueryableConflictHistory = Invoke-Sql -Database 'target' -Sql @"
+SELECT (
+    to_regclass('pglogical.conflict_history') IS NOT NULL AND
+    to_regprocedure('pglogical.conflict_history_ensure_partition(date)') IS NOT NULL
+)::text
+"@
+    if ($hasQueryableConflictHistory -eq 'true') {
+        Invoke-Sql -Database 'target' -Sql @"
 SELECT pglogical.conflict_history_ensure_partition(CURRENT_DATE);
 INSERT INTO pglogical.conflict_history(
     sub_id, sub_name, conflict_type, resolution,
@@ -1480,6 +1487,8 @@ SELECT
 FROM pglogical.subscription AS s
 WHERE s.sub_name = 'sub';
 "@ | Out-Null
+    }
+
     $repairableDriftResult = Invoke-Sql -Database 'provider' -Sql @"
 SELECT run_id::text || ';' || verdict
 FROM pgl_validate.compare_table(
@@ -1513,20 +1522,27 @@ SELECT count(*)::text || ';' ||
 FROM pgl_validate.conflict_evidence($repairableDriftRunId)
 WHERE node = 'target'
 "@
-    if ($conflictEvidence -ne '1;update_update;keep_local;true;true') {
+    $expectedConflictEvidence = if ($hasQueryableConflictHistory -eq 'true') {
+        '1;update_update;keep_local;true;true'
+    }
+    else {
+        '0;<none>;<none>;false;false'
+    }
+    if ($conflictEvidence -ne $expectedConflictEvidence) {
         throw "unexpected pglogical conflict-history evidence: $conflictEvidence"
     }
 
     $reportConflictEvidence = Invoke-Sql -Database 'provider' -Sql @"
-SELECT (jsonb_array_length(
+SELECT COALESCE(jsonb_array_length(
     pgl_validate.report($repairableDriftRunId)
         -> 'tables' -> 0
         -> 'divergences' -> 0
         -> 'conflict_evidence'
-) = 1)::text
+), 0)::text
 "@
-    if ($reportConflictEvidence -ne 'true') {
-        throw "pglogical conflict-history evidence was not included in report()"
+    $expectedReportConflictEvidence = if ($hasQueryableConflictHistory -eq 'true') { '1' } else { '0' }
+    if ($reportConflictEvidence -ne $expectedReportConflictEvidence) {
+        throw "unexpected pglogical conflict-history evidence count in report(): $reportConflictEvidence"
     }
 
     $repairResult = Invoke-Sql -Database 'provider' -Sql @"
