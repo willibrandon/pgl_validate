@@ -156,6 +156,84 @@ function Test-PglPackageLayout {
     }
 }
 
+<#
+.SYNOPSIS
+Creates a ZIP archive while including hidden package paths such as macOS .pgrx.
+#>
+function New-PglPackageArchive {
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [string] $PackageDirectory,
+        [string] $PackageName,
+        [string] $ArchivePath
+    )
+
+    if (-not $PSCmdlet.ShouldProcess($ArchivePath, 'Create package archive')) {
+        return
+    }
+
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+
+    $packageRoot = [IO.Path]::GetFullPath($PackageDirectory).TrimEnd(
+        [IO.Path]::DirectorySeparatorChar,
+        [IO.Path]::AltDirectorySeparatorChar
+    )
+    $archive = [IO.Compression.ZipFile]::Open($ArchivePath, [IO.Compression.ZipArchiveMode]::Create)
+    try {
+        Get-ChildItem -LiteralPath $PackageDirectory -Recurse -Force -File |
+            Sort-Object FullName |
+            ForEach-Object {
+                $relativePath = [IO.Path]::GetRelativePath($packageRoot, $_.FullName)
+                $entryName = "$PackageName/$relativePath".Replace('\', '/')
+                [IO.Compression.ZipFileExtensions]::CreateEntryFromFile(
+                    $archive,
+                    $_.FullName,
+                    $entryName,
+                    [IO.Compression.CompressionLevel]::Optimal
+                ) | Out-Null
+            }
+    }
+    finally {
+        $archive.Dispose()
+    }
+}
+
+<#
+.SYNOPSIS
+Verifies that a release archive contains the extension files users need.
+#>
+function Test-PglPackageArchive {
+    param(
+        [string] $ArchivePath,
+        [string] $Version
+    )
+
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+
+    $archive = [IO.Compression.ZipFile]::OpenRead($ArchivePath)
+    try {
+        $entries = @($archive.Entries | Where-Object { $_.Length -gt 0 })
+        foreach ($rootFile in @('LICENSE', 'README.md')) {
+            if (-not ($entries | Where-Object { $_.FullName -match "/$([regex]::Escape($rootFile))$" })) {
+                throw "Archive is missing $rootFile."
+            }
+        }
+
+        if (-not ($entries | Where-Object { $_.FullName -match '/pgl_validate\.control$' })) {
+            throw 'Archive is missing pgl_validate.control.'
+        }
+        if (-not ($entries | Where-Object { $_.FullName -match "/pgl_validate--$([regex]::Escape($Version))\.sql$" })) {
+            throw "Archive is missing pgl_validate--$Version.sql."
+        }
+        if (-not ($entries | Where-Object { $_.FullName -match '/pgl_validate\.(dll|so|dylib)$' })) {
+            throw 'Archive is missing the pgl_validate shared library.'
+        }
+    }
+    finally {
+        $archive.Dispose()
+    }
+}
+
 $pgConfig = Get-PglPgrxPgConfig -PgMajor $PgMajor
 $version = Get-PglExtensionVersion
 $packagePlatform = Get-PglPackagePlatform
@@ -181,8 +259,8 @@ Invoke-PglPackage -PgConfig $pgConfig -PackageDirectory $packageDirectory
 Copy-Item -LiteralPath (Join-Path $root 'LICENSE') -Destination (Join-Path $packageDirectory 'LICENSE') -Force
 Copy-Item -LiteralPath (Join-Path $root 'README.md') -Destination (Join-Path $packageDirectory 'README.md') -Force
 Test-PglPackageLayout -PackageDirectory $packageDirectory -Version $version
-
-Compress-Archive -LiteralPath $packageDirectory -DestinationPath $archivePath -CompressionLevel Optimal
+New-PglPackageArchive -PackageDirectory $packageDirectory -PackageName $packageName -ArchivePath $archivePath
+Test-PglPackageArchive -ArchivePath $archivePath -Version $version
 
 if ($env:GITHUB_OUTPUT) {
     "artifact_name=$packageName" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
