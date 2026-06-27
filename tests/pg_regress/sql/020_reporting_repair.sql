@@ -236,6 +236,17 @@ VALUES
         '{"local":null,"peer":{"id":2,"value":"target-only"}}'
     ),
     (
+        'keys_only_extra_without_delete',
+        'keys_only',
+        true,
+        false,
+        false,
+        false,
+        'extra_on',
+        22,
+        '{"local":null,"peer":{"id":22,"value":"target-only"}}'
+    ),
+    (
         'keys_only_differs',
         'keys_only',
         true,
@@ -245,6 +256,17 @@ VALUES
         'differs',
         3,
         '{"local":{"id":3,"value":"local"},"peer":{"id":3,"value":"target"}}'
+    ),
+    (
+        'keys_only_missing',
+        'keys_only',
+        true,
+        false,
+        true,
+        true,
+        'missing_on',
+        23,
+        '{"local":{"id":23,"value":"local"},"peer":null}'
     ),
     (
         'superset_extra',
@@ -290,6 +312,24 @@ WITH run AS (
 )
 INSERT INTO pgl_validate_regress_action_seed
 SELECT 'keys_only_differs', run_id
+FROM run;
+
+WITH run AS (
+    INSERT INTO pgl_validate.run(status, started_at, finished_at, tables_total, tables_differ)
+    VALUES ('completed', '2026-01-01 00:00:00+00', '2026-01-01 00:00:01+00', 1, 1)
+    RETURNING run_id
+)
+INSERT INTO pgl_validate_regress_action_seed
+SELECT 'keys_only_extra_without_delete', run_id
+FROM run;
+
+WITH run AS (
+    INSERT INTO pgl_validate.run(status, started_at, finished_at, tables_total, tables_differ)
+    VALUES ('completed', '2026-01-01 00:00:00+00', '2026-01-01 00:00:01+00', 1, 1)
+    RETURNING run_id
+)
+INSERT INTO pgl_validate_regress_action_seed
+SELECT 'keys_only_missing', run_id
 FROM run;
 
 WITH run AS (
