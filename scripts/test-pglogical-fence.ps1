@@ -297,11 +297,13 @@ function Wait-SubscriptionReady {
         [string] $ProviderDatabase = 'provider',
         [int] $SubscriberPort = $script:Port,
         [int] $ProviderPort = $script:Port,
+        [int] $StableReadyPolls = 1,
         [int] $TimeoutSeconds
     )
 
     $deadline = [DateTimeOffset]::Now.AddSeconds($TimeoutSeconds)
     $last = ''
+    $readyPolls = 0
 
     while ([DateTimeOffset]::Now -lt $deadline) {
         $status = Invoke-Sql -Database $SubscriberDatabase -Port $SubscriberPort -Sql @"
@@ -343,7 +345,13 @@ SELECT COALESCE((
 
         $last = "status=$statusValue slot=$slotName sync=$sync sync_ready=$syncReady provider_slot=$slotStatus"
         if ($statusValue -eq 'replicating' -and $syncReady -eq 'true' -and $slotStatus.StartsWith('true:')) {
-            return $slotName
+            $readyPolls++
+            if ($readyPolls -ge $StableReadyPolls) {
+                return $slotName
+            }
+        }
+        else {
+            $readyPolls = 0
         }
 
         Start-Sleep -Milliseconds 250
@@ -955,6 +963,18 @@ SELECT pglogical.create_subscription(
         -Database 'provider' `
         -Sql "SELECT COALESCE((SELECT left(status, 1) FROM pglogical.show_subscription_table('sub_from_fanout'::name, 'public.bidir_accounts'::regclass)), '<missing>')" `
         -Expected 'r' `
+        -TimeoutSeconds $TimeoutSeconds
+    $reverseSlotName = Wait-SubscriptionReady `
+        -SubscriberDatabase 'provider' `
+        -SubscriptionName 'sub_from_target' `
+        -ProviderDatabase 'target' `
+        -StableReadyPolls 12 `
+        -TimeoutSeconds $TimeoutSeconds
+    $fanoutReverseSlotName = Wait-SubscriptionReady `
+        -SubscriberDatabase 'provider' `
+        -SubscriptionName 'sub_from_fanout' `
+        -ProviderDatabase 'fanout' `
+        -StableReadyPolls 12 `
         -TimeoutSeconds $TimeoutSeconds
 
     Invoke-Sql -Database 'provider' -Sql @"
