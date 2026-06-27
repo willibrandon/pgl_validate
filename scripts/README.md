@@ -8,7 +8,7 @@ On Windows, prefer running commands through `pgrx-vs.ps1`. It loads the Visual
 Studio C++ environment before invoking Rust, pgrx, or PostgreSQL tools:
 
 ```powershell
-.\scripts\pgrx-vs.ps1 cargo pgrx schema --features pg18
+.\scripts\pgrx-vs.ps1 cargo pgrx schema pg18 --no-default-features --features pg18
 ```
 
 ## Setup

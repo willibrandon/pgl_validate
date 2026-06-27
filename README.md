@@ -17,7 +17,7 @@ Use the same pgrx version as the crate:
 
 ```powershell
 rustup default stable
-cargo install --locked cargo-pgrx
+cargo install --locked cargo-pgrx --version 0.19.1
 ```
 
 The default target is PostgreSQL 18, the latest stable major. PostgreSQL 19 is
@@ -27,20 +27,20 @@ On Windows, run pgrx commands from a Visual Studio developer environment so
 bindgen can find the MSVC and Windows SDK headers:
 
 ```powershell
-.\scripts\pgrx-vs.ps1 cargo pgrx schema --features pg18
+.\scripts\pgrx-vs.ps1 cargo pgrx schema pg18 --no-default-features --features pg18
 ```
 
 For quick Rust-only feedback:
 
 ```powershell
-.\scripts\pgrx-vs.ps1 cargo check --features pg18
-.\scripts\pgrx-vs.ps1 cargo test --lib --features pg18
+.\scripts\pgrx-vs.ps1 cargo check --no-default-features --features pg18
+.\scripts\pgrx-vs.ps1 cargo test --lib --no-default-features --features pg18
 ```
 
 For extension validation, use pgrx:
 
 ```powershell
-.\scripts\pgrx-vs.ps1 cargo pgrx schema --features pg18
+.\scripts\pgrx-vs.ps1 cargo pgrx schema pg18 --no-default-features --features pg18
 .\scripts\test-pgrx.ps1
 ```
 
