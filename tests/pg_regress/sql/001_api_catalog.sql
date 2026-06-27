@@ -86,6 +86,23 @@ FROM documented_object
 WHERE description IS NULL
 ORDER BY kind, identity;
 
+WITH documented_column(kind, identity, description) AS (
+    SELECT CASE c.relkind WHEN 'r' THEN 'table column' WHEN 'v' THEN 'view column' ELSE c.relkind::text END,
+           c.relname || '.' || a.attname,
+           col_description(c.oid, a.attnum)
+    FROM pg_class c
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    JOIN pg_attribute a ON a.attrelid = c.oid
+    WHERE n.nspname = 'pgl_validate'
+      AND c.relkind IN ('r', 'v')
+      AND a.attnum > 0
+      AND NOT a.attisdropped
+)
+SELECT kind, identity
+FROM documented_column
+WHERE description IS NULL
+ORDER BY kind, identity;
+
 SELECT octet_length(pgl_validate.row_digest(ARRAY[1], 1::int4)) AS row_digest_bytes,
        octet_length(pgl_validate.hash_digest_array(ARRAY[
            pgl_validate.row_digest(ARRAY[1], 1::int4)

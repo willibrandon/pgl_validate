@@ -50,6 +50,286 @@ COMMENT ON TABLE pgl_validate.repair_run IS
 COMMENT ON TABLE pgl_validate.repair_result IS
     'Per-key outcome from a repair run.';
 
+DO $$
+DECLARE
+    column_comment record;
+    copied_comment record;
+BEGIN
+    FOR column_comment IN
+        SELECT *
+        FROM (VALUES
+            ('peer', 'name', 'Stable peer name used in validation requests and run catalogs.'),
+            ('peer', 'dsn', 'libpq connection string used to reach the peer.'),
+            ('peer', 'backend', 'Replication backend type for the peer: pglogical, native, or standby.'),
+            ('peer', 'subscription_name', 'Target-side subscription name used to identify the incoming edge.'),
+            ('peer', 'reverse_subscription_name', 'Explicit local pglogical subscription from this peer back to the coordinator, used to include bidirectional reverse edges in the fence vector.'),
+            ('peer', 'replication_sets', 'Replication sets expected on this peer when a request does not supply an override.'),
+            ('peer', 'connect_timeout_seconds', 'libpq connection timeout for remote calls to this peer.'),
+            ('peer', 'statement_timeout_ms', 'Remote statement timeout applied while querying this peer.'),
+            ('peer', 'lock_timeout_ms', 'Remote lock timeout applied while querying this peer.'),
+            ('peer', 'added_at', 'Time this peer definition was inserted.'),
+
+            ('run', 'run_id', 'Validation run identifier.'),
+            ('run', 'status', 'Current lifecycle state of the validation run.'),
+            ('run', 'options', 'Normalized run options recorded for audit and resume.'),
+            ('run', 'reference_node', 'Optional named authoritative or provider node for the run.'),
+            ('run', 'launched_by', 'Database role that launched the run.'),
+            ('run', 'started_at', 'Time the run row was created.'),
+            ('run', 'finished_at', 'Time the run reached a terminal state.'),
+            ('run', 'tables_total', 'Number of tables planned for the run.'),
+            ('run', 'tables_matched', 'Number of tables with exact match verdicts.'),
+            ('run', 'tables_differ', 'Number of tables with confirmed differ verdicts.'),
+            ('run', 'error', 'Terminal error message when the run fails.'),
+
+            ('run_participant', 'run_id', 'Validation run that owns this participant row.'),
+            ('run_participant', 'node', 'Participant node name within the run.'),
+            ('run_participant', 'role', 'Participant role in the run.'),
+            ('run_participant', 'backend', 'Replication backend used for this participant.'),
+            ('run_participant', 'pg_version', 'Remote PostgreSQL server_version_num observed for this participant.'),
+            ('run_participant', 'dsn_ref', 'Peer name or DSN reference used to reach the participant.'),
+            ('run_participant', 'status', 'Participant connection or completion state.'),
+
+            ('fence_epoch', 'run_id', 'Validation run that owns this convergence epoch.'),
+            ('fence_epoch', 'epoch_seq', 'Monotonic epoch number within the run.'),
+            ('fence_epoch', 'created_at', 'Time the epoch was recorded.'),
+
+            ('run_edge', 'run_id', 'Validation run that owns this directed replication edge.'),
+            ('run_edge', 'edge_id', 'Directed edge number within the run.'),
+            ('run_edge', 'provider_node', 'Node that produces changes for this edge.'),
+            ('run_edge', 'target_node', 'Node that receives changes for this edge.'),
+            ('run_edge', 'backend', 'Replication backend used by this edge.'),
+            ('run_edge', 'subscription', 'Subscription name for the receiving side of this edge.'),
+            ('run_edge', 'slot_name', 'Provider-side logical replication slot for this edge.'),
+            ('run_edge', 'origin_name', 'Target-side replication origin name for this edge.'),
+            ('run_edge', 'repsets', 'Replication sets validated on this edge.'),
+
+            ('fence_edge', 'run_id', 'Validation run that owns this fence target.'),
+            ('fence_edge', 'epoch_seq', 'Fence epoch for this edge.'),
+            ('fence_edge', 'edge_id', 'Directed edge being fenced.'),
+            ('fence_edge', 'fence_kind', 'Fence method: barrier, standby_replay, or degraded.'),
+            ('fence_edge', 'barrier_token', 'Barrier token expected to become visible on the target for exact logical fences.'),
+            ('fence_edge', 'barrier_end_lsn', 'Exact WAL LSN the target must reach for this fence.'),
+
+            ('fence_attempt', 'run_id', 'Validation run that owns this fence observation.'),
+            ('fence_attempt', 'epoch_seq', 'Fence epoch being observed.'),
+            ('fence_attempt', 'edge_id', 'Directed edge being observed.'),
+            ('fence_attempt', 'barrier_end_lsn', 'Fence LSN copied from the edge target.'),
+            ('fence_attempt', 'origin_progress_lsn', 'Target-side replay or origin progress observed for the edge.'),
+            ('fence_attempt', 'token_visible', 'Whether the barrier token is visible on the target.'),
+            ('fence_attempt', 'confirmed_flush_lsn', 'Provider-side slot flush confirmation, when available.'),
+            ('fence_attempt', 'converged_at', 'Time the edge first satisfied its convergence predicate.'),
+            ('fence_attempt', 'status', 'Observed fence state.'),
+
+            ('fence_barrier', 'id', 'Local surrogate key for duplicate-safe barrier rows.'),
+            ('fence_barrier', 'token', 'Replicated non-unique barrier token.'),
+            ('fence_barrier', 'injected_at', 'Local time the barrier token row was inserted.'),
+
+            ('fence_barrier_run', 'token', 'Barrier token associated with a run edge.'),
+            ('fence_barrier_run', 'run_id', 'Validation run that injected the token.'),
+            ('fence_barrier_run', 'epoch_seq', 'Fence epoch that injected the token.'),
+            ('fence_barrier_run', 'edge_id', 'Directed edge that injected the token.'),
+            ('fence_barrier_run', 'origin_node', 'Origin node where the barrier transaction was committed.'),
+            ('fence_barrier_run', 'barrier_end_lsn', 'Exact commit-end LSN returned after barrier insertion.'),
+
+            ('table_plan', 'run_id', 'Validation run that owns this table plan.'),
+            ('table_plan', 'schema_name', 'Schema name of the planned table.'),
+            ('table_plan', 'table_name', 'Relation name of the planned table.'),
+            ('table_plan', 'key_cols', 'Comparison key columns used for localization.'),
+            ('table_plan', 'att_list', 'Columns included in row digests for the table.'),
+            ('table_plan', 'repsets', 'Replication sets used to resolve the table contract.'),
+            ('table_plan', 'repl_insert', 'Whether the contract replicates inserts.'),
+            ('table_plan', 'repl_update', 'Whether the contract replicates updates.'),
+            ('table_plan', 'repl_delete', 'Whether the contract replicates deletes.'),
+            ('table_plan', 'repl_truncate', 'Whether the contract replicates truncates.'),
+            ('table_plan', 'has_row_filter', 'Whether the table contract includes a row filter.'),
+            ('table_plan', 'sync_status', 'Subscriber-side table synchronization state, when known.'),
+            ('table_plan', 'validated_property', 'Strongest property that can be soundly validated for the table.'),
+
+            ('table_result', 'run_id', 'Validation run that owns this table verdict.'),
+            ('table_result', 'schema_name', 'Schema name of the validated table.'),
+            ('table_result', 'table_name', 'Relation name of the validated table.'),
+            ('table_result', 'verdict', 'Final table-level validation verdict.'),
+            ('table_result', 'reason', 'Human-readable explanation of the verdict.'),
+            ('table_result', 'started_at', 'Time table validation began.'),
+            ('table_result', 'finished_at', 'Time table validation finished.'),
+
+            ('table_node_result', 'run_id', 'Validation run that owns this node checksum.'),
+            ('table_node_result', 'schema_name', 'Schema name of the validated table.'),
+            ('table_node_result', 'table_name', 'Relation name of the validated table.'),
+            ('table_node_result', 'node', 'Participant node that produced this checksum.'),
+            ('table_node_result', 'n_rows', 'Rows included in the table checksum.'),
+            ('table_node_result', 'lthash', 'LtHash multiset checksum for the table.'),
+            ('table_node_result', 'set_hash', 'Optional cryptographic sorted-digest confirmation for the table.'),
+
+            ('chunk_result', 'run_id', 'Validation run that owns this chunk.'),
+            ('chunk_result', 'schema_name', 'Schema name of the chunked table.'),
+            ('chunk_result', 'table_name', 'Relation name of the chunked table.'),
+            ('chunk_result', 'chunk_id', 'Chunk identifier within the table plan.'),
+            ('chunk_result', 'parent_id', 'Parent chunk identifier for split chunks.'),
+            ('chunk_result', 'lo', 'Inclusive lower key boundary encoded as canonical bytes.'),
+            ('chunk_result', 'hi', 'Exclusive upper key boundary encoded as canonical bytes.'),
+            ('chunk_result', 'state', 'Chunk validation or localization state.'),
+            ('chunk_result', 'updated_at', 'Last time the chunk row changed.'),
+
+            ('chunk_node_result', 'run_id', 'Validation run that owns this chunk checksum.'),
+            ('chunk_node_result', 'schema_name', 'Schema name of the chunked table.'),
+            ('chunk_node_result', 'table_name', 'Relation name of the chunked table.'),
+            ('chunk_node_result', 'chunk_id', 'Chunk identifier within the table plan.'),
+            ('chunk_node_result', 'node', 'Participant node that produced this chunk checksum.'),
+            ('chunk_node_result', 'n_rows', 'Rows included in the chunk checksum.'),
+            ('chunk_node_result', 'lthash', 'LtHash multiset checksum for the chunk.'),
+
+            ('divergence', 'run_id', 'Validation run that owns this divergence.'),
+            ('divergence', 'schema_name', 'Schema name of the divergent table.'),
+            ('divergence', 'table_name', 'Relation name of the divergent table.'),
+            ('divergence', 'key_text', 'Text form of the divergent key for display.'),
+            ('divergence', 'key_bytes', 'Canonical key bytes used for stable identity.'),
+            ('divergence', 'classification', 'Whether the key is missing, extra, or content-different on the node.'),
+            ('divergence', 'node', 'Participant node where the divergence was observed.'),
+            ('divergence', 'status', 'Candidate, confirmed, cleared, indeterminate, or advisory state.'),
+            ('divergence', 'detected_epoch', 'Fence epoch in which the candidate was first detected.'),
+            ('divergence', 'tuple', 'Bounded tuple payload captured for repair or reporting.'),
+            ('divergence', 'detected_at', 'Time the divergence was recorded.'),
+
+            ('divergence_recheck', 'run_id', 'Validation run that owns this recheck.'),
+            ('divergence_recheck', 'schema_name', 'Schema name of the rechecked table.'),
+            ('divergence_recheck', 'table_name', 'Relation name of the rechecked table.'),
+            ('divergence_recheck', 'key_bytes', 'Canonical key bytes rechecked for stability.'),
+            ('divergence_recheck', 'node', 'Participant node rechecked for the key.'),
+            ('divergence_recheck', 'epoch_seq', 'Later fence epoch used for the recheck.'),
+            ('divergence_recheck', 'outcome', 'Digest-stability outcome for the recheck.'),
+            ('divergence_recheck', 'at', 'Time the recheck was recorded.'),
+
+            ('conflict_evidence', 'run_id', 'Validation run that owns this conflict evidence.'),
+            ('conflict_evidence', 'schema_name', 'Schema name of the divergent table.'),
+            ('conflict_evidence', 'table_name', 'Relation name of the divergent table.'),
+            ('conflict_evidence', 'key_bytes', 'Canonical divergent key matched to the conflict.'),
+            ('conflict_evidence', 'node', 'Participant node whose conflict history was queried.'),
+            ('conflict_evidence', 'source', 'Evidence source identifier.'),
+            ('conflict_evidence', 'conflict_id', 'Conflict-history identifier from the source node.'),
+            ('conflict_evidence', 'recorded_at', 'Time the conflict was recorded on the source node.'),
+            ('conflict_evidence', 'subscription_name', 'Subscription associated with the conflict.'),
+            ('conflict_evidence', 'conflict_type', 'pglogical conflict type.'),
+            ('conflict_evidence', 'resolution', 'pglogical conflict resolution that was applied.'),
+            ('conflict_evidence', 'index_name', 'Index used by pglogical conflict detection, when available.'),
+            ('conflict_evidence', 'local_tuple', 'Local tuple image from conflict history, when available.'),
+            ('conflict_evidence', 'local_xid', 'Local transaction id from conflict history, when available.'),
+            ('conflict_evidence', 'local_origin', 'Local replication origin identifier, when available.'),
+            ('conflict_evidence', 'local_commit_ts', 'Local commit timestamp from conflict history, when available.'),
+            ('conflict_evidence', 'remote_tuple', 'Remote tuple image from conflict history, when available.'),
+            ('conflict_evidence', 'remote_origin', 'Remote replication origin identifier from conflict history.'),
+            ('conflict_evidence', 'remote_commit_ts', 'Remote commit timestamp from conflict history.'),
+            ('conflict_evidence', 'remote_commit_lsn', 'Remote commit LSN from conflict history.'),
+            ('conflict_evidence', 'has_before_triggers', 'Whether pglogical reported before triggers on the target table.'),
+            ('conflict_evidence', 'matched_on', 'Tuple fields that matched the divergent key.'),
+            ('conflict_evidence', 'observed_at', 'Time pgl_validate recorded this evidence.'),
+
+            ('sequence_result', 'run_id', 'Validation run that owns this sequence result.'),
+            ('sequence_result', 'schema_name', 'Schema name of the sequence.'),
+            ('sequence_result', 'seq_name', 'Sequence name.'),
+            ('sequence_result', 'provider_node', 'Provider node used as the sequence reference.'),
+            ('sequence_result', 'provider_last_value', 'Provider last_value observed for the sequence.'),
+            ('sequence_result', 'subscriber_node', 'Subscriber node compared against the provider.'),
+            ('sequence_result', 'subscriber_last_value', 'Subscriber last_value observed for the sequence.'),
+            ('sequence_result', 'cache_size', 'Sequence cache size used to compute the acceptable window.'),
+            ('sequence_result', 'within_contract', 'Whether the subscriber value is inside the pglogical sequence window.'),
+            ('sequence_result', 'verdict', 'Sequence validation verdict.'),
+
+            ('schema_issue', 'run_id', 'Validation run that owns this issue.'),
+            ('schema_issue', 'node', 'Node where the issue was discovered.'),
+            ('schema_issue', 'schema_name', 'Schema name related to the issue.'),
+            ('schema_issue', 'table_name', 'Relation name related to the issue.'),
+            ('schema_issue', 'issue_code', 'Machine-readable issue code.'),
+            ('schema_issue', 'detail', 'Human-readable issue detail.'),
+
+            ('schedule', 'name', 'Stable schedule name.'),
+            ('schedule', 'cron', 'Five-field cron expression evaluated in the database session time zone.'),
+            ('schedule', 'tables', 'Optional relation names validated by the schedule.'),
+            ('schedule', 'repset', 'Optional pglogical replication set expanded by the schedule.'),
+            ('schedule', 'peers', 'Optional peer names used by the schedule.'),
+            ('schedule', 'options', 'Validation options merged into scheduled runs.'),
+            ('schedule', 'enabled', 'Whether automatic dispatch may launch the schedule.'),
+            ('schedule', 'last_run_id', 'Most recent run launched by the schedule.'),
+
+            ('worker_task', 'task_id', 'Background worker task identifier.'),
+            ('worker_task', 'run_id', 'Validation run owned by this worker task.'),
+            ('worker_task', 'task_kind', 'Task kind executed by the worker.'),
+            ('worker_task', 'request', 'Serialized request used by the worker.'),
+            ('worker_task', 'status', 'Durable worker task state.'),
+            ('worker_task', 'launched_by', 'Database role that queued the task.'),
+            ('worker_task', 'database_name', 'Database where the worker connects to run the task.'),
+            ('worker_task', 'worker_pid', 'Backend PID of the worker handling the task.'),
+            ('worker_task', 'enqueued_at', 'Time the task was queued.'),
+            ('worker_task', 'started_at', 'Time the task started running.'),
+            ('worker_task', 'finished_at', 'Time the task reached a terminal state.'),
+            ('worker_task', 'error', 'Terminal worker error message, if any.'),
+
+            ('repair_run', 'repair_id', 'Repair run identifier.'),
+            ('repair_run', 'run_id', 'Validation run being repaired.'),
+            ('repair_run', 'authoritative', 'Node chosen as the repair authority.'),
+            ('repair_run', 'target', 'Node receiving repair statements.'),
+            ('repair_run', 'propagation', 'Repair propagation mode.'),
+            ('repair_run', 'paused_subs', 'Subscriptions paused while repair was applied.'),
+            ('repair_run', 'origin_name', 'Replication origin used for the repair session.'),
+            ('repair_run', 'status', 'Repair lifecycle state.'),
+            ('repair_run', 'launched_by', 'Database role that launched the repair.'),
+            ('repair_run', 'started_at', 'Time the repair run began.'),
+            ('repair_run', 'finished_at', 'Time the repair run reached a terminal state.'),
+            ('repair_run', 'error', 'Terminal repair error message, if any.'),
+
+            ('repair_result', 'repair_id', 'Repair run that owns this per-key result.'),
+            ('repair_result', 'schema_name', 'Schema name of the repaired object.'),
+            ('repair_result', 'table_name', 'Table or sequence name repaired.'),
+            ('repair_result', 'key_bytes', 'Canonical key bytes repaired.'),
+            ('repair_result', 'action', 'Repair action performed.'),
+            ('repair_result', 'statement', 'Generated SQL statement applied or proposed for the key.'),
+            ('repair_result', 'post_verdict', 'Focused post-repair verdict for the key.')
+        ) AS v(relation_name, column_name, description)
+    LOOP
+        EXECUTE format(
+            'COMMENT ON COLUMN pgl_validate.%I.%I IS %L',
+            column_comment.relation_name,
+            column_comment.column_name,
+            column_comment.description
+        );
+    END LOOP;
+
+    FOR copied_comment IN
+        SELECT *
+        FROM (VALUES
+            ('runs', 'run'),
+            ('table_results', 'table_result'),
+            ('chunk_results', 'chunk_result'),
+            ('divergences', 'divergence'),
+            ('sequence_results', 'sequence_result'),
+            ('schema_issues', 'schema_issue'),
+            ('worker_tasks', 'worker_task')
+        ) AS v(view_name, table_name)
+    LOOP
+        FOR column_comment IN
+            SELECT a.attname AS column_name,
+                   col_description(source_rel.oid, a.attnum) AS description
+            FROM pg_attribute a
+            JOIN pg_class source_rel
+              ON source_rel.oid = a.attrelid
+            JOIN pg_namespace source_ns
+              ON source_ns.oid = source_rel.relnamespace
+            WHERE source_ns.nspname = 'pgl_validate'
+              AND source_rel.relname = copied_comment.table_name
+              AND a.attnum > 0
+              AND NOT a.attisdropped
+        LOOP
+            EXECUTE format(
+                'COMMENT ON COLUMN pgl_validate.%I.%I IS %L',
+                copied_comment.view_name,
+                column_comment.column_name,
+                column_comment.description
+            );
+        END LOOP;
+    END LOOP;
+END
+$$;
+
 COMMENT ON VIEW pgl_validate.runs IS
     'Reporting view over validation runs.';
 COMMENT ON VIEW pgl_validate.run_progress IS
@@ -66,6 +346,36 @@ COMMENT ON VIEW pgl_validate.schema_issues IS
     'Reporting view over planning and schema issues.';
 COMMENT ON VIEW pgl_validate.worker_tasks IS
     'Reporting view over asynchronous validation worker tasks.';
+
+DO $$
+DECLARE
+    column_comment record;
+BEGIN
+    FOR column_comment IN
+        SELECT *
+        FROM (VALUES
+            ('run_progress', 'run_id', 'Validation run identifier.'),
+            ('run_progress', 'status', 'Current lifecycle state of the validation run.'),
+            ('run_progress', 'phase', 'Derived execution phase for progress displays.'),
+            ('run_progress', 'current_epoch', 'Most recent fence epoch recorded for the run.'),
+            ('run_progress', 'chunks_done', 'Completed or divergent leaf chunks.'),
+            ('run_progress', 'chunks_total', 'Total leaf chunks currently known.'),
+            ('run_progress', 'rows_scanned', 'Rows included in table or chunk checksum work.'),
+            ('run_progress', 'bytes_scanned', 'Approximate digest payload bytes scanned.'),
+            ('run_progress', 'eta', 'Estimated remaining interval when enough progress exists.'),
+            ('run_progress', 'started_at', 'Time the run row was created.'),
+            ('run_progress', 'finished_at', 'Time the run reached a terminal state.')
+        ) AS v(relation_name, column_name, description)
+    LOOP
+        EXECUTE format(
+            'COMMENT ON COLUMN pgl_validate.%I.%I IS %L',
+            column_comment.relation_name,
+            column_comment.column_name,
+            column_comment.description
+        );
+    END LOOP;
+END
+$$;
 
 COMMENT ON FUNCTION pgl_validate.column_encoding_mode(oid) IS
     'Select the coordinator-pushed row_digest encoding mode for a column type, using binary send only for stable built-ins and enums while recursively falling back to pinned text for unknown or unstable nested type families.';
