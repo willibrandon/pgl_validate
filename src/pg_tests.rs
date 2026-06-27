@@ -1908,6 +1908,99 @@ mod tests {
     }
 
     #[pg_test]
+    fn compare_skips_collation_drift_table_before_checksum() {
+        let backend_pid = Spi::get_one::<i32>("SELECT pg_backend_pid()")
+            .unwrap()
+            .unwrap();
+        let peer_db = identifier(&format!("pgl_validate_collation_peer_{backend_pid}"));
+        let table_name = identifier(&format!("collation_drift_target_{backend_pid}"));
+        let peer_name = identifier(&format!("collation_drift_peer_{backend_pid}"));
+        let local_dsn = local_dsn();
+        let remote_dsn = peer_dsn(&peer_db);
+
+        let _ = crate::transport::libpq::execute_command(
+            &local_dsn,
+            &format!("DROP DATABASE IF EXISTS {peer_db} WITH (FORCE)"),
+        );
+        crate::transport::libpq::execute_command(&local_dsn, &format!("CREATE DATABASE {peer_db}"))
+            .unwrap();
+        crate::transport::libpq::execute_command(
+            &remote_dsn,
+            &format!(
+                "CREATE EXTENSION pgl_validate;
+                 CREATE TABLE public.{table_name}(
+                     id int PRIMARY KEY,
+                     value text COLLATE \"POSIX\"
+                 );
+                 INSERT INTO public.{table_name} VALUES (1, 'same');"
+            ),
+        )
+        .unwrap();
+
+        Spi::run(&format!(
+            "
+            DELETE FROM pgl_validate.peer;
+            CREATE TABLE public.{table_name}(
+                id int PRIMARY KEY,
+                value text COLLATE \"C\"
+            );
+            INSERT INTO public.{table_name} VALUES (1, 'same');
+            INSERT INTO pgl_validate.peer(name, dsn, backend)
+            VALUES ({peer_name}, {remote_dsn}, 'native');
+            ",
+            peer_name = sql_literal(&peer_name),
+            remote_dsn = sql_literal(&remote_dsn)
+        ))
+        .unwrap();
+
+        let result = Spi::get_one::<String>(&format!(
+            "
+            SELECT run_id::text || ';' || verdict || ';' ||
+                   (reason LIKE '%schema precondition failed%')::text
+            FROM pgl_validate.compare_table(
+                'public.{table_name}'::regclass,
+                ARRAY[{peer_name}]
+            )
+            ",
+            peer_name = sql_literal(&peer_name)
+        ))
+        .unwrap()
+        .unwrap();
+        let (run_id, result_tail) = result
+            .split_once(';')
+            .expect("compare_table result should include run id");
+        assert_eq!(result_tail, "skipped;true");
+
+        let issue = Spi::get_one::<String>(&format!(
+            "
+            SELECT si.issue_code || ';' ||
+                   (si.detail LIKE '%collation%')::text || ';' ||
+                   (si.detail LIKE '%POSIX%')::text || ';' ||
+                   (si.detail LIKE '%\"C\"%')::text || ';' ||
+                   (SELECT count(*)::text
+                    FROM pgl_validate.table_node_result tnr
+                    WHERE tnr.run_id = si.run_id
+                      AND tnr.schema_name = si.schema_name
+                      AND tnr.table_name = si.table_name)
+            FROM pgl_validate.schema_issue si
+            WHERE si.run_id = {run_id}
+              AND si.table_name = {table_name_lit}
+              AND si.node = {peer_name}
+            ",
+            table_name_lit = sql_literal(&table_name),
+            peer_name = sql_literal(&peer_name)
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(issue, "SCHEMA_SIGNATURE_MISMATCH;true;true;true;0");
+
+        let _ = crate::transport::libpq::execute_command(
+            &local_dsn,
+            &format!("DROP DATABASE IF EXISTS {peer_db} WITH (FORCE)"),
+        );
+    }
+
+    #[pg_test]
     fn remote_checksum_reads_over_libpq() {
         let dsn = local_dsn();
         let checksum_sql = "SELECT 7::bigint AS n_rows, decode('010203', 'hex') AS lthash, decode('040506', 'hex') AS set_hash";
