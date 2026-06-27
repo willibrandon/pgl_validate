@@ -145,6 +145,11 @@ SET pgl_validate.correlate_conflict_history = on;
 SET pgl_validate.conflict_history_max_rows = 1000;
 ```
 
+`pgl_validate.conflict_summary(run_id)` condenses optional pglogical conflict
+evidence by table, node, conflict type, and resolution. Use
+`pgl_validate.purge_conflict_evidence(before, run_id)` when you want to keep run
+results but prune old raw evidence.
+
 For bidirectional pglogical validation, set `pgl_validate.peer.reverse_subscription_name`
 to the local subscription that replicates from that peer back to the coordinator.
 

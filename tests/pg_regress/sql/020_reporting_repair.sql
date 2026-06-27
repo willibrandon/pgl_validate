@@ -111,6 +111,60 @@ sequence AS (
            false,
            'behind'
     FROM run
+),
+conflict AS (
+    INSERT INTO pgl_validate.conflict_evidence(
+        run_id, schema_name, table_name, key_bytes, node,
+        conflict_id, recorded_at, subscription_name, conflict_type, resolution,
+        index_name, local_tuple, local_xid, local_origin, local_commit_ts,
+        remote_tuple, remote_origin, remote_commit_ts, remote_commit_lsn,
+        has_before_triggers, matched_on
+    )
+    SELECT run_id,
+           'public',
+           'pgl_validate_regress_repair',
+           convert_to('{"id":1}', 'UTF8'),
+           'target',
+           conflict_id,
+           recorded_at,
+           'sub',
+           'update_update',
+           'keep_local',
+           'pgl_validate_regress_repair_pkey',
+           '{"id":1,"value":"local"}'::jsonb,
+           '123',
+           1,
+           '2026-01-01 00:00:00+00'::timestamptz,
+           '{"id":1,"value":"remote"}'::jsonb,
+           2,
+           remote_commit_ts,
+           remote_commit_lsn,
+           has_before_triggers,
+           ARRAY['local_tuple_key','remote_tuple_key']
+    FROM run
+    CROSS JOIN (
+        VALUES
+            (
+                10::bigint,
+                '2025-12-31 23:59:00+00'::timestamptz,
+                '2025-12-31 23:58:59+00'::timestamptz,
+                '0/16B6C50'::pg_lsn,
+                false
+            ),
+            (
+                11::bigint,
+                '2026-01-01 00:00:02+00'::timestamptz,
+                '2026-01-01 00:00:02+00'::timestamptz,
+                '0/16B6D00'::pg_lsn,
+                true
+            )
+    ) AS evidence(
+        conflict_id,
+        recorded_at,
+        remote_commit_ts,
+        remote_commit_lsn,
+        has_before_triggers
+    )
 )
 SELECT run_id
 FROM run;
@@ -122,6 +176,19 @@ SELECT node, issue_code, detail
 FROM pgl_validate.schema_issues
 WHERE run_id = (SELECT run_id FROM pgl_validate_regress_seed)
 ORDER BY node, issue_code;
+
+SELECT source,
+       schema_name,
+       table_name,
+       node,
+       conflict_type,
+       resolution,
+       evidence_count,
+       matched_key_count,
+       to_char(first_recorded_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') AS first_recorded_at,
+       to_char(last_recorded_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') AS last_recorded_at,
+       has_before_triggers
+FROM pgl_validate.conflict_summary((SELECT run_id FROM pgl_validate_regress_seed));
 
 SELECT regexp_replace(stmt, '\s+', ' ', 'g') AS repair_statement
 FROM pgl_validate.generate_repair(
@@ -447,7 +514,21 @@ SELECT report.doc->'run'->>'status' AS run_status,
        jsonb_array_length(report.doc->'tables') AS table_count,
        jsonb_array_length(report.doc->'schema_issues') AS issue_count,
        jsonb_array_length(report.doc->'sequences') AS sequence_count,
+       jsonb_array_length(report.doc->'conflict_summary') AS conflict_summary_count,
+       report.doc->'conflict_summary'->0->>'evidence_count' AS conflict_summary_evidence,
        report.doc->'tables'->0->'result'->>'verdict' AS table_verdict
 FROM (
     SELECT pgl_validate.report((SELECT run_id FROM pgl_validate_regress_seed)) AS doc
 ) report;
+
+SELECT pgl_validate.purge_conflict_evidence(
+    '2026-01-01 00:00:00+00',
+    (SELECT run_id FROM pgl_validate_regress_seed)
+) AS purged_conflict_evidence;
+
+SELECT evidence_count,
+       matched_key_count,
+       to_char(first_recorded_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') AS first_recorded_at,
+       to_char(last_recorded_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') AS last_recorded_at,
+       has_before_triggers
+FROM pgl_validate.conflict_summary((SELECT run_id FROM pgl_validate_regress_seed));

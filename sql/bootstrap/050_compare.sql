@@ -1523,7 +1523,7 @@ BEGIN
             ELSE 'partial'
         END;
         result_reason := format(
-            'pglogical contract %s is not yet exact-comparable by the checksum-only path: %s',
+            'pglogical contract %s is not exact-comparable by the checksum path: %s',
             validated_property,
             contract_reason
         );

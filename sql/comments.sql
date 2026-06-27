@@ -163,10 +163,14 @@ COMMENT ON FUNCTION pgl_validate.divergences(bigint) IS
     'Return persisted divergences for a validation run.';
 COMMENT ON FUNCTION pgl_validate.conflict_evidence(bigint) IS
     'Return pglogical conflict-history evidence attached to a validation run.';
+COMMENT ON FUNCTION pgl_validate.conflict_summary(bigint) IS
+    'Return compact conflict-history cause counts by table, node, conflict type, and resolution for one validation run.';
+COMMENT ON FUNCTION pgl_validate.purge_conflict_evidence(timestamptz, bigint) IS
+    'Delete raw conflict-history evidence older than the recorded-at cutoff, optionally scoped to one run, while retaining validation results.';
 COMMENT ON FUNCTION pgl_validate.sequences(bigint) IS
     'Return persisted sequence results for a validation run.';
 COMMENT ON FUNCTION pgl_validate.report(bigint) IS
-    'Return a structured JSON validation report for one run, including plans, verdicts, divergences, sequences, fences, and issues.';
+    'Return a structured JSON validation report for one run, including plans, verdicts, divergences, conflict summaries, sequences, fences, and issues.';
 COMMENT ON FUNCTION pgl_validate.metrics() IS
     'Return aggregate validation counters, per-table last success, rows scanned, and recorded remote payload bytes as structured JSON.';
 COMMENT ON FUNCTION pgl_validate.record_barrier_fence(bigint, integer, integer, uuid, text, pg_lsn) IS

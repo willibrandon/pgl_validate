@@ -845,7 +845,7 @@ Each milestone is independently shippable and fully tested before the next (no d
 - **Incremental validation** — re-validate only key ranges whose `pg_xact_commit_timestamp` watermark advanced since the last clean run, for cheap continuous assurance (catalog already records per-chunk verdicts and epochs).
 - **Explicit sampling mode** — statistically-bounded partial validation for very large tables, with a *reported* confidence level (never silent scope reduction).
 - **Slot-peek fence** — derive an exact provider fence LSN from a logical slot peek instead of `pg_current_wal_lsn()`, if a future need arises.
-- **Conflict-history summaries** — conflict-history correlation is part of the catalog/API path; future work should add compact cause summaries and retention-policy controls for long-running fleets.
+- **Conflict-history summaries and retention** — conflict-history correlation is part of the catalog/API path; `conflict_summary(run_id)` provides compact cause counts by table/node/conflict type/resolution, and `purge_conflict_evidence(before, run_id)` lets operators retain validation results while pruning raw evidence in long-running fleets.
 
 ---
 

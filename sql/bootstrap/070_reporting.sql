@@ -726,6 +726,75 @@ AS $$
     ORDER BY ce.recorded_at DESC, ce.conflict_id DESC
 $$;
 
+CREATE FUNCTION pgl_validate.conflict_summary(p_run_id bigint)
+RETURNS TABLE(
+    source text,
+    schema_name text,
+    table_name text,
+    node text,
+    conflict_type text,
+    resolution text,
+    evidence_count bigint,
+    matched_key_count bigint,
+    first_recorded_at timestamptz,
+    last_recorded_at timestamptz,
+    has_before_triggers boolean
+)
+LANGUAGE sql
+STABLE
+AS $$
+    SELECT ce.source,
+           ce.schema_name,
+           ce.table_name,
+           ce.node,
+           ce.conflict_type,
+           ce.resolution,
+           count(*)::bigint AS evidence_count,
+           count(DISTINCT ce.key_bytes)::bigint AS matched_key_count,
+           min(ce.recorded_at) AS first_recorded_at,
+           max(ce.recorded_at) AS last_recorded_at,
+           bool_or(ce.has_before_triggers) AS has_before_triggers
+    FROM pgl_validate.conflict_evidence ce
+    WHERE ce.run_id = p_run_id
+    GROUP BY ce.source,
+             ce.schema_name,
+             ce.table_name,
+             ce.node,
+             ce.conflict_type,
+             ce.resolution
+    ORDER BY ce.schema_name,
+             ce.table_name,
+             ce.node,
+             ce.source,
+             ce.conflict_type,
+             ce.resolution
+$$;
+
+CREATE FUNCTION pgl_validate.purge_conflict_evidence(
+    before timestamptz,
+    p_run_id bigint DEFAULT NULL
+)
+RETURNS bigint
+LANGUAGE plpgsql
+VOLATILE
+AS $$
+DECLARE
+    deleted_rows bigint;
+BEGIN
+    IF before IS NULL THEN
+        RAISE EXCEPTION 'before must not be null'
+            USING ERRCODE = '22004';
+    END IF;
+
+    DELETE FROM pgl_validate.conflict_evidence ce
+    WHERE ce.recorded_at < before
+      AND (p_run_id IS NULL OR ce.run_id = p_run_id);
+
+    GET DIAGNOSTICS deleted_rows = ROW_COUNT;
+    RETURN deleted_rows;
+END
+$$;
+
 CREATE FUNCTION pgl_validate.sequences(run_id bigint)
 RETURNS SETOF pgl_validate.sequence_result
 LANGUAGE sql
@@ -843,6 +912,19 @@ SELECT CASE
                     SELECT jsonb_agg(to_jsonb(sr) ORDER BY sr.schema_name, sr.seq_name, sr.subscriber_node)
                     FROM pgl_validate.sequence_result sr
                     WHERE sr.run_id = p_run_id
+                ), '[]'::jsonb),
+            'conflict_summary',
+                COALESCE((
+                    SELECT jsonb_agg(
+                        to_jsonb(cs)
+                        ORDER BY cs.schema_name,
+                                 cs.table_name,
+                                 cs.node,
+                                 cs.source,
+                                 cs.conflict_type,
+                                 cs.resolution
+                    )
+                    FROM pgl_validate.conflict_summary(p_run_id) cs
                 ), '[]'::jsonb),
             'schema_issues',
                 COALESCE((
