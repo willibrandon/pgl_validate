@@ -8,6 +8,7 @@ use pgrx::prelude::*;
 use pgrx::{GucContext, GucFlags, GucRegistry, GucSetting};
 use std::ffi::CString;
 
+mod compat;
 mod digest;
 mod sql_api;
 mod transport;

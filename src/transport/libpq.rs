@@ -377,7 +377,7 @@ struct WaitEventSetGuard {
 
 impl WaitEventSetGuard {
     fn new(event_count: usize) -> Result<Self, String> {
-        let raw = unsafe { create_wait_event_set(event_count as c_int) };
+        let raw = unsafe { crate::compat::create_wait_event_set(event_count as c_int) };
         if raw.is_null() {
             Err("CreateWaitEventSet returned NULL".to_string())
         } else {
@@ -390,16 +390,6 @@ impl Drop for WaitEventSetGuard {
     fn drop(&mut self) {
         unsafe { pg_sys::FreeWaitEventSet(self.raw) };
     }
-}
-
-#[cfg(any(feature = "pg15", feature = "pg16"))]
-unsafe fn create_wait_event_set(event_count: c_int) -> *mut pg_sys::WaitEventSet {
-    unsafe { pg_sys::CreateWaitEventSet(pg_sys::CurrentMemoryContext, event_count) }
-}
-
-#[cfg(not(any(feature = "pg15", feature = "pg16")))]
-unsafe fn create_wait_event_set(event_count: c_int) -> *mut pg_sys::WaitEventSet {
-    unsafe { pg_sys::CreateWaitEventSet(pg_sys::CurrentResourceOwner, event_count) }
 }
 
 fn wait_for_remote_input(active: &[ActiveChecksumTask]) -> Result<(), String> {
