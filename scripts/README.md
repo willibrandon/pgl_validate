@@ -35,6 +35,8 @@ Use `stop-pgrx-test-clusters.ps1 -RemoveData` when a local run is interrupted.
 - `package-windows-msi.ps1` builds the Windows x64 MSI from the pgrx package
   directory using WiX v5. Use `-VerifyInstall` to run a silent per-user
   install/uninstall into a temporary PostgreSQL root.
+- `check-release-version.ps1` verifies that a release tag matches `Cargo.toml`
+  and `pgl_validate.control`.
 
 Generated packages are written under `target` and are ignored by git.
 

@@ -50,6 +50,10 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      - name: Check release version
+        if: startsWith(github.ref, 'refs/tags/')
+        run: pwsh -NoProfile -ExecutionPolicy Bypass -File ./scripts/check-release-version.ps1 -Version ${{ github.ref_name }}
+
       - name: Install Rust toolchain
         run: |
           $toolchain = '${{ matrix.target.rust_toolchain }}'
@@ -199,5 +203,19 @@ jobs:
             gh release upload $env:RELEASE_TAG @files --clobber
           }
           else {
-            gh release create $env:RELEASE_TAG @files --verify-tag --title $env:RELEASE_TAG --notes "pgl_validate $env:RELEASE_TAG packages."
+            $createArgs = @(
+              'release',
+              'create',
+              $env:RELEASE_TAG
+            ) + $files + @(
+              '--verify-tag',
+              '--title',
+              $env:RELEASE_TAG,
+              '--notes',
+              "pgl_validate $env:RELEASE_TAG packages."
+            )
+            if ($env:RELEASE_TAG -like '*-*') {
+              $createArgs += '--prerelease'
+            }
+            gh @createArgs
           }
