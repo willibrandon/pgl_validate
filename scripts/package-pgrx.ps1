@@ -117,7 +117,7 @@ function Test-PglPackageLayout {
     )
 
     $controlMatches = @(
-        Get-ChildItem -LiteralPath $PackageDirectory -Recurse -File -Filter 'pgl_validate.control' -ErrorAction SilentlyContinue
+        Get-ChildItem -LiteralPath $PackageDirectory -Recurse -Force -File -Filter 'pgl_validate.control' -ErrorAction SilentlyContinue
     )
     if ($controlMatches.Count -eq 0) {
         throw "Package is missing pgl_validate.control under $PackageDirectory."
@@ -133,7 +133,7 @@ function Test-PglPackageLayout {
     }
 
     $libraries = @(
-        Get-ChildItem -LiteralPath $PackageDirectory -Recurse -File -Filter 'pgl_validate.*' -ErrorAction SilentlyContinue |
+        Get-ChildItem -LiteralPath $PackageDirectory -Recurse -Force -File -Filter 'pgl_validate.*' -ErrorAction SilentlyContinue |
             Where-Object { $_.Extension -in @('.dll', '.so', '.dylib') }
     )
     if ($libraries.Count -eq 0) {

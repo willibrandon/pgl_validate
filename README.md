@@ -1,15 +1,10 @@
 # pgl_validate
 
-`pgl_validate` is a PostgreSQL extension for checking whether replicated tables
-agree across nodes.
-
-The primary target is pglogical, including bidirectional deployments. The same
-validation model also supports native logical replication and physical
-standbys.
-
-Validation is replication-aware. It accounts for apply lag, row filters, column
-lists, action masks, sequence windows, and standby replay state before
-reporting a match or divergence.
+`pgl_validate` is a PostgreSQL extension for validating table contents across
+pglogical and logical-replication topologies. The primary target is
+bidirectional replication, where validation must distinguish real divergence
+from replication lag, filtered replication contracts, and expected sequence
+windows.
 
 ## Supported Scope
 
