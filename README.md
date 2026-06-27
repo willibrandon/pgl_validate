@@ -18,8 +18,8 @@ windows. Native logical replication and physical standbys are supported modes.
 
 pglogical support is first-class and release-gated. It is not a runtime
 prerequisite for native logical replication or physical standby validation.
-pglogical is required only for pglogical validation jobs and pglogical
-deployments.
+Full CI installs pglogical because the test suite exercises pglogical code
+paths. Production installations need pglogical only on pglogical participants.
 
 CI covers the Windows-capable pglogical fork and vanilla upstream pglogical
 where upstream has a normal source-build path. Fork-only queryable conflict
