@@ -193,6 +193,8 @@ jobs:
       run:
         shell: pwsh
     steps:
+      - uses: actions/checkout@v5
+
       - name: Download package artifacts
         uses: actions/download-artifact@v8
         with:
@@ -227,6 +229,11 @@ jobs:
           finally {
             Pop-Location
           }
+
+          ./scripts/check-release-assets.ps1 `
+            -AssetDirectory $assetDir `
+            -Version $env:RELEASE_TAG `
+            -RequireChecksums
 
           $files = Get-ChildItem -LiteralPath $assetDir -File | Select-Object -ExpandProperty FullName
           if (-not $files) {

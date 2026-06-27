@@ -43,6 +43,9 @@ Use `stop-pgrx-test-clusters.ps1 -RemoveData` when a local run is interrupted.
   refuses to run when the same PostgreSQL-major MSI is already installed.
 - `check-release-version.ps1` verifies that a release tag matches `Cargo.toml`
   and `pgl_validate.control`.
+- `check-release-assets.ps1` verifies the prepared release asset matrix before
+  publishing: Linux/macOS `.tar.gz`, Windows `.zip`, Windows x64 MSI installers,
+  and matching checksums.
 
 Generated packages are written under `target` and are ignored by git.
 
