@@ -1956,6 +1956,58 @@ WHERE repair_id = $blockedRepairId
         throw "blocked repair unexpectedly modified target row: $targetStillDrifted"
     }
 
+    Write-Step 'Applying replicate repair with explicit conflict-policy acknowledgement'
+    $replicateRepairResult = Invoke-Sql -Database 'provider' -Sql @"
+SELECT repair_id::text || ';' || status || ';' || propagation || ';' || (origin_name IS NULL)::text
+FROM pgl_validate.apply_repair($driftRunId, 'local', 'target', 'target', 'replicate', true)
+"@
+    $replicateRepairParts = $replicateRepairResult.Split(';', 4)
+    if ($replicateRepairParts.Count -ne 4) {
+        throw "unexpected replicate repair result: $replicateRepairResult"
+    }
+    $replicateRepairId = $replicateRepairParts[0]
+    $replicateRepairStatus = $replicateRepairParts[1]
+    $replicateRepairPropagation = $replicateRepairParts[2]
+    $replicateRepairOriginIsNull = $replicateRepairParts[3]
+    if ($replicateRepairStatus -ne 'revalidated' -or
+        $replicateRepairPropagation -ne 'replicate' -or
+        $replicateRepairOriginIsNull -ne 'true') {
+        throw "replicate repair did not run as local-origin acknowledged repair: $replicateRepairResult"
+    }
+
+    $replicateRepairAudit = Invoke-Sql -Database 'provider' -Sql @"
+SELECT COALESCE(string_agg(action || ':' || post_verdict, ',' ORDER BY action), '<none>')
+FROM pgl_validate.repair_result
+WHERE repair_id = $replicateRepairId
+"@
+    if ($replicateRepairAudit -ne 'update:match') {
+        throw "unexpected replicate repair audit actions: $replicateRepairAudit"
+    }
+
+    Wait-SqlEqual `
+        -Database 'cascade' `
+        -Port $script:CascadePort `
+        -Sql "SELECT value FROM public.accounts WHERE id = 1" `
+        -Expected 'same' `
+        -TimeoutSeconds $TimeoutSeconds
+
+    $replicatedRepairVerdict = Invoke-Sql -Database 'provider' -Sql @"
+SELECT (pgl_validate.compare_table(
+    'public.accounts'::regclass,
+    ARRAY['target'],
+    jsonb_build_object(
+        'provider_dsn', $providerDsnSql,
+        'provider_node', 'provider',
+        'repsets', jsonb_build_array('default'),
+        'fence_timeout_ms', 30000,
+        'fence_poll_interval_ms', 100
+    )
+)).verdict
+"@
+    if ($replicatedRepairVerdict -ne 'match') {
+        throw "unexpected post-replicate-repair compare_table verdict: $replicatedRepairVerdict"
+    }
+
     Write-Step 'Validating pglogical sequence buffer-window semantics in an isolated topology'
     Invoke-Sql -Database 'postgres' -Sql 'CREATE DATABASE seq_provider' | Out-Null
     Invoke-Sql -Database 'postgres' -Sql 'CREATE DATABASE seq_target' | Out-Null
