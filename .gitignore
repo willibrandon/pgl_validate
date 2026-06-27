@@ -17,6 +17,9 @@
 *.lib
 *.dll
 *.msi
+*.wixpdb
+*.wixobj
+*.cab
 *.so
 *.dylib
 *.a
