@@ -189,8 +189,8 @@ because validation functions run as invoker.
 The core validation path is implemented for pglogical, native logical
 replication, and physical standbys. CI exercises PostgreSQL 15-18 across Linux,
 Windows, and macOS, with both packaged pglogical fork coverage and vanilla
-pglogical source coverage where upstream supports it. Remaining work is tracked
-against [docs/design.md](docs/design.md).
+pglogical source coverage where upstream supports it. Optional post-0.1.0
+extensions are tracked in [docs/design.md](docs/design.md).
 
 ## License
 
