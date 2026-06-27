@@ -292,7 +292,6 @@ try {
         "--dbname=$databaseName",
         "--inputdir=$regressDirectory",
         "--outputdir=$regressDirectory",
-        "--expecteddir=$(Join-Path $regressDirectory 'expected')",
         "--launcher=$launcher",
         "--schedule=$schedule"
     )

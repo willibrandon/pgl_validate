@@ -464,6 +464,7 @@ DECLARE
     provider_dsn text;
     provider_node text;
     provider_node_filter text;
+    nondeterministic_collation_columns text[];
     fence_timeout_ms int;
     fence_poll_interval_ms int;
     on_fence_timeout text;
@@ -1014,6 +1015,51 @@ BEGIN
             v_rel_name,
             'NO_COMMIT_TS',
             'track_commit_timestamp is off; validation remains sound, but origin-attribution diagnostics and last-update-wins repair are unavailable'
+        )
+        ON CONFLICT DO NOTHING;
+    END IF;
+
+    SELECT array_agg(format('%I.%I.%I uses %I.%I',
+                            v_schema_name,
+                            v_rel_name,
+                            collation_rec.attname,
+                            collation_rec.collation_schema,
+                            collation_rec.collation_name)
+                     ORDER BY collation_rec.attname)
+    INTO nondeterministic_collation_columns
+    FROM (
+        SELECT DISTINCT a.attname,
+               cn.nspname AS collation_schema,
+               co.collname AS collation_name
+        FROM pg_attribute a
+        JOIN pg_collation co ON co.oid = a.attcollation
+        JOIN pg_namespace cn ON cn.oid = co.collnamespace
+        WHERE a.attrelid = p_table_name
+          AND a.attnum > 0
+          AND NOT a.attisdropped
+          AND NOT co.collisdeterministic
+          AND (
+              cols IS NULL
+              OR cardinality(cols) = 0
+              OR a.attname = ANY (cols)
+              OR a.attname = ANY (COALESCE(key_cols, ARRAY[]::text[]))
+          )
+    ) AS collation_rec;
+
+    IF cardinality(nondeterministic_collation_columns) > 0 THEN
+        INSERT INTO pgl_validate.schema_issue(
+            run_id, node, schema_name, table_name, issue_code, detail
+        )
+        VALUES (
+            v_run_id,
+            provider_node,
+            v_schema_name,
+            v_rel_name,
+            'NONDETERMINISTIC_COLLATION',
+            format(
+                'non-deterministic collation on compared column(s): %s; validation hashes canonical bytes and remains exact, but equality semantics may be collation-dependent',
+                array_to_string(nondeterministic_collation_columns, ', ')
+            )
         )
         ON CONFLICT DO NOTHING;
     END IF;

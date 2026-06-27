@@ -2001,6 +2001,82 @@ mod tests {
     }
 
     #[pg_test]
+    fn compare_records_nondeterministic_collation_advisory() {
+        let backend_pid = Spi::get_one::<i32>("SELECT pg_backend_pid()")
+            .unwrap()
+            .unwrap();
+        let collation_name = identifier(&format!("pgl_validate_nondet_{backend_pid}"));
+        let table_name = identifier(&format!("nondet_collation_target_{backend_pid}"));
+
+        Spi::run(&format!(
+            "
+            CREATE TEMP TABLE pgl_validate_nondet_probe(
+                created boolean NOT NULL,
+                message text
+            ) ON COMMIT DROP;
+            DO $pgl_validate_nondet$
+            BEGIN
+                EXECUTE 'DROP COLLATION IF EXISTS public.{collation_name}';
+                EXECUTE 'CREATE COLLATION public.{collation_name} (provider = icu, locale = ''und-u-ks-level1'', deterministic = false)';
+                INSERT INTO pgl_validate_nondet_probe VALUES (true, NULL);
+            EXCEPTION WHEN others THEN
+                INSERT INTO pgl_validate_nondet_probe VALUES (false, SQLERRM);
+            END
+            $pgl_validate_nondet$;
+            "
+        ))
+        .unwrap();
+
+        let created = Spi::get_one::<bool>(
+            "SELECT created FROM pgl_validate_nondet_probe ORDER BY created DESC LIMIT 1",
+        )
+        .unwrap()
+        .unwrap();
+        if !created {
+            return;
+        }
+
+        Spi::run(&format!(
+            "
+            CREATE TABLE public.{table_name}(
+                id int PRIMARY KEY,
+                value text COLLATE public.{collation_name}
+            );
+            INSERT INTO public.{table_name} VALUES (1, 'same');
+            "
+        ))
+        .unwrap();
+
+        let evidence = Spi::get_one::<String>(&format!(
+            "
+            WITH compared AS (
+                SELECT pgl_validate.compare_table(
+                    'public.{table_name}'::regclass,
+                    ARRAY[]::text[]
+                ) AS result
+            )
+            SELECT (result).verdict || ';' ||
+                   EXISTS (
+                       SELECT 1
+                       FROM pgl_validate.schema_issue si
+                       WHERE si.run_id = (result).run_id
+                         AND si.table_name = {table_name_lit}
+                         AND si.node = 'local'
+                         AND si.issue_code = 'NONDETERMINISTIC_COLLATION'
+                         AND si.detail LIKE {collation_like}
+                         AND si.detail LIKE '%validation hashes canonical bytes%'
+                   )::text
+            FROM compared
+            ",
+            table_name_lit = sql_literal(&table_name),
+            collation_like = sql_literal(&format!("%{collation_name}%"))
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(evidence, "match;true");
+    }
+
+    #[pg_test]
     fn remote_checksum_reads_over_libpq() {
         let dsn = local_dsn();
         let checksum_sql = "SELECT 7::bigint AS n_rows, decode('010203', 'hex') AS lthash, decode('040506', 'hex') AS set_hash";
