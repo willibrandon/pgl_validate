@@ -26,6 +26,21 @@ env:
   RUST_BACKTRACE: "1"
 
 jobs:
+  scripts-check:
+    name: PowerShell scripts
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install PSScriptAnalyzer
+        run: Install-Module PSScriptAnalyzer -Scope CurrentUser -Force
+
+      - name: Check scripts
+        run: pwsh -NoProfile -ExecutionPolicy Bypass -File ./scripts/check-powershell.ps1
+
   design-check:
     name: design catalog DDL
     runs-on: ubuntu-24.04

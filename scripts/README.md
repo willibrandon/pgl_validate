@@ -45,3 +45,6 @@ Generated packages are written under `target` and are ignored by git.
 
 `check-design-catalog-ddl.ps1` verifies that Appendix A in `docs/design.md`
 matches the authoritative catalog DDL in `sql/bootstrap/001_catalog.sql`.
+
+`check-powershell.ps1` parses every script and runs PSScriptAnalyzer with
+warnings treated as failures.
