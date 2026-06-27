@@ -1,197 +1,81 @@
 # pgl_validate
 
-`pgl_validate` is a PostgreSQL extension for validating table contents across
-pglogical and logical-replication topologies. The primary target is
-bidirectional replication, where validation must distinguish real divergence
-from replication lag, filtered replication contracts, and expected sequence
-windows.
+`pgl_validate` validates table contents across PostgreSQL replication
+topologies. It is built for pglogical first, especially bidirectional
+replication, and also supports native logical replication and physical
+standbys.
 
-The design is in [docs/design.md](docs/design.md). Implementation should keep
-the database-facing contract exact: barrier-converged epochs, edge-specific
-origin progress, planner-visible checksum SQL, and pglogical-aware validation
-strength.
+The extension compares data only after a replication-aware fence proves the
+right state is visible. That matters: a validator that cannot tell lag from
+divergence is worse than noisy.
 
-## Build
+## Supported Scope
 
-Use the same pgrx version as the crate:
+- PostgreSQL 15, 16, 17, and 18.
+- pglogical validation, including bidirectional topologies.
+- Native logical replication validation.
+- Physical standby validation.
+- Windows, Linux, and macOS builds.
+- Release zip packages for each supported PostgreSQL major.
+- Windows x64 MSI installers for each supported PostgreSQL major.
+
+pglogical is mandatory, not optional. CI covers the Windows-capable pglogical
+fork and vanilla upstream pglogical where upstream has a normal source-build
+path. Fork-only queryable conflict history is used only as report enrichment;
+validation does not depend on it.
+
+## Quick Start
+
+Install with pgrx against the PostgreSQL major you want to use:
+
+```powershell
+.\scripts\pgrx-vs.ps1 cargo pgrx install `
+  --pg-config C:\path\to\pg_config.exe `
+  --no-default-features `
+  --features pg18
+```
+
+Then, in the target database:
+
+```sql
+CREATE EXTENSION pgl_validate;
+
+SELECT *
+FROM pgl_validate.compare_table('public.accounts'::regclass);
+```
+
+On Windows, run pgrx commands through `scripts\pgrx-vs.ps1` so bindgen sees
+the Visual Studio C++ and Windows SDK headers.
+
+## Development
+
+Use Rust stable with `cargo-pgrx` 0.19.1.
 
 ```powershell
 rustup default stable
 cargo install --locked cargo-pgrx --version 0.19.1
 ```
 
-The default target is PostgreSQL 18, the latest stable major. PostgreSQL 19 is
-currently beta, so it is not the default build target.
-
-On Windows, run pgrx commands from a Visual Studio developer environment so
-bindgen can find the MSVC and Windows SDK headers:
+Common checks:
 
 ```powershell
-.\scripts\pgrx-vs.ps1 cargo pgrx schema pg18 --no-default-features --features pg18
+.\scripts\check-powershell.ps1
+.\scripts\check-design-catalog-ddl.ps1
+.\scripts\test-pgrx.ps1 -PgMajor 18
+.\scripts\test-pglogical-fence.ps1 -PgMajor 18
 ```
 
-For quick Rust-only feedback:
+Script details live in [scripts/README.md](scripts/README.md). The design
+contract lives in [docs/design.md](docs/design.md).
 
-```powershell
-.\scripts\pgrx-vs.ps1 cargo check --no-default-features --features pg18
-.\scripts\pgrx-vs.ps1 cargo test --lib --no-default-features --features pg18
-```
+## Releases
 
-For extension validation, use pgrx:
+The first release line starts at `v0.1.0`.
 
-```powershell
-.\scripts\pgrx-vs.ps1 cargo pgrx schema pg18 --no-default-features --features pg18
-.\scripts\test-pgrx.ps1
-```
-
-The scripts are PowerShell, but they are intended to run on Windows, Linux, and
-macOS. On Windows, `scripts\pgrx-vs.ps1` loads the Visual Studio C++
-environment; on other platforms it runs the command directly.
-
-`scripts\test-pgrx.ps1` always stops repo-local pgrx test clusters in
-`target\test-pgdata`, `target\pglogical-test-pgdata`,
-`target\native-test-pgdata`, `target\standby-primary-pgdata`,
-`target\standby-replica-pgdata`, and `target\diag-pgdata`, even when a pg_test
-fails. It also runs pg_tests serially because they share one PostgreSQL cluster
-and extension catalog state. The script prebuilds the Rust test binary before
-starting the pg_test watchdog, so no-cache compilation is bounded separately
-from the running PostgreSQL tests. Local pgrx test runs default to a
-180-second test timeout and a 600-second build-preflight timeout; pass
-`-TimeoutSeconds` or `-BuildTimeoutSeconds` only when deliberately debugging a
-slow run.
-
-pglogical is a required part of the test environment. Install the packaged
-release into the target pgrx PostgreSQL; do not build from a local pglogical
-checkout. Repeat this for each PostgreSQL major you run locally:
-
-```powershell
-.\scripts\install-pglogical-release.ps1 -PgMajor 18
-```
-
-The installer verifies the release checksum and installs a packaged artifact
-when one exists. If a package is not published for the host architecture, it
-builds the source release against the selected `pg_config`.
-
-Mixed-major pglogical coverage runs a real subscription between two PostgreSQL
-majors and checks that validation records both participant versions:
-
-```powershell
-.\scripts\test-pglogical-mixed-major.ps1 -ProviderPgMajor 15 -TargetPgMajor 18
-```
-
-CI runs PostgreSQL 15, 16, 17, and 18 across Linux x64/arm64, Windows x64,
-Windows ARM64-hosted x64, and macOS ARM64 runners. Intel macOS is intentionally
-excluded. Native Windows ARM64 PostgreSQL is not scheduled because PostgreSQL
-15-18 do not ship a supported native Windows ARM64 CI build path here. The pgrx
-pg_test, pglogical integration, and mixed-major pglogical jobs install the fork
-release package or source release for each target. A separate vanilla
-pglogical lane builds upstream `2ndQuadrant/pglogical` from the pinned release
-source on Linux and macOS; Windows pglogical coverage uses the fork because the
-upstream release does not publish Windows packages or a CMake/MSVC source build.
-
-Native logical replication coverage uses PostgreSQL's built-in publication and
-subscription machinery:
-
-```powershell
-.\scripts\test-native-logical-fence.ps1 -PgMajor 18
-```
-
-Physical standby coverage uses PostgreSQL streaming replication and validates
-the replay-LSN fence path against a real read-only standby:
-
-```powershell
-.\scripts\test-physical-standby-fence.ps1 -PgMajor 18
-```
-
-Release packages are built with `cargo pgrx package` through the wrapper script.
-It writes a pgrx install tree and a zip archive under `target`:
-
-```powershell
-.\scripts\pgrx-vs.ps1 pwsh -NoProfile -ExecutionPolicy Bypass -File .\scripts\package-pgrx.ps1 -PgMajor 18
-```
-
-Tagged releases run the same packaging path for PostgreSQL 15-18 on Linux
-x64/arm64, Windows x64, Windows ARM64-hosted x64, and macOS ARM64. Windows x64
-releases also publish an MSI installer for each PostgreSQL major.
-
-```powershell
-.\scripts\package-windows-msi.ps1 -PgMajor 18
-```
-
-For local pgrx installs, pass the PostgreSQL root explicitly:
-
-```powershell
-msiexec /i .\target\package-artifacts\pgl_validate-0.1.0-pg18-windows-x64.msi `
-  POSTGRESQLDIR="$env:USERPROFILE\.pgrx\18.4" `
-  WIXUI_DONTSETPATH=1 ALLUSERS=2 MSIINSTALLPERUSER=1 `
-  /qn /norestart
-```
-
-If `cargo check` is launched by an editor, start that editor from a Visual
-Studio developer shell, or use the checked-in VS Code workspace settings. They
-route rust-analyzer flycheck through `scripts\pgrx-vs.ps1`, which loads the
-Visual Studio C++ environment before running `cargo check`. The `crtdefs.h`
-bindgen error means that environment is missing from the cargo process.
-
-## Configuration
-
-Per-run `options` override PostgreSQL settings. Implemented settings are:
-
-```sql
-SET pgl_validate.chunk_target_rows = 50000;
-SET pgl_validate.localize_threshold = 1000;
-SET pgl_validate.recheck_passes = 3;
-SET pgl_validate.fence_timeout_ms = 300000;
-SET pgl_validate.fence_poll_interval_ms = 100;
--- compare_table option: "on_fence_timeout": "abort_run" | "skip_peer"
-SET pgl_validate.sequence_buffer_multiplier = 2;
-SET pgl_validate.paranoid_confirm = off;
-SET pgl_validate.paranoid_confirm_max_rows = 1000;
-SET pgl_validate.max_reported_tuple_bytes = 8192;
-SET pgl_validate.max_reported_divergences = 1000;
-SET pgl_validate.hash_algorithm = 'blake3_256'; -- or blake3_512
-SET pgl_validate.chunk_max_duration = '2s';
-SET pgl_validate.split_fanout = 4;
-SET pgl_validate.max_parallel_chunks = 4;
-SET pgl_validate.max_snapshot_age = '5min';
-SET pgl_validate.statement_timeout_per_chunk = '30s';
-SET pgl_validate.throttle_max_lag = 'off';
-SET pgl_validate.allow_approximate_filters = off;
-SET pgl_validate.require_barrier = on;
-SET pgl_validate.allow_degraded_fence = off;
-SET pgl_validate.correlate_conflict_history = on;
-SET pgl_validate.conflict_history_max_rows = 1000;
-```
-
-`pgl_validate.conflict_summary(run_id)` condenses optional pglogical conflict
-evidence by table, node, conflict type, and resolution. Use
-`pgl_validate.purge_conflict_evidence(before, run_id)` when you want to keep run
-results but prune old raw evidence.
-
-For bidirectional pglogical validation, set `pgl_validate.peer.reverse_subscription_name`
-to the local subscription that replicates from that peer back to the coordinator.
-
-Durable schedules can be dispatched manually with `pgl_validate.run_schedule`.
-To dispatch due schedules automatically, preload `pgl_validate` and set
-`pgl_validate.scheduler_database` to the database that owns the schedule rows.
-`pgl_validate.scheduler_interval_ms` controls the polling interval.
-
-## Security
-
-The extension installs four NOLOGIN tier roles: `pgl_validate_validate`,
-`pgl_validate_discover`, `pgl_validate_orchestrate`, and `pgl_validate_repair`.
-Default PUBLIC access is revoked. Grant the narrowest role to the operators or
-service accounts that need it; ordinary table privileges are still required
-because validation functions run as invoker.
-
-## Status
-
-The core validation path is implemented for pglogical, native logical
-replication, and physical standbys. CI exercises PostgreSQL 15-18 across Linux,
-Windows, and macOS, with both packaged pglogical fork coverage and vanilla
-pglogical source coverage where upstream supports it. Optional post-0.1.0
-extensions are tracked in [docs/design.md](docs/design.md).
+Release packages are produced with `cargo pgrx package` through
+`scripts/package-pgrx.ps1`. Windows MSI installers are produced with
+`scripts/package-windows-msi.ps1`.
 
 ## License
 
-MIT. Copyright (c) 2026 Brandon Williams.
+MIT. See [LICENSE](LICENSE).
