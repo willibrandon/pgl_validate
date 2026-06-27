@@ -50,6 +50,42 @@ FROM information_schema.views
 WHERE table_schema = 'pgl_validate'
 ORDER BY table_name;
 
+WITH documented_object(kind, identity, description) AS (
+    SELECT 'schema',
+           n.nspname,
+           obj_description(n.oid, 'pg_namespace')
+    FROM pg_namespace n
+    WHERE n.nspname = 'pgl_validate'
+    UNION ALL
+    SELECT CASE c.relkind WHEN 'r' THEN 'table' WHEN 'v' THEN 'view' ELSE c.relkind::text END,
+           c.relname,
+           obj_description(c.oid, 'pg_class')
+    FROM pg_class c
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE n.nspname = 'pgl_validate'
+      AND c.relkind IN ('r', 'v')
+    UNION ALL
+    SELECT CASE p.prokind WHEN 'a' THEN 'aggregate' ELSE 'function' END,
+           p.proname || '(' || oidvectortypes(p.proargtypes) || ')',
+           obj_description(p.oid, 'pg_proc')
+    FROM pg_proc p
+    JOIN pg_namespace n ON n.oid = p.pronamespace
+    WHERE n.nspname = 'pgl_validate'
+    UNION ALL
+    SELECT 'type',
+           t.typname,
+           obj_description(t.oid, 'pg_type')
+    FROM pg_type t
+    JOIN pg_namespace n ON n.oid = t.typnamespace
+    WHERE n.nspname = 'pgl_validate'
+      AND t.typrelid = 0
+      AND t.typelem = 0
+)
+SELECT kind, identity
+FROM documented_object
+WHERE description IS NULL
+ORDER BY kind, identity;
+
 SELECT octet_length(pgl_validate.row_digest(ARRAY[1], 1::int4)) AS row_digest_bytes,
        octet_length(pgl_validate.hash_digest_array(ARRAY[
            pgl_validate.row_digest(ARRAY[1], 1::int4)
