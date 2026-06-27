@@ -233,6 +233,53 @@ function Invoke-Logged {
     }
 }
 
+<#
+.SYNOPSIS
+Returns the Cargo home directory used by the current runner.
+#>
+function Get-CargoHome {
+    if (-not [string]::IsNullOrWhiteSpace($env:CARGO_HOME)) {
+        return $env:CARGO_HOME
+    }
+
+    return Join-Path $HOME '.cargo'
+}
+
+<#
+.SYNOPSIS
+Clears Cargo source caches after a failed registry operation.
+#>
+function Clear-CargoSourceCache {
+    param([string] $Reason)
+
+    $cargoHome = Get-CargoHome
+    $paths = @(
+        Join-Path $cargoHome 'registry',
+        Join-Path $cargoHome 'git'
+    )
+
+    Write-Warning "Clearing Cargo source cache after failure: $Reason"
+    foreach ($path in $paths) {
+        if (-not (Test-Path -LiteralPath $path)) {
+            continue
+        }
+
+        for ($attempt = 1; $attempt -le 5; $attempt++) {
+            try {
+                Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction Stop
+                break
+            }
+            catch {
+                if ($attempt -eq 5) {
+                    throw
+                }
+
+                Start-Sleep -Seconds $attempt
+            }
+        }
+    }
+}
+
 function Install-HomebrewFormula {
     param([string[]] $Formulae)
 
@@ -419,8 +466,10 @@ function Install-CargoPgrx {
                 throw
             }
 
+            $failure = $_.Exception.Message
+            Clear-CargoSourceCache -Reason $failure
             $delaySeconds = 15 * $attempt
-            Write-Warning "cargo-pgrx install attempt $attempt failed: $($_.Exception.Message). Retrying in $delaySeconds seconds."
+            Write-Warning "cargo-pgrx install attempt $attempt failed: $failure. Retrying in $delaySeconds seconds."
             Start-Sleep -Seconds $delaySeconds
         }
     }
@@ -467,8 +516,10 @@ function Invoke-CargoDependencyFetch {
                 throw
             }
 
+            $failure = $_.Exception.Message
+            Clear-CargoSourceCache -Reason $failure
             $delaySeconds = 20 * $attempt
-            Write-Warning "cargo dependency fetch attempt $attempt failed: $($_.Exception.Message). Retrying in $delaySeconds seconds."
+            Write-Warning "cargo dependency fetch attempt $attempt failed: $failure. Retrying in $delaySeconds seconds."
             Start-Sleep -Seconds $delaySeconds
         }
     }
