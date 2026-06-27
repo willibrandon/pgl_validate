@@ -202,6 +202,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_REPOSITORY: ${{ github.repository }}
         run: |
           $assetDir = Join-Path (Get-Location) 'release-assets'
           New-Item -ItemType Directory -Force -Path $assetDir | Out-Null
@@ -232,9 +233,9 @@ jobs:
             throw 'No release assets were prepared.'
           }
 
-          gh release view $env:RELEASE_TAG *> $null
+          gh release view $env:RELEASE_TAG --repo $env:RELEASE_REPOSITORY *> $null
           if ($LASTEXITCODE -eq 0) {
-            gh release upload $env:RELEASE_TAG @files --clobber
+            gh release upload $env:RELEASE_TAG @files --clobber --repo $env:RELEASE_REPOSITORY
           }
           else {
             $createArgs = @(
@@ -246,7 +247,9 @@ jobs:
               '--title',
               $env:RELEASE_TAG,
               '--notes',
-              "pgl_validate $env:RELEASE_TAG packages."
+              "pgl_validate $env:RELEASE_TAG packages.",
+              '--repo',
+              $env:RELEASE_REPOSITORY
             )
             if ($env:RELEASE_TAG -like '*-*') {
               $createArgs += '--prerelease'
