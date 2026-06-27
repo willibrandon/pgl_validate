@@ -16,10 +16,14 @@ windows.
 - Release zip packages for each supported PostgreSQL major.
 - Windows x64 MSI installers for each supported PostgreSQL major.
 
-pglogical is mandatory, not optional. CI covers the Windows-capable pglogical
-fork and vanilla upstream pglogical where upstream has a normal source-build
-path. Fork-only queryable conflict history is used only as report enrichment;
-validation does not depend on it.
+pglogical support is a required release gate, not an optional add-on. Native
+logical replication and physical standby validation are supported modes too.
+pglogical is required only for pglogical validation jobs and pglogical
+deployments.
+
+CI covers the Windows-capable pglogical fork and vanilla upstream pglogical
+where upstream has a normal source-build path. Fork-only queryable conflict
+history is used only as report enrichment; validation does not depend on it.
 
 ## Quick Start
 
