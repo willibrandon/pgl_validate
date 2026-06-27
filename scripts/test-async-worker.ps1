@@ -234,6 +234,52 @@ WHERE r.run_id = $RunId::bigint;
     throw "timed out waiting for async validation run ${RunId}; last state: $last"
 }
 
+function Wait-ScheduledRunComplete {
+    param(
+        [string] $ScheduleName,
+        [int] $TimeoutSeconds
+    )
+
+    $deadline = [DateTimeOffset]::Now.AddSeconds($TimeoutSeconds)
+    $last = ''
+    $scheduleLiteral = "'" + $ScheduleName.Replace("'", "''") + "'"
+
+    while ([DateTimeOffset]::Now -lt $deadline) {
+        $last = Invoke-Sql -Quiet -Sql @"
+SELECT COALESCE(s.last_run_id::text, '<none>') || '|' ||
+       COALESCE(r.status, '<none>') || '|' ||
+       COALESCE(wt.status, '<none>') || '|' ||
+       COALESCE(tr.verdict, '<none>') || '|' ||
+       COALESCE(wt.error, '')
+FROM pgl_validate.schedule s
+LEFT JOIN pgl_validate.run r
+  ON r.run_id = s.last_run_id
+LEFT JOIN pgl_validate.worker_task wt
+  ON wt.run_id = s.last_run_id
+LEFT JOIN pgl_validate.table_result tr
+  ON tr.run_id = s.last_run_id
+WHERE s.name = $scheduleLiteral;
+"@
+
+        if ($last -match '^[0-9]+\|completed\|completed\|match\|') {
+            return $last
+        }
+
+        if ($last -match '^[0-9]+\|failed\|') {
+            throw "scheduled validation failed for ${ScheduleName}: $last"
+        }
+
+        Start-Sleep -Milliseconds 100
+    }
+
+    if (Test-Path -LiteralPath $log) {
+        $tail = (Get-Content -LiteralPath $log -Tail 120) -join [Environment]::NewLine
+        throw "timed out waiting for schedule ${ScheduleName}; last state: $last$([Environment]::NewLine)PostgreSQL log tail:$([Environment]::NewLine)$tail"
+    }
+
+    throw "timed out waiting for schedule ${ScheduleName}; last state: $last"
+}
+
 function Wait-AsyncRunStatus {
     param(
         [string] $RunId,
@@ -322,6 +368,9 @@ try {
         "-p $script:Port",
         '-h localhost',
         $socketOption,
+        '-c shared_preload_libraries=pgl_validate',
+        '-c pgl_validate.scheduler_database=postgres',
+        '-c pgl_validate.scheduler_interval_ms=1000',
         '-c max_worker_processes=20'
     ) | Where-Object { $_ }) -join ' '
     Invoke-CheckedProcess `
@@ -355,10 +404,10 @@ SELECT (pgl_validate.put_schedule(
     NULL,
     NULL,
     '{}'::jsonb,
-    true
+    false
 )).name;
 "@ | Out-Null
-    $scheduledRunId = Invoke-Sql -Quiet -Sql "SELECT pgl_validate.run_schedule('async_worker_smoke')::text;"
+    $scheduledRunId = Invoke-Sql -Quiet -Sql "SELECT pgl_validate.run_schedule('async_worker_smoke', true)::text;"
     if (-not $scheduledRunId) {
         throw 'run_schedule did not return a run id.'
     }
@@ -371,6 +420,24 @@ SELECT (pgl_validate.put_schedule(
     }
 
     Write-Output "scheduled async validation passed on pg${PgMajor}: run_id=$scheduledRunId state=$scheduledState"
+
+    Write-Step 'Waiting for the preloaded scheduler worker to dispatch a due schedule'
+    Invoke-Sql -Quiet -Sql @"
+SELECT (pgl_validate.put_schedule(
+    'async_worker_auto',
+    '* * * * *',
+    ARRAY['public.async_target'],
+    NULL,
+    NULL,
+    '{}'::jsonb,
+    true
+)).name;
+"@ | Out-Null
+
+    $autoScheduleState = Wait-ScheduledRunComplete `
+        -ScheduleName 'async_worker_auto' `
+        -TimeoutSeconds $TimeoutSeconds
+    Write-Output "automatic scheduler validation passed on pg${PgMajor}: state=$autoScheduleState"
 
     Write-Step 'Creating paused async task and resuming it through a replacement worker'
     $resumeSeed = Invoke-Sql -Quiet -Sql @"
