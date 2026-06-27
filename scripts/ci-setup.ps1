@@ -14,6 +14,7 @@ $ProgressPreference = 'SilentlyContinue'
 
 $common = Join-Path $PSScriptRoot 'pgrx-common.ps1'
 . $common
+$root = Split-Path -Parent $PSScriptRoot
 
 function Add-GitHubEnv {
     param(
@@ -317,6 +318,52 @@ function Install-CargoPgrx {
     }
 }
 
+<#
+.SYNOPSIS
+Fetches Rust crate dependencies before cargo-pgrx commands need Cargo metadata.
+#>
+function Invoke-CargoDependencyFetch {
+    if (-not $env:CARGO_NET_RETRY) {
+        $env:CARGO_NET_RETRY = '10'
+    }
+    if (-not $env:CARGO_HTTP_MULTIPLEXING) {
+        $env:CARGO_HTTP_MULTIPLEXING = 'false'
+    }
+    if (-not $env:CARGO_HTTP_TIMEOUT) {
+        $env:CARGO_HTTP_TIMEOUT = '120'
+    }
+
+    $manifestPath = Join-Path $root 'Cargo.toml'
+    $maxAttempts = 4
+    for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+        try {
+            Invoke-Logged -FilePath 'cargo' -Arguments @('fetch', '--locked', '--manifest-path', $manifestPath)
+            $metadataArguments = @('metadata', '--locked', '--format-version', '1', '--manifest-path', $manifestPath)
+            if ($env:PGL_VALIDATE_RUST_TOOLCHAIN) {
+                $metadataArguments = @("+$env:PGL_VALIDATE_RUST_TOOLCHAIN") + $metadataArguments
+            }
+
+            Write-Host "+ cargo $($metadataArguments -join ' ')"
+            $metadataOutput = & cargo @metadataArguments 2>&1
+            if ($LASTEXITCODE -ne 0) {
+                $metadataOutput | Write-Host
+                throw "cargo metadata exited with code $LASTEXITCODE."
+            }
+
+            return
+        }
+        catch {
+            if ($attempt -eq $maxAttempts) {
+                throw
+            }
+
+            $delaySeconds = 20 * $attempt
+            Write-Warning "cargo dependency fetch attempt $attempt failed: $($_.Exception.Message). Retrying in $delaySeconds seconds."
+            Start-Sleep -Seconds $delaySeconds
+        }
+    }
+}
+
 function Install-ChocolateyPackage {
     param(
         [string] $CommandName,
@@ -570,3 +617,5 @@ elseif (Test-PglLinux) {
 else {
     throw 'Unsupported CI operating system.'
 }
+
+Invoke-CargoDependencyFetch
