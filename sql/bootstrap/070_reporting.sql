@@ -471,6 +471,8 @@ BEGIN
     VALUES (
         'planning',
         (effective_options - '_pgl_validate_worker_fail_once_after_tables')
+            - '_pgl_validate_worker_sleep_once_after_tables'
+            - '_pgl_validate_worker_sleep_once_ms'
             || jsonb_build_object('async', true),
         reference,
         CASE WHEN tables IS NULL THEN NULL ELSE cardinality(tables) END
@@ -640,6 +642,8 @@ BEGIN
             peer_list,
             request_reference,
             (request_options - '_pgl_validate_worker_fail_once_after_tables')
+                - '_pgl_validate_worker_sleep_once_after_tables'
+                - '_pgl_validate_worker_sleep_once_ms'
                 || jsonb_build_object(
                     'async', true,
                     '_pgl_validate_parent_run_id', task.run_id

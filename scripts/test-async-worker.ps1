@@ -325,6 +325,114 @@ WHERE r.run_id = $RunId::bigint;
     throw "timed out waiting for async validation run ${RunId} to reach ${ExpectedStatus}; last state: $last"
 }
 
+function Wait-AsyncRunFrontier {
+    param(
+        [string] $RunId,
+        [string] $CompletedTable,
+        [string] $PendingTable,
+        [int] $TimeoutSeconds
+    )
+
+    $deadline = [DateTimeOffset]::Now.AddSeconds($TimeoutSeconds)
+    $last = ''
+
+    while ([DateTimeOffset]::Now -lt $deadline) {
+        $last = Invoke-Sql -Quiet -Sql @"
+SELECT COALESCE(wt.worker_pid::text, '<null>') || '|' ||
+       r.status || '|' ||
+       wt.status || '|' ||
+       (
+           SELECT count(*)::text
+           FROM pgl_validate.table_result tr
+           WHERE tr.run_id = r.run_id
+             AND tr.table_name = '$CompletedTable'
+             AND tr.verdict = 'match'
+       ) || '|' ||
+       (
+           SELECT count(*)::text
+           FROM pgl_validate.table_result tr
+           WHERE tr.run_id = r.run_id
+             AND tr.table_name = '$PendingTable'
+       )
+FROM pgl_validate.run r
+JOIN pgl_validate.worker_task wt USING (run_id)
+WHERE r.run_id = $RunId::bigint;
+"@
+        $parts = $last.Split('|')
+        if ($parts.Count -eq 5 -and
+            $parts[0] -match '^[0-9]+$' -and
+            $parts[3] -eq '1' -and
+            $parts[4] -eq '0') {
+            return $parts[0]
+        }
+
+        if ($last -like '*|failed|*' -or $last -like '*|*|failed|*') {
+            throw "async validation reached failure before frontier check for run ${RunId}: $last"
+        }
+
+        Start-Sleep -Milliseconds 100
+    }
+
+    if (Test-Path -LiteralPath $log) {
+        $tail = (Get-Content -LiteralPath $log -Tail 120) -join [Environment]::NewLine
+        throw "timed out waiting for async validation frontier for run ${RunId}; last state: $last$([Environment]::NewLine)PostgreSQL log tail:$([Environment]::NewLine)$tail"
+    }
+
+    throw "timed out waiting for async validation frontier for run ${RunId}; last state: $last"
+}
+
+function Wait-WorkerPidGone {
+    param(
+        [string] $WorkerPid,
+        [int] $TimeoutSeconds
+    )
+
+    $deadline = [DateTimeOffset]::Now.AddSeconds($TimeoutSeconds)
+    $workerProcessId = [int] $WorkerPid
+
+    while ([DateTimeOffset]::Now -lt $deadline) {
+        $process = Get-Process -Id $workerProcessId -ErrorAction SilentlyContinue
+        if (-not $process) {
+            return
+        }
+
+        Start-Sleep -Milliseconds 100
+    }
+
+    throw "timed out waiting for worker pid ${WorkerPid} to exit"
+}
+
+function Stop-WorkerProcess {
+    param([string] $WorkerPid)
+
+    Stop-Process -Id ([int] $WorkerPid) -Force -ErrorAction Stop
+}
+
+function Wait-DatabaseReady {
+    param([int] $TimeoutSeconds)
+
+    $deadline = [DateTimeOffset]::Now.AddSeconds($TimeoutSeconds)
+    $last = ''
+
+    while ([DateTimeOffset]::Now -lt $deadline) {
+        $output = & $script:Psql -X -w -h localhost -p $script:Port -U postgres -d postgres `
+            -v ON_ERROR_STOP=1 -Atq -c 'SELECT 1;' 2>&1
+        if ($LASTEXITCODE -eq 0 -and (($output -join "`n").Trim()) -eq '1') {
+            return
+        }
+
+        $last = $output -join [Environment]::NewLine
+        Start-Sleep -Milliseconds 250
+    }
+
+    if (Test-Path -LiteralPath $log) {
+        $tail = (Get-Content -LiteralPath $log -Tail 120) -join [Environment]::NewLine
+        throw "timed out waiting for PostgreSQL to recover after worker termination; last psql output: $last$([Environment]::NewLine)PostgreSQL log tail:$([Environment]::NewLine)$tail"
+    }
+
+    throw "timed out waiting for PostgreSQL to recover after worker termination; last psql output: $last"
+}
+
 $pgConfig = Get-PglPgrxPgConfig -PgMajor $PgMajor
 $script:InitDb = Get-PglToolPath -PgConfig $pgConfig -Name 'initdb'
 $script:PgCtl = Get-PglToolPath -PgConfig $pgConfig -Name 'pg_ctl'
@@ -482,6 +590,70 @@ FROM task;
     Write-Step "Waiting for resumed async run $resumeRunId to complete"
     $resumedState = Wait-AsyncRunComplete -RunId $resumeRunId -TimeoutSeconds $TimeoutSeconds
     Write-Output "resumed async validation passed on pg${PgMajor}: run_id=$resumeRunId state=$resumedState"
+
+    Write-Step 'Validating resume after terminating a running async worker'
+    Invoke-Sql -Quiet -Sql @"
+CREATE TABLE public.async_kill_a(id int PRIMARY KEY, value text);
+CREATE TABLE public.async_kill_b(id int PRIMARY KEY, value text);
+INSERT INTO public.async_kill_a VALUES (1, 'same');
+INSERT INTO public.async_kill_b VALUES (1, 'same');
+"@ | Out-Null
+
+    $killRunId = Invoke-Sql -Quiet -Sql @"
+SELECT pgl_validate.compare_async(
+    ARRAY[
+        'public.async_kill_a'::regclass,
+        'public.async_kill_b'::regclass
+    ],
+    NULL,
+    NULL,
+    NULL,
+    '{
+        "_pgl_validate_worker_sleep_once_after_tables": 1,
+        "_pgl_validate_worker_sleep_once_ms": 30000
+    }'::jsonb
+)::text;
+"@
+    if (-not $killRunId) {
+        throw 'kill-resume compare_async did not return a run id.'
+    }
+
+    $workerPid = Wait-AsyncRunFrontier `
+        -RunId $killRunId `
+        -CompletedTable 'async_kill_a' `
+        -PendingTable 'async_kill_b' `
+        -TimeoutSeconds $TimeoutSeconds
+
+    # pg_terminate_backend can let this background worker finish; kill the OS process to test resume after real worker death.
+    Stop-WorkerProcess -WorkerPid $workerPid
+    Wait-WorkerPidGone -WorkerPid $workerPid -TimeoutSeconds $TimeoutSeconds
+    Wait-DatabaseReady -TimeoutSeconds $TimeoutSeconds
+
+    $killResumed = Invoke-Sql -Quiet -Sql "SELECT pgl_validate.resume($killRunId::bigint)::text;"
+    if ($killResumed -ne 'true') {
+        throw "resume returned $killResumed for terminated async run $killRunId."
+    }
+
+    $killCompleted = Wait-AsyncRunStatus -RunId $killRunId -ExpectedStatus 'completed' -TimeoutSeconds $TimeoutSeconds
+    if ($killCompleted -notlike 'completed|completed||2') {
+        throw "unexpected completed kill-resume async state: $killCompleted"
+    }
+
+    $killFinalShape = Invoke-Sql -Quiet -Sql @"
+SELECT r.tables_total::text || ';' ||
+       r.tables_matched::text || ';' ||
+       r.tables_differ::text || ';' ||
+       string_agg(tr.table_name || ':' || tr.verdict, ',' ORDER BY tr.table_name)
+FROM pgl_validate.run r
+JOIN pgl_validate.table_result tr USING (run_id)
+WHERE r.run_id = $killRunId::bigint
+GROUP BY r.run_id;
+"@
+    if ($killFinalShape -ne '2;2;0;async_kill_a:match,async_kill_b:match') {
+        throw "unexpected kill-resume final shape: $killFinalShape"
+    }
+
+    Write-Output "terminated async worker resume preserved committed progress on pg${PgMajor}: run_id=$killRunId state=$killCompleted"
 
     Write-Step 'Validating explicit-table async resume preserves committed table progress'
     Invoke-Sql -Quiet -Sql @"

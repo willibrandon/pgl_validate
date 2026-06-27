@@ -140,6 +140,7 @@ fn run_worker_task(task_id: i32) -> Result<(), String> {
 
     for (index, table_name) in table_names.iter().enumerate() {
         run_one_table(task_id, table_name)?;
+        maybe_sleep_once_after_table(task_id, index + 1)?;
         maybe_fail_once_after_table(task_id, index + 1)?;
     }
 
@@ -198,6 +199,8 @@ fn run_one_table(task_id: i32, table_name: &str) -> Result<(), String> {
                 (
                     COALESCE(task.request->'options', '{{}}'::jsonb)
                     - '_pgl_validate_worker_fail_once_after_tables'
+                    - '_pgl_validate_worker_sleep_once_after_tables'
+                    - '_pgl_validate_worker_sleep_once_ms'
                 ) || jsonb_build_object(
                     'async', true,
                     '_pgl_validate_parent_run_id', task.run_id,
@@ -209,6 +212,70 @@ fn run_one_table(task_id: i32, table_name: &str) -> Result<(), String> {
         ))
     })
     .map_err(|err| format!("worker task table {table_name} failed: {err}"))
+}
+
+fn maybe_sleep_once_after_table(task_id: i32, completed_tables: usize) -> Result<(), String> {
+    let sleep_after = BackgroundWorker::transaction(|| {
+        Spi::get_one::<i32>(&format!(
+            "
+            SELECT NULLIF(
+                       wt.request->'options'->>'_pgl_validate_worker_sleep_once_after_tables',
+                       ''
+                   )::int
+            FROM pgl_validate.worker_task wt
+            WHERE wt.task_id = {task_id}
+            "
+        ))
+    })
+    .map_err(|err| format!("could not read worker sleep-injection table count: {err}"))?;
+
+    if sleep_after != Some(completed_tables as i32) {
+        return Ok(());
+    }
+
+    let sleep_ms = BackgroundWorker::transaction(|| {
+        Spi::get_one::<i32>(&format!(
+            "
+            SELECT NULLIF(
+                       wt.request->'options'->>'_pgl_validate_worker_sleep_once_ms',
+                       ''
+                   )::int
+            FROM pgl_validate.worker_task wt
+            WHERE wt.task_id = {task_id}
+            "
+        ))
+    })
+    .map_err(|err| format!("could not read worker sleep-injection duration: {err}"))?
+    .unwrap_or(0);
+
+    if !(1..=60000).contains(&sleep_ms) {
+        return Err("_pgl_validate_worker_sleep_once_ms must be between 1 and 60000".to_string());
+    }
+
+    BackgroundWorker::transaction(|| {
+        Spi::run(&format!(
+            "
+            UPDATE pgl_validate.worker_task wt
+            SET request = jsonb_set(
+                wt.request,
+                '{{options}}',
+                COALESCE(wt.request->'options', '{{}}'::jsonb)
+                    - '_pgl_validate_worker_sleep_once_after_tables'
+                    - '_pgl_validate_worker_sleep_once_ms',
+                true
+            )
+            WHERE wt.task_id = {task_id}
+            "
+        ))
+    })
+    .map_err(|err| format!("could not clear worker sleep-injection option: {err}"))?;
+
+    BackgroundWorker::transaction(|| {
+        Spi::run(&format!(
+            "SELECT pg_sleep(({sleep_ms})::double precision / 1000.0)"
+        ))
+    })
+    .map_err(|err| format!("worker sleep-injection interrupted: {err}"))
 }
 
 fn maybe_fail_once_after_table(task_id: i32, completed_tables: usize) -> Result<(), String> {
