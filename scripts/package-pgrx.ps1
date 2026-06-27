@@ -111,26 +111,36 @@ function Invoke-PglPackage {
 }
 
 function Test-PglPackageLayout {
-    param([string] $PackageDirectory)
+    param(
+        [string] $PackageDirectory,
+        [string] $Version
+    )
 
-    $control = Join-Path (Join-Path $PackageDirectory 'share') 'extension'
-    $control = Join-Path $control 'pgl_validate.control'
-    if (-not (Test-Path -LiteralPath $control)) {
-        throw "Package is missing $control."
+    $controlMatches = @(
+        Get-ChildItem -LiteralPath $PackageDirectory -Recurse -File -Filter 'pgl_validate.control' -ErrorAction SilentlyContinue
+    )
+    if ($controlMatches.Count -eq 0) {
+        throw "Package is missing pgl_validate.control under $PackageDirectory."
+    }
+    if ($controlMatches.Count -gt 1) {
+        throw "Package contains multiple pgl_validate.control files: $($controlMatches.FullName -join ', ')."
     }
 
-    $sql = Get-ChildItem -LiteralPath (Split-Path -Parent $control) -Filter 'pgl_validate--*.sql' |
-        Select-Object -First 1
-    if (-not $sql) {
-        throw "Package is missing the generated extension SQL."
+    $extensionDirectory = Split-Path -Parent $controlMatches[0].FullName
+    $sql = Join-Path $extensionDirectory "pgl_validate--$Version.sql"
+    if (-not (Test-Path -LiteralPath $sql)) {
+        throw "Package is missing the generated extension SQL $sql."
     }
 
-    $libraryDirectory = Join-Path $PackageDirectory 'lib'
-    $library = Get-ChildItem -LiteralPath $libraryDirectory -Filter 'pgl_validate.*' -ErrorAction SilentlyContinue |
-        Where-Object { $_.Extension -in @('.dll', '.so', '.dylib') } |
-        Select-Object -First 1
-    if (-not $library) {
-        throw "Package is missing the pgl_validate shared library under $libraryDirectory."
+    $libraries = @(
+        Get-ChildItem -LiteralPath $PackageDirectory -Recurse -File -Filter 'pgl_validate.*' -ErrorAction SilentlyContinue |
+            Where-Object { $_.Extension -in @('.dll', '.so', '.dylib') }
+    )
+    if ($libraries.Count -eq 0) {
+        throw "Package is missing the pgl_validate shared library under $PackageDirectory."
+    }
+    if ($libraries.Count -gt 1) {
+        throw "Package contains multiple pgl_validate shared libraries: $($libraries.FullName -join ', ')."
     }
 
     foreach ($rootFile in @('LICENSE', 'README.md')) {
@@ -165,7 +175,7 @@ New-Item -ItemType Directory -Force -Path $ArtifactDir | Out-Null
 Invoke-PglPackage -PgConfig $pgConfig -PackageDirectory $packageDirectory
 Copy-Item -LiteralPath (Join-Path $root 'LICENSE') -Destination (Join-Path $packageDirectory 'LICENSE') -Force
 Copy-Item -LiteralPath (Join-Path $root 'README.md') -Destination (Join-Path $packageDirectory 'README.md') -Force
-Test-PglPackageLayout -PackageDirectory $packageDirectory
+Test-PglPackageLayout -PackageDirectory $packageDirectory -Version $version
 
 Compress-Archive -LiteralPath $packageDirectory -DestinationPath $archivePath -CompressionLevel Optimal
 
