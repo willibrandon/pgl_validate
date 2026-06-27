@@ -2,7 +2,7 @@
 
 ## Complete Technical Design Document
 
-**Status:** Proposed (v4 — supersedes v1/v2/v3; see the version note. v4 makes barrier convergence edge-specific and exact, fixes the `row_digest` signature, gates approximate filters, and adds a validation-strength matrix.)
+**Status:** Implementation-tracking (v4 — supersedes v1/v2/v3; current code and CI are expected to match this document. v4 makes barrier convergence edge-specific and exact, fixes the `row_digest` signature, gates approximate filters, and adds a validation-strength matrix.)
 **Component:** `pgl_validate` — a standalone PostgreSQL extension (Rust / [pgrx](https://github.com/pgcentralfoundation/pgrx))
 **Targets:** PostgreSQL 15, 16, 17, 18
 **Primary use case:** pglogical bidirectional (multi-master) replication. Native logical replication and physical standbys are designed as explicit secondary modes.
