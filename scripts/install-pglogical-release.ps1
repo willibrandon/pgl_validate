@@ -73,6 +73,20 @@ function Get-PglogicalReleaseTag {
 
 <#
 .SYNOPSIS
+Returns GitHub API headers, authenticated when CI provides a token.
+#>
+function Get-GitHubApiHeaders {
+    $headers = @{ 'User-Agent' = 'pgl_validate-ci/1.0' }
+    if (-not [string]::IsNullOrWhiteSpace($env:GITHUB_TOKEN)) {
+        $headers['Authorization'] = "Bearer $env:GITHUB_TOKEN"
+        $headers['X-GitHub-Api-Version'] = '2022-11-28'
+    }
+
+    return $headers
+}
+
+<#
+.SYNOPSIS
 Returns the commit SHA referenced by a GitHub tag or branch.
 #>
 function Get-GitHubRefCommit {
@@ -81,7 +95,7 @@ function Get-GitHubRefCommit {
         [string] $Ref
     )
 
-    $headers = @{ 'User-Agent' = 'pgl_validate-ci/1.0' }
+    $headers = Get-GitHubApiHeaders
     $refUri = "https://api.github.com/repos/$Repository/git/ref/tags/$Ref"
     try {
         $refObject = Invoke-RestMethod -Uri $refUri -Headers $headers
@@ -126,7 +140,7 @@ function Save-GitHubSourceArchive {
     }
 
     $tarballUri = "https://api.github.com/repos/$Repository/tarball/$Ref"
-    Invoke-WebRequest -Uri $tarballUri -OutFile $Destination -UserAgent 'pgl_validate-ci/1.0'
+    Invoke-WebRequest -Uri $tarballUri -OutFile $Destination -Headers (Get-GitHubApiHeaders)
     Write-Host "Downloaded $Repository@$Ref ($commit)"
 }
 
@@ -378,9 +392,15 @@ function Install-PglogicalSource {
         throw 'make is required to build pglogical from source.'
     }
 
+    $pkglibDir = & $PgConfig --pkglibdir
+    $privateLibFlags = "-L$pkglibDir"
+    if (-not [string]::IsNullOrWhiteSpace($env:LDFLAGS_EX)) {
+        $privateLibFlags = "$env:LDFLAGS_EX $privateLibFlags"
+    }
+
     Push-Location $sourceRoot.FullName
     try {
-        & $make "PG_CONFIG=$PgConfig" install
+        & $make "PG_CONFIG=$PgConfig" "LDFLAGS_EX=$privateLibFlags" install
         if ($LASTEXITCODE -ne 0) {
             throw 'pglogical source install failed.'
         }

@@ -262,6 +262,8 @@ jobs:
         run: ./scripts/pgrx-vs.ps1 pwsh -NoProfile -ExecutionPolicy Bypass -File ./scripts/ci-setup.ps1 -PgMajor ${{ matrix.pg }}
 
       - name: Install vanilla pglogical source
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: >
           ./scripts/pgrx-vs.ps1 pwsh -NoProfile -ExecutionPolicy Bypass
           -File ./scripts/install-pglogical-release.ps1
