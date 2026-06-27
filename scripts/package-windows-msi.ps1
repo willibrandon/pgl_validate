@@ -101,6 +101,29 @@ function Test-PglWindowsPackageLayout {
     }
 }
 
+function Assert-PglNoInstalledMsiProduct {
+    <#
+    .SYNOPSIS
+        Refuses verification when the same PG-major MSI product is already installed.
+    #>
+    $uninstallRoots = @(
+        'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*',
+        'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*',
+        'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
+    )
+    $displayPattern = "pgl_validate * for PostgreSQL $PgMajor"
+    $installed = foreach ($rootPath in $uninstallRoots) {
+        Get-ItemProperty -Path $rootPath -ErrorAction SilentlyContinue |
+            Where-Object { $_.DisplayName -like $displayPattern } |
+            Select-Object -First 1
+    }
+
+    if ($installed) {
+        $names = ($installed | ForEach-Object { $_.DisplayName } | Sort-Object -Unique) -join ', '
+        throw "-VerifyInstall refuses to replace an existing MSI install for PostgreSQL ${PgMajor}: $names"
+    }
+}
+
 function Invoke-PglMsiInstallVerification {
     <#
     .SYNOPSIS
@@ -111,6 +134,8 @@ function Invoke-PglMsiInstallVerification {
     $pgRoot = Join-Path $ArtifactDir "msi-verify-pg$PgMajor"
     $installLog = Join-Path $ArtifactDir "pgl_validate-pg$PgMajor-msi-install.log"
     $uninstallLog = Join-Path $ArtifactDir "pgl_validate-pg$PgMajor-msi-uninstall.log"
+    Assert-PglNoInstalledMsiProduct
+
     if (Test-Path -LiteralPath $pgRoot) {
         Remove-Item -LiteralPath $pgRoot -Recurse -Force
     }
