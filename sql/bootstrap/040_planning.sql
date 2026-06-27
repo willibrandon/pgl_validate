@@ -594,6 +594,132 @@ BEGIN
 END
 $$;
 
+-- Generate a checksum SQL statement for one keyless hash bucket. This is used
+-- when no comparison key exists: it bounds impact reporting by row-digest
+-- bucket without pretending row-level localization is possible.
+CREATE FUNCTION pgl_validate.plan_keyless_bucket_sql(
+    rel regclass,
+    bucket_count integer,
+    bucket_index integer,
+    cols text[],
+    row_filter_sql text DEFAULT NULL,
+    include_set_hash boolean DEFAULT false,
+    hash_algorithm text DEFAULT NULL
+)
+RETURNS text
+LANGUAGE plpgsql
+STABLE
+AS $$
+DECLARE
+    rel_sql text;
+    enc_modes int[];
+    digest_args text;
+    row_digest_expr text;
+    selected_cols text[];
+    filter_sql text;
+    effective_hash_algorithm text;
+    settings_cte text;
+BEGIN
+    IF bucket_count IS NULL OR bucket_count < 1 OR bucket_count > 256 THEN
+        RAISE EXCEPTION 'bucket_count must be between 1 and 256'
+            USING ERRCODE = '22023';
+    END IF;
+    IF bucket_index IS NULL OR bucket_index < 0 OR bucket_index >= bucket_count THEN
+        RAISE EXCEPTION 'bucket_index must be in 0..bucket_count-1'
+            USING ERRCODE = '22023';
+    END IF;
+
+    SELECT format('%I.%I', n.nspname, c.relname)
+    INTO rel_sql
+    FROM pg_class c
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE c.oid = rel;
+
+    IF rel_sql IS NULL THEN
+        RAISE EXCEPTION 'relation % does not exist', rel;
+    END IF;
+
+    IF cols IS NULL OR cardinality(cols) = 0 THEN
+        SELECT array_agg(a.attname ORDER BY a.attname)
+        INTO selected_cols
+        FROM pg_attribute a
+        WHERE a.attrelid = rel
+          AND a.attnum > 0
+          AND NOT a.attisdropped;
+    ELSE
+        SELECT array_agg(a.attname ORDER BY a.attname)
+        INTO selected_cols
+        FROM unnest(cols) requested(col_name)
+        JOIN pg_attribute a
+          ON a.attrelid = rel
+         AND a.attname = requested.col_name
+         AND a.attnum > 0
+         AND NOT a.attisdropped;
+
+        IF cardinality(selected_cols) IS DISTINCT FROM cardinality(cols) THEN
+            RAISE EXCEPTION 'one or more requested columns are not present on %', rel::text;
+        END IF;
+    END IF;
+
+    IF selected_cols IS NULL OR cardinality(selected_cols) = 0 THEN
+        RAISE EXCEPTION 'no comparable columns found on %', rel::text;
+    END IF;
+
+    SELECT
+        array_agg(pgl_validate.column_encoding_mode(a.atttypid) ORDER BY a.attname),
+        string_agg(format('t.%I', a.attname), ', ' ORDER BY a.attname)
+    INTO enc_modes, digest_args
+    FROM pg_attribute a
+    WHERE a.attrelid = rel
+      AND a.attname = ANY (selected_cols)
+      AND a.attnum > 0
+      AND NOT a.attisdropped;
+
+    row_digest_expr := format(
+        'pgl_validate.row_digest(%L::int[], %s)',
+        enc_modes::text,
+        digest_args
+    );
+    effective_hash_algorithm := COALESCE(
+        NULLIF(hash_algorithm, ''),
+        NULLIF(current_setting('pgl_validate.hash_algorithm', true), ''),
+        'blake3_256'
+    );
+    IF effective_hash_algorithm NOT IN ('blake3_256','blake3_512') THEN
+        RAISE EXCEPTION 'hash_algorithm % is not implemented; supported values are blake3_256, blake3_512',
+            effective_hash_algorithm
+            USING ERRCODE = '0A000';
+    END IF;
+    settings_cte := pgl_validate.plan_settings_cte(effective_hash_algorithm);
+    filter_sql := CASE
+        WHEN row_filter_sql IS NULL OR btrim(row_filter_sql) = '' THEN 'true'
+        ELSE format('(%s)', row_filter_sql)
+    END;
+
+    IF include_set_hash THEN
+        RETURN format(
+            'WITH %1$s, digests AS MATERIALIZED (SELECT %2$s AS rd FROM pgl_validate_settings, %3$s t WHERE %4$s), bucketed AS MATERIALIZED (SELECT rd FROM digests WHERE mod(get_byte(rd, 0), %5$s) = %6$s), aggregate AS (SELECT count(*)::bigint AS n_rows, pgl_validate.lthash_bytes(pgl_validate.lthash(rd)) AS lthash FROM bucketed) SELECT aggregate.n_rows, aggregate.lthash, (SELECT pgl_validate.hash_digest_array(COALESCE(array_agg(rd ORDER BY rd), ARRAY[]::bytea[])) FROM bucketed) AS set_hash FROM aggregate',
+            settings_cte,
+            row_digest_expr,
+            rel_sql,
+            filter_sql,
+            bucket_count,
+            bucket_index
+        );
+    END IF;
+
+    RETURN format(
+        'WITH %1$s, digests AS MATERIALIZED (SELECT %2$s AS rd FROM pgl_validate_settings, %3$s t WHERE %4$s), bucketed AS MATERIALIZED (SELECT rd FROM digests WHERE mod(get_byte(rd, 0), %5$s) = %6$s) SELECT count(*)::bigint AS n_rows, pgl_validate.lthash_bytes(pgl_validate.lthash(rd)) AS lthash, NULL::bytea AS set_hash FROM bucketed',
+        settings_cte,
+        row_digest_expr,
+        rel_sql,
+        filter_sql,
+        bucket_count,
+        bucket_index
+    );
+END
+$$;
+
 -- Generate the diagnostic-only pglogical row-filter SQL used for
 -- session-sensitive filters. This intentionally calls pglogical's own
 -- table_data_filtered() function instead of the exact path's deparsed

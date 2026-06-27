@@ -523,6 +523,10 @@ DECLARE
     chunk_set_hash bytea;
     chunk_started_at_value timestamptz;
     chunk_elapsed interval;
+    keyless_bucket_count int := 0;
+    keyless_bucket_index int;
+    keyless_divergent_bucket_count int := 0;
+    keyless_bucket_descriptor bytea;
     differ_count int := 0;
     confirmed_count int := 0;
     advisory_count int := 0;
@@ -2860,6 +2864,165 @@ BEGIN
     END IF;
 
     IF differ_count > 0
+       AND (key_cols IS NULL OR cardinality(key_cols) = 0) THEN
+        keyless_bucket_count := LEAST(256, GREATEST(2, split_fanout));
+
+        SELECT COALESCE(max(cr.chunk_id), 1)
+        INTO next_chunk_id
+        FROM pgl_validate.chunk_result cr
+        WHERE cr.run_id = v_run_id
+          AND cr.schema_name = v_schema_name
+          AND cr.table_name = v_rel_name;
+
+        FOR keyless_bucket_index IN 0..(keyless_bucket_count - 1) LOOP
+            next_chunk_id := next_chunk_id + 1;
+            child_chunk_id := next_chunk_id;
+            keyless_bucket_descriptor := convert_to(
+                jsonb_build_object(
+                    'kind', 'keyless_hash_bucket',
+                    'bucket', keyless_bucket_index,
+                    'buckets', keyless_bucket_count
+                )::text,
+                'UTF8'
+            );
+
+            PERFORM pgl_validate.throttle_replication_lag(
+                v_run_id,
+                v_schema_name,
+                v_rel_name,
+                provider_node,
+                provider_dsn,
+                current_edge_ids,
+                throttle_max_lag,
+                fence_timeout_ms,
+                fence_poll_interval_ms
+            );
+
+            INSERT INTO pgl_validate.chunk_result(
+                run_id, schema_name, table_name, chunk_id, parent_id, lo, hi, state, updated_at
+            )
+            VALUES (
+                v_run_id,
+                v_schema_name,
+                v_rel_name,
+                child_chunk_id,
+                1,
+                keyless_bucket_descriptor,
+                NULL,
+                'running',
+                now()
+            )
+            ON CONFLICT (run_id, schema_name, table_name, chunk_id) DO UPDATE
+            SET parent_id = EXCLUDED.parent_id,
+                lo = EXCLUDED.lo,
+                hi = EXCLUDED.hi,
+                state = EXCLUDED.state,
+                updated_at = EXCLUDED.updated_at;
+
+            checksum_sql := pgl_validate.plan_keyless_bucket_sql(
+                p_table_name,
+                keyless_bucket_count,
+                keyless_bucket_index,
+                cols,
+                row_filter_sql,
+                false,
+                hash_algorithm
+            );
+            previous_statement_timeout := current_setting('statement_timeout');
+            PERFORM set_config('statement_timeout', statement_timeout_per_chunk_ms::text, true);
+            BEGIN
+                EXECUTE checksum_sql INTO chunk_n_rows, chunk_lthash, chunk_set_hash;
+            EXCEPTION WHEN others THEN
+                PERFORM set_config('statement_timeout', previous_statement_timeout, true);
+                RAISE;
+            END;
+            PERFORM set_config('statement_timeout', previous_statement_timeout, true);
+
+            INSERT INTO pgl_validate.chunk_node_result(
+                run_id, schema_name, table_name, chunk_id, node, n_rows, lthash
+            )
+            VALUES (
+                v_run_id,
+                v_schema_name,
+                v_rel_name,
+                child_chunk_id,
+                'local',
+                chunk_n_rows,
+                chunk_lthash
+            )
+            ON CONFLICT (run_id, schema_name, table_name, chunk_id, node) DO UPDATE
+            SET n_rows = EXCLUDED.n_rows,
+                lthash = EXCLUDED.lthash;
+
+            chunk_differ_count := 0;
+            remote_checksum_sql := pgl_validate.plan_keyless_bucket_sql(
+                p_table_name,
+                keyless_bucket_count,
+                keyless_bucket_index,
+                cols,
+                NULL,
+                false,
+                hash_algorithm
+            );
+
+            FOR peer_rec IN
+                SELECT p.name, p.dsn, p.backend,
+                       p.connect_timeout_seconds,
+                       p.statement_timeout_ms,
+                       p.lock_timeout_ms
+                FROM pgl_validate.peer p
+                WHERE p.name = ANY (peer_names)
+                ORDER BY p.name
+            LOOP
+                SELECT rc.pg_version, rc.n_rows, rc.lthash, rc.set_hash
+                INTO remote_rec
+                FROM pgl_validate.remote_checksum(
+                    peer_rec.dsn,
+                    remote_checksum_sql,
+                    peer_rec.connect_timeout_seconds,
+                    LEAST(peer_rec.statement_timeout_ms, statement_timeout_per_chunk_ms),
+                    peer_rec.lock_timeout_ms
+                ) AS rc;
+
+                INSERT INTO pgl_validate.chunk_node_result(
+                    run_id, schema_name, table_name, chunk_id, node, n_rows, lthash
+                )
+                VALUES (
+                    v_run_id,
+                    v_schema_name,
+                    v_rel_name,
+                    child_chunk_id,
+                    peer_rec.name,
+                    remote_rec.n_rows,
+                    remote_rec.lthash
+                )
+                ON CONFLICT (run_id, schema_name, table_name, chunk_id, node) DO UPDATE
+                SET n_rows = EXCLUDED.n_rows,
+                    lthash = EXCLUDED.lthash;
+
+                IF remote_rec.n_rows IS DISTINCT FROM chunk_n_rows
+                   OR remote_rec.lthash IS DISTINCT FROM chunk_lthash THEN
+                    chunk_differ_count := chunk_differ_count + 1;
+                END IF;
+            END LOOP;
+
+            IF chunk_differ_count > 0 THEN
+                keyless_divergent_bucket_count := keyless_divergent_bucket_count + 1;
+            END IF;
+
+            UPDATE pgl_validate.chunk_result cr
+            SET state = CASE WHEN chunk_differ_count = 0 THEN 'clean' ELSE 'divergent' END,
+                updated_at = now()
+            WHERE cr.run_id = v_run_id
+              AND cr.schema_name = v_schema_name
+              AND cr.table_name = v_rel_name
+              AND cr.chunk_id = child_chunk_id;
+
+            planned_chunk_count := planned_chunk_count + 1;
+        END LOOP;
+    END IF;
+
+    IF differ_count > 0
        AND NOT degraded_mode
        AND key_cols IS NOT NULL
        AND cardinality(key_cols) > 0 THEN
@@ -3682,12 +3845,23 @@ BEGIN
         END IF;
     ELSIF key_cols IS NULL OR cardinality(key_cols) = 0 THEN
         verdict := 'differ';
-        result_reason := format(
-            '%s of %s remote peer(s) differ from local; whole-relation checksum/count differ; row-level localization unavailable without a key; validated_property=%s',
-            differ_count,
-            participant_count - 1,
-            validated_property
-        );
+        IF keyless_bucket_count > 0 THEN
+            result_reason := format(
+                '%s of %s remote peer(s) differ from local; whole-relation checksum/count differ; %s of %s keyless hash bucket(s) differ; row-level localization unavailable without a key; validated_property=%s',
+                differ_count,
+                participant_count - 1,
+                keyless_divergent_bucket_count,
+                keyless_bucket_count,
+                validated_property
+            );
+        ELSE
+            result_reason := format(
+                '%s of %s remote peer(s) differ from local; whole-relation checksum/count differ; row-level localization unavailable without a key; validated_property=%s',
+                differ_count,
+                participant_count - 1,
+                validated_property
+            );
+        END IF;
     ELSIF confirmed_count > 0 THEN
         verdict := 'differ';
         result_reason := format(

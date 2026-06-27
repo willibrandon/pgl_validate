@@ -101,6 +101,8 @@ COMMENT ON FUNCTION pgl_validate.plan_schema_signature_sql(text, text, text[], t
     'Generate remote SQL that returns a relation contract schema_signature without failing on a missing remote relation.';
 COMMENT ON FUNCTION pgl_validate.plan_chunk_sql(regclass, text[], bytea, bytea, text[], text[], text, boolean, text) IS
     'Generate planner-visible SQL for a table chunk checksum and optional cryptographic set confirmation.';
+COMMENT ON FUNCTION pgl_validate.plan_keyless_bucket_sql(regclass, integer, integer, text[], text, boolean, text) IS
+    'Generate planner-visible checksum SQL for one keyless row-digest bucket.';
 COMMENT ON FUNCTION pgl_validate.plan_pglogical_filtered_sql(regclass, text[], text[], boolean, text) IS
     'Generate diagnostic-only checksum SQL using pglogical.table_data_filtered for session-sensitive row filters.';
 COMMENT ON FUNCTION pgl_validate.plan_localize_sql(regclass, text[], bytea, bytea, text[], text, text) IS

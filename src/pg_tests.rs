@@ -3712,7 +3712,7 @@ mod tests {
         .unwrap();
 
         let run_sql = format!(
-            "SELECT (pgl_validate.compare_table({}::regclass)).run_id",
+            "SELECT (pgl_validate.compare_table({}::regclass, NULL, '{{\"split_fanout\":4}}'::jsonb)).run_id",
             sql_literal(&format!("public.{table_name}"))
         );
         let match_run_id = Spi::get_one::<i64>(&run_sql).unwrap().unwrap();
@@ -3751,6 +3751,7 @@ mod tests {
             SELECT tr.verdict || ';' ||
                    tp.validated_property || ';' ||
                    (tr.reason LIKE '%whole-relation checksum/count differ%')::text || ';' ||
+                   (tr.reason LIKE '%keyless hash bucket(s) differ%')::text || ';' ||
                    (SELECT count(*)::text
                     FROM pgl_validate.divergence d
                     WHERE d.run_id = tr.run_id) || ';' ||
@@ -3762,6 +3763,22 @@ mod tests {
                     FROM pgl_validate.table_node_result tnr
                     WHERE tnr.run_id = tr.run_id) || ';' ||
                    (SELECT count(*)::text
+                    FROM pgl_validate.chunk_result cr
+                    WHERE cr.run_id = tr.run_id
+                      AND cr.parent_id = 1) || ';' ||
+                   (SELECT count(*)::text
+                    FROM pgl_validate.chunk_node_result cnr
+                    JOIN pgl_validate.chunk_result cr USING (run_id, schema_name, table_name, chunk_id)
+                    WHERE cr.run_id = tr.run_id
+                      AND cr.parent_id = 1) || ';' ||
+                   (SELECT EXISTS (
+                        SELECT 1
+                        FROM pgl_validate.chunk_result cr
+                        WHERE cr.run_id = tr.run_id
+                          AND cr.parent_id = 1
+                          AND cr.state = 'divergent'
+                    )::text) || ';' ||
+                   (SELECT count(*)::text
                     FROM pgl_validate.generate_repair(tr.run_id, 'local'))
             FROM pgl_validate.table_result tr
             JOIN pgl_validate.table_plan tp USING (run_id, schema_name, table_name)
@@ -3770,7 +3787,10 @@ mod tests {
         ))
         .unwrap()
         .unwrap();
-        assert_eq!(differ_contract, "differ;keyless;true;0;true;true;0");
+        assert_eq!(
+            differ_contract,
+            "differ;keyless;true;true;0;true;true;4;8;true;0"
+        );
 
         let _ = crate::transport::libpq::execute_command(
             &local_dsn,
