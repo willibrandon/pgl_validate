@@ -20,10 +20,13 @@ WHERE n.nspname = 'pgl_validate'
       'cleanup_fence_barriers',
       'compare',
       'compare_table',
+      'conflict_evidence',
+      'conflict_summary',
       'generate_repair',
       'hash_digest_array',
       'lthash',
       'metrics',
+      'purge_conflict_evidence',
       'report',
       'row_digest'
   )
@@ -33,13 +36,16 @@ apply_repair|f|bigint, text, text, text, text, boolean|v|u
 cleanup_fence_barriers|f|interval, uuid[]|v|u
 compare|f|regclass[], text, text[], text, jsonb|v|u
 compare_table|f|regclass, text[], jsonb|v|u
+conflict_evidence|f|bigint|s|u
+conflict_summary|f|bigint|s|u
 generate_repair|f|bigint, text|s|u
 hash_digest_array|f|bytea[]|i|s
 lthash|a|bytea|i|s
 metrics|f||s|u
+purge_conflict_evidence|f|timestamp with time zone, bigint|v|u
 report|f|bigint|s|u
 row_digest|f|integer[], "any"|s|s
-(10 rows)
+(13 rows)
 SELECT name, set_config(name, setting, true) AS setting
 FROM (
     VALUES

@@ -19,10 +19,13 @@ WHERE n.nspname = 'pgl_validate'
       'cleanup_fence_barriers',
       'compare',
       'compare_table',
+      'conflict_evidence',
+      'conflict_summary',
       'generate_repair',
       'hash_digest_array',
       'lthash',
       'metrics',
+      'purge_conflict_evidence',
       'report',
       'row_digest'
   )
