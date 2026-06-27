@@ -104,6 +104,11 @@ function Invoke-PglPackage {
         "pg$PgMajor"
     )
 
+    if ($env:PGL_VALIDATE_RUST_TOOLCHAIN -and
+        ($arguments.Count -eq 0 -or -not $arguments[0].StartsWith('+', [StringComparison]::Ordinal))) {
+        $arguments = @("+$env:PGL_VALIDATE_RUST_TOOLCHAIN") + $arguments
+    }
+
     cargo @arguments
     if ($LASTEXITCODE -ne 0) {
         throw "cargo pgrx package exited with code $LASTEXITCODE."

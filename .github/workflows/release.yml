@@ -134,19 +134,53 @@ jobs:
           -VerifyInstall
 
       - name: Upload package artifact
+        id: upload_package_artifact
+        continue-on-error: true
         uses: actions/upload-artifact@v7
         with:
           name: ${{ steps.package.outputs.artifact_name }}
           path: ${{ steps.package.outputs.artifact_path }}
           if-no-files-found: error
+          overwrite: true
+
+      - name: Retry package artifact upload
+        id: retry_upload_package_artifact
+        if: steps.upload_package_artifact.outcome == 'failure'
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.package.outputs.artifact_name }}
+          path: ${{ steps.package.outputs.artifact_path }}
+          if-no-files-found: error
+          overwrite: true
+
+      - name: Check package artifact upload
+        if: steps.upload_package_artifact.outcome == 'failure' && steps.retry_upload_package_artifact.outcome == 'failure'
+        run: throw 'Package artifact upload failed after retry.'
 
       - name: Upload MSI artifact
+        id: upload_msi_artifact
         if: matrix.target.platform == 'windows-x64'
+        continue-on-error: true
         uses: actions/upload-artifact@v7
         with:
           name: ${{ steps.msi.outputs.msi_artifact_name }}
           path: ${{ steps.msi.outputs.msi_artifact_path }}
           if-no-files-found: error
+          overwrite: true
+
+      - name: Retry MSI artifact upload
+        id: retry_upload_msi_artifact
+        if: matrix.target.platform == 'windows-x64' && steps.upload_msi_artifact.outcome == 'failure'
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.msi.outputs.msi_artifact_name }}
+          path: ${{ steps.msi.outputs.msi_artifact_path }}
+          if-no-files-found: error
+          overwrite: true
+
+      - name: Check MSI artifact upload
+        if: matrix.target.platform == 'windows-x64' && steps.upload_msi_artifact.outcome == 'failure' && steps.retry_upload_msi_artifact.outcome == 'failure'
+        run: throw 'MSI artifact upload failed after retry.'
 
   publish-github-release:
     name: publish GitHub release
