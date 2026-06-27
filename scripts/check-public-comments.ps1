@@ -150,9 +150,11 @@ foreach ($match in [regex]::Matches($commentsText, '(?im)^\s*COMMENT\s+ON\s+COLU
 
 $catalogPath = Join-Path $workspace 'sql/bootstrap/001_catalog.sql'
 $catalogText = Get-Content -LiteralPath $catalogPath -Raw
+$catalogTableColumns = @{}
 foreach ($tableMatch in [regex]::Matches($catalogText, '(?ims)^\s*CREATE\s+TABLE\s+pgl_validate\.([a-zA-Z_][a-zA-Z0-9_]*)\s*\((.*?)^\s*\);')) {
     $tableName = $tableMatch.Groups[1].Value
     $body = $tableMatch.Groups[2].Value
+    $tableColumns = New-Object System.Collections.Generic.List[string]
     foreach ($line in ($body -split "`r?`n")) {
         if ($line -notmatch '^\s+([a-zA-Z_][a-zA-Z0-9_]*)\s+') {
             continue
@@ -167,8 +169,54 @@ foreach ($tableMatch in [regex]::Matches($catalogText, '(?ims)^\s*CREATE\s+TABLE
             continue
         }
 
+        [void] $tableColumns.Add($columnName)
         if (-not $commentedColumns.ContainsKey("$tableName.$columnName")) {
             Add-Failure "sql/bootstrap/001_catalog.sql: missing COMMENT ON COLUMN for pgl_validate.$tableName.$columnName."
+        }
+    }
+    $catalogTableColumns[$tableName] = $tableColumns
+}
+
+foreach ($copyMatch in [regex]::Matches($commentsText, "\('([^']+)'\s*,\s*'([^']+)'\)")) {
+    $viewName = $copyMatch.Groups[1].Value
+    $sourceTableName = $copyMatch.Groups[2].Value
+    if (-not $catalogTableColumns.ContainsKey($sourceTableName)) {
+        continue
+    }
+
+    foreach ($columnName in $catalogTableColumns[$sourceTableName]) {
+        $commentedColumns["$viewName.$columnName"] = $true
+    }
+}
+
+foreach ($viewMatch in [regex]::Matches($catalogText, '(?ims)^\s*CREATE\s+OR\s+REPLACE\s+VIEW\s+pgl_validate\.([a-zA-Z_][a-zA-Z0-9_]*)\s+AS\s+SELECT\s+\*\s+FROM\s+pgl_validate\.([a-zA-Z_][a-zA-Z0-9_]*)\s*;')) {
+    $viewName = $viewMatch.Groups[1].Value
+    $sourceTableName = $viewMatch.Groups[2].Value
+    if (-not $catalogTableColumns.ContainsKey($sourceTableName)) {
+        Add-Failure "sql/bootstrap/001_catalog.sql: view pgl_validate.$viewName selects from unknown table pgl_validate.$sourceTableName."
+        continue
+    }
+
+    foreach ($columnName in $catalogTableColumns[$sourceTableName]) {
+        if (-not $commentedColumns.ContainsKey("$viewName.$columnName")) {
+            Add-Failure "sql/bootstrap/001_catalog.sql: missing COMMENT ON COLUMN for pgl_validate.$viewName.$columnName."
+        }
+    }
+}
+
+foreach ($viewMatch in [regex]::Matches($catalogText, '(?ims)^\s*CREATE\s+OR\s+REPLACE\s+VIEW\s+pgl_validate\.run_progress\s+AS\s+.*?^SELECT\s+(.*?)^FROM\s+pgl_validate\.run\s+r', 'Multiline')) {
+    $selectList = $viewMatch.Groups[1].Value
+    $viewColumns = New-Object System.Collections.Generic.HashSet[string]
+    foreach ($columnMatch in [regex]::Matches($selectList, '(?m)^\s*[a-zA-Z_][a-zA-Z0-9_]*\.([a-zA-Z_][a-zA-Z0-9_]*)\s*,?\s*$')) {
+        [void] $viewColumns.Add($columnMatch.Groups[1].Value)
+    }
+    foreach ($aliasMatch in [regex]::Matches($selectList, '(?im)\bAS\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*,?\s*$')) {
+        [void] $viewColumns.Add($aliasMatch.Groups[1].Value)
+    }
+
+    foreach ($columnName in $viewColumns) {
+        if (-not $commentedColumns.ContainsKey("run_progress.$columnName")) {
+            Add-Failure "sql/bootstrap/001_catalog.sql: missing COMMENT ON COLUMN for pgl_validate.run_progress.$columnName."
         }
     }
 }
