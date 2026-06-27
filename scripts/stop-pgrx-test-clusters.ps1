@@ -65,44 +65,6 @@ function Get-DataDirectoryPid {
     return $null
 }
 
-function Get-DataDirectoryMajor {
-    param([string] $DataDirectory)
-
-    $versionFile = Join-Path $DataDirectory 'PG_VERSION'
-    if (-not (Test-Path -LiteralPath $versionFile)) {
-        return $null
-    }
-
-    $version = (Get-Content -LiteralPath $versionFile -TotalCount 1).Trim()
-    if (-not $version) {
-        return $null
-    }
-
-    return $version.Split('.')[0]
-}
-
-function Get-PgCtl {
-    param([string] $DataDirectory)
-
-    $major = Get-DataDirectoryMajor -DataDirectory $DataDirectory
-    if ($major) {
-        try {
-            $pgConfig = Get-PglPgrxPgConfig -PgMajor ([int] $major)
-            return Get-PglToolPath -PgConfig $pgConfig -Name 'pg_ctl'
-        }
-        catch {
-            Write-Verbose "Could not resolve pg_ctl from pgrx pg$major; falling back to PATH."
-        }
-    }
-
-    $fromPath = Get-PglCommandSource -Name 'pg_ctl'
-    if ($fromPath) {
-        return $fromPath
-    }
-
-    return $null
-}
-
 function Stop-DataDirectoryCluster {
     [CmdletBinding(SupportsShouldProcess)]
     param([string] $DataDirectory)
@@ -116,12 +78,6 @@ function Stop-DataDirectoryCluster {
     }
 
     $postmasterPid = Get-DataDirectoryPid -DataDirectory $DataDirectory
-    $pgCtl = Get-PgCtl -DataDirectory $DataDirectory
-
-    if ($pgCtl) {
-        & $pgCtl stop -D $DataDirectory -m fast -w -t 30 2>$null
-    }
-
     if ($postmasterPid -and (Get-Process -Id $postmasterPid -ErrorAction SilentlyContinue)) {
         Stop-ProcessTree -ProcessId $postmasterPid
     }
@@ -230,3 +186,4 @@ if ($RemoveData) {
 }
 
 $global:LASTEXITCODE = 0
+[Environment]::ExitCode = 0
