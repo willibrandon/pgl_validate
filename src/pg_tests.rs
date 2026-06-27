@@ -324,6 +324,90 @@ mod tests {
     }
 
     #[pg_test]
+    fn lthash_aggregate_matches_with_parallel_workers_enabled() {
+        let backend_pid = Spi::get_one::<i32>("SELECT pg_backend_pid()")
+            .unwrap()
+            .unwrap();
+        let table_name = identifier(&format!("pgl_validate_parallel_lthash_{backend_pid}"));
+
+        Spi::run(&format!(
+            "
+            CREATE TABLE public.{table_name}(
+                id int PRIMARY KEY,
+                payload text NOT NULL
+            );
+            INSERT INTO public.{table_name}
+            SELECT g, md5(g::text)
+            FROM generate_series(1, 20000) AS g;
+            ALTER TABLE public.{table_name} SET (parallel_workers = 4);
+            ANALYZE public.{table_name};
+            "
+        ))
+        .unwrap();
+
+        let aggregate_sql = format!(
+            "
+            SELECT encode(
+                pgl_validate.lthash_bytes(
+                    pgl_validate.lthash(pgl_validate.row_digest(ARRAY[1,2], id, payload))
+                ),
+                'hex'
+            )
+            FROM public.{table_name}
+            "
+        );
+
+        Spi::run("SET LOCAL max_parallel_workers_per_gather = 0").unwrap();
+        let serial = Spi::get_one::<String>(&aggregate_sql).unwrap().unwrap();
+
+        Spi::run(
+            "
+            SET LOCAL max_parallel_workers_per_gather = 4;
+            SET LOCAL min_parallel_table_scan_size = 0;
+            SET LOCAL min_parallel_index_scan_size = 0;
+            SET LOCAL parallel_setup_cost = 0;
+            SET LOCAL parallel_tuple_cost = 0;
+            SET LOCAL enable_indexscan = off;
+            SET LOCAL enable_indexonlyscan = off;
+            SET LOCAL enable_bitmapscan = off;
+            ",
+        )
+        .unwrap();
+
+        Spi::run(&format!(
+            "
+            CREATE TEMP TABLE pgl_validate_parallel_lthash_plan(plan text);
+            DO $pgl_validate_explain$
+            DECLARE
+                plan_line text;
+            BEGIN
+                FOR plan_line IN EXECUTE $pgl_validate_query$
+                    EXPLAIN (COSTS OFF)
+                    {aggregate_sql}
+                $pgl_validate_query$ LOOP
+                    INSERT INTO pgl_validate_parallel_lthash_plan VALUES (plan_line);
+                END LOOP;
+            END
+            $pgl_validate_explain$;
+            "
+        ))
+        .unwrap();
+
+        let parallel_plan = Spi::get_one::<String>(
+            "SELECT string_agg(plan, E'\n') FROM pgl_validate_parallel_lthash_plan",
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            parallel_plan.contains("Gather") || parallel_plan.contains("Parallel Seq Scan"),
+            "expected a parallel aggregate plan, got:\n{parallel_plan}"
+        );
+
+        let parallel = Spi::get_one::<String>(&aggregate_sql).unwrap().unwrap();
+        assert_eq!(serial, parallel);
+    }
+
+    #[pg_test]
     fn plan_chunk_sql_sorts_columns_and_uses_variadic_row_digest() {
         Spi::run(
             r#"
