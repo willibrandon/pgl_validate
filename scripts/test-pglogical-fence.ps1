@@ -843,6 +843,7 @@ WHERE tp.run_id = $truncateRunId
 
     Write-Step 'Validating bidirectional pglogical fence vector'
     Invoke-Sql -Database 'target' -Sql 'SELECT pgl_validate.ensure_pglogical_barrier_repset()' | Out-Null
+    Invoke-Sql -Database 'fanout' -Sql 'SELECT pgl_validate.ensure_pglogical_barrier_repset()' | Out-Null
     Invoke-Sql -Database 'provider' -Sql @"
 CREATE TABLE public.bidir_accounts(id int PRIMARY KEY, value text);
 SELECT pglogical.create_replication_set('pgl_validate_bidir');
@@ -854,10 +855,26 @@ SELECT pglogical.create_replication_set('pgl_validate_bidir');
 SELECT pglogical.replication_set_add_table('pgl_validate_bidir', 'public.bidir_accounts'::regclass, false);
 SELECT pglogical.alter_subscription_add_replication_set('sub', 'pgl_validate_bidir');
 "@ | Out-Null
+    Invoke-Sql -Database 'fanout' -Sql @"
+CREATE TABLE public.bidir_accounts(id int PRIMARY KEY, value text);
+SELECT pglogical.create_replication_set('pgl_validate_bidir');
+SELECT pglogical.replication_set_add_table('pgl_validate_bidir', 'public.bidir_accounts'::regclass, false);
+SELECT pglogical.alter_subscription_add_replication_set('sub_fanout', 'pgl_validate_bidir');
+"@ | Out-Null
     Invoke-Sql -Database 'provider' -Sql @"
 SELECT pglogical.create_subscription(
     'sub_from_target',
     $targetDsnSql,
+    ARRAY['pgl_validate_bidir','pgl_validate_barrier'],
+    false,
+    true,
+    ARRAY[]::text[]
+)
+"@ | Out-Null
+    Invoke-Sql -Database 'provider' -Sql @"
+SELECT pglogical.create_subscription(
+    'sub_from_fanout',
+    $fanoutDsnSql,
     ARRAY['pgl_validate_bidir','pgl_validate_barrier'],
     false,
     true,
@@ -869,9 +886,19 @@ SELECT pglogical.create_subscription(
         -SubscriptionName 'sub_from_target' `
         -ProviderDatabase 'target' `
         -TimeoutSeconds $TimeoutSeconds
+    $fanoutReverseSlotName = Wait-SubscriptionReady `
+        -SubscriberDatabase 'provider' `
+        -SubscriptionName 'sub_from_fanout' `
+        -ProviderDatabase 'fanout' `
+        -TimeoutSeconds $TimeoutSeconds
     Wait-SqlEquals `
         -Database 'provider' `
         -Sql "SELECT COALESCE((SELECT left(status, 1) FROM pglogical.show_subscription_table('sub_from_target'::name, 'public.bidir_accounts'::regclass)), '<missing>')" `
+        -Expected 'r' `
+        -TimeoutSeconds $TimeoutSeconds
+    Wait-SqlEquals `
+        -Database 'provider' `
+        -Sql "SELECT COALESCE((SELECT left(status, 1) FROM pglogical.show_subscription_table('sub_from_fanout'::name, 'public.bidir_accounts'::regclass)), '<missing>')" `
         -Expected 'r' `
         -TimeoutSeconds $TimeoutSeconds
 
@@ -881,11 +908,17 @@ SET replication_sets = ARRAY['pgl_validate_bidir'],
     reverse_subscription_name = 'sub_from_target'
 WHERE name = 'target'
 "@ | Out-Null
+    Invoke-Sql -Database 'provider' -Sql @"
+UPDATE pgl_validate.peer
+SET replication_sets = ARRAY['pgl_validate_bidir'],
+    reverse_subscription_name = 'sub_from_fanout'
+WHERE name = 'fanout'
+"@ | Out-Null
     $bidirectionalResult = Invoke-Sql -Database 'provider' -Sql @"
 SELECT run_id::text || ';' || verdict
 FROM pgl_validate.compare_table(
     'public.bidir_accounts'::regclass,
-    ARRAY['target'],
+    ARRAY['target','fanout'],
     jsonb_build_object(
         'provider_dsn', $providerDsnSql,
         'provider_node', 'provider',
@@ -909,16 +942,16 @@ FROM pgl_validate.compare_table(
 SELECT
     count(*) FILTER (
         WHERE re.provider_node = 'provider'
-          AND re.target_node = 'target'
+          AND re.target_node IN ('target','fanout')
           AND fa.status = 'converged'
     )::text || ';' ||
     count(*) FILTER (
-        WHERE re.provider_node = 'target'
+        WHERE re.provider_node IN ('target','fanout')
           AND re.target_node = 'provider'
           AND fa.status = 'converged'
     )::text || ';' ||
     count(*) FILTER (
-        WHERE br.origin_node = 'target'
+        WHERE br.origin_node IN ('target','fanout')
     )::text
 FROM pgl_validate.run_edge re
 JOIN pgl_validate.fence_attempt fa USING (run_id, edge_id)
@@ -927,14 +960,14 @@ WHERE re.run_id = $bidirectionalRunId
   AND re.backend = 'pglogical'
   AND fa.epoch_seq = 1
 "@
-    if ($bidirectionalFenceShape -ne '1;1;1') {
-        throw "bidirectional pglogical fence vector was not recorded: $bidirectionalFenceShape using reverse slot $reverseSlotName"
+    if ($bidirectionalFenceShape -ne '2;2;2') {
+        throw "N-way bidirectional pglogical fence vector was not recorded: $bidirectionalFenceShape using reverse slots $reverseSlotName and $fanoutReverseSlotName"
     }
     Invoke-Sql -Database 'provider' -Sql @"
 UPDATE pgl_validate.peer
 SET replication_sets = ARRAY['default'],
     reverse_subscription_name = NULL
-WHERE name = 'target'
+WHERE name IN ('target','fanout')
 "@ | Out-Null
 
     Write-Step 'Validating pglogical mid-sync table is skipped before fencing'
