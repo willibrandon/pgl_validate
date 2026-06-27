@@ -1507,6 +1507,137 @@ mod tests {
     }
 
     #[pg_test]
+    fn compare_expands_partitioned_root_to_leaf_results() {
+        let backend_pid = Spi::get_one::<i32>("SELECT pg_backend_pid()")
+            .unwrap()
+            .unwrap();
+        let peer_db = identifier(&format!("pgl_validate_partition_peer_{backend_pid}"));
+        let root_table = identifier(&format!("partition_parent_{backend_pid}"));
+        let first_leaf = identifier(&format!("partition_part_a_{backend_pid}"));
+        let second_leaf = identifier(&format!("partition_part_b_{backend_pid}"));
+        let peer_name = identifier(&format!("partition_peer_{backend_pid}"));
+        let local_dsn = local_dsn();
+        let remote_dsn = peer_dsn(&peer_db);
+
+        let _ = crate::transport::libpq::execute_command(
+            &local_dsn,
+            &format!("DROP DATABASE IF EXISTS {peer_db} WITH (FORCE)"),
+        );
+        let _ = crate::transport::libpq::execute_command(
+            &local_dsn,
+            &format!("DROP TABLE IF EXISTS public.{root_table} CASCADE"),
+        );
+        crate::transport::libpq::execute_command(&local_dsn, &format!("CREATE DATABASE {peer_db}"))
+            .unwrap();
+
+        let table_ddl = format!(
+            "
+            CREATE TABLE public.{root_table}(
+                id int NOT NULL,
+                value text,
+                PRIMARY KEY (id)
+            ) PARTITION BY RANGE (id);
+            CREATE TABLE public.{first_leaf}
+                PARTITION OF public.{root_table} FOR VALUES FROM (0) TO (10);
+            CREATE TABLE public.{second_leaf}
+                PARTITION OF public.{root_table} FOR VALUES FROM (10) TO (20);
+            "
+        );
+
+        crate::transport::libpq::execute_command(
+            &remote_dsn,
+            &format!(
+                "CREATE EXTENSION pgl_validate;
+                 {table_ddl}
+                 INSERT INTO public.{root_table} VALUES (1, 'same'), (11, 'remote-diff');"
+            ),
+        )
+        .unwrap();
+
+        Spi::run(&format!(
+            "
+            DELETE FROM pgl_validate.peer;
+            {table_ddl}
+            INSERT INTO public.{root_table} VALUES (1, 'same'), (11, 'local-diff');
+            INSERT INTO pgl_validate.peer(name, dsn, backend)
+            VALUES ({peer_name}, {remote_dsn}, 'native');
+            ",
+            peer_name = sql_literal(&peer_name),
+            remote_dsn = sql_literal(&remote_dsn)
+        ))
+        .unwrap();
+
+        let run_id = Spi::get_one::<i64>(&format!(
+            "
+            SELECT pgl_validate.compare(
+                ARRAY['public.{root_table}'::regclass],
+                peers => ARRAY[{peer_name}]
+            )
+            ",
+            peer_name = sql_literal(&peer_name)
+        ))
+        .unwrap()
+        .unwrap();
+
+        let verdict_shape = Spi::get_one::<String>(&format!(
+            "
+            SELECT
+                count(*) FILTER (WHERE table_name = {root_table} AND verdict = 'differ')::text || ';' ||
+                count(*) FILTER (WHERE table_name = {first_leaf} AND verdict = 'match')::text || ';' ||
+                count(*) FILTER (WHERE table_name = {second_leaf} AND verdict = 'differ')::text || ';' ||
+                count(*)::text
+            FROM pgl_validate.table_result
+            WHERE run_id = {run_id}
+            ",
+            root_table = sql_literal(&root_table),
+            first_leaf = sql_literal(&first_leaf),
+            second_leaf = sql_literal(&second_leaf)
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(verdict_shape, "1;1;1;3");
+
+        let run_shape = Spi::get_one::<String>(&format!(
+            "
+            SELECT status || ';' || tables_total::text || ';' ||
+                   tables_matched::text || ';' || tables_differ::text
+            FROM pgl_validate.run
+            WHERE run_id = {run_id}
+            "
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(run_shape, "completed;3;1;2");
+
+        let parent_reason = Spi::get_one::<String>(&format!(
+            "
+            SELECT
+                (reason LIKE '%partitioned parent aggregate of 2 leaf table(s)%')::text || ';' ||
+                (reason LIKE '%' || {first_leaf} || '=match%')::text || ';' ||
+                (reason LIKE '%' || {second_leaf} || '=differ%')::text
+            FROM pgl_validate.table_result
+            WHERE run_id = {run_id}
+              AND table_name = {root_table}
+            ",
+            root_table = sql_literal(&root_table),
+            first_leaf = sql_literal(&first_leaf),
+            second_leaf = sql_literal(&second_leaf)
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(parent_reason, "true;true;true");
+
+        let _ = crate::transport::libpq::execute_command(
+            &local_dsn,
+            &format!("DROP TABLE IF EXISTS public.{root_table} CASCADE"),
+        );
+        let _ = crate::transport::libpq::execute_command(
+            &local_dsn,
+            &format!("DROP DATABASE IF EXISTS {peer_db} WITH (FORCE)"),
+        );
+    }
+
+    #[pg_test]
     fn compare_records_table_error_and_continues_parent_run() {
         let backend_pid = Spi::get_one::<i32>("SELECT pg_backend_pid()")
             .unwrap()

@@ -77,6 +77,14 @@ DECLARE
     sequence_list regclass[];
     table_oid regclass;
     sequence_oid regclass;
+    partition_parent_count int := 0;
+    partition_parent_rec record;
+    partition_parent_cols text[];
+    partition_parent_key_cols text[];
+    partition_parent_repsets text[];
+    partition_parent_validated_property text;
+    partition_parent_verdict text;
+    partition_parent_reason text;
     effective_options jsonb := COALESCE(options, '{}'::jsonb);
     internal_options jsonb;
     result_row pgl_validate.table_result;
@@ -156,7 +164,101 @@ BEGIN
           AND n.nspname <> 'pgl_validate';
     END IF;
 
-    table_count := COALESCE(cardinality(table_list), 0);
+    CREATE TEMP TABLE IF NOT EXISTS pgl_validate_partition_parent_map (
+        parent_oid oid NOT NULL,
+        leaf_oid oid NOT NULL,
+        first_ordinal bigint NOT NULL,
+        parent_schema text NOT NULL,
+        parent_table text NOT NULL,
+        leaf_schema text NOT NULL,
+        leaf_table text NOT NULL,
+        PRIMARY KEY (parent_oid, leaf_oid)
+    ) ON COMMIT DROP;
+    TRUNCATE pgl_validate_partition_parent_map;
+
+    IF table_list IS NOT NULL AND cardinality(table_list) > 0 THEN
+        WITH input_table AS (
+            SELECT input.input_relid::oid AS input_relid,
+                   input.ordinality
+            FROM unnest(table_list) WITH ORDINALITY AS input(input_relid, ordinality)
+        ),
+        partition_root AS (
+            SELECT i.input_relid AS parent_oid,
+                   i.ordinality,
+                   pn.nspname AS parent_schema,
+                   pc.relname AS parent_table
+            FROM input_table i
+            JOIN pg_class pc ON pc.oid = i.input_relid
+            JOIN pg_namespace pn ON pn.oid = pc.relnamespace
+            WHERE pc.relkind = 'p'
+        ),
+        partition_leaf AS (
+            SELECT pr.parent_oid,
+                   pt.relid AS leaf_oid,
+                   pr.ordinality,
+                   pr.parent_schema,
+                   pr.parent_table,
+                   ln.nspname AS leaf_schema,
+                   lc.relname AS leaf_table
+            FROM partition_root pr
+            CROSS JOIN LATERAL pg_partition_tree(pr.parent_oid) AS pt
+            JOIN pg_class lc ON lc.oid = pt.relid
+            JOIN pg_namespace ln ON ln.oid = lc.relnamespace
+            WHERE pt.isleaf
+              AND pt.relid <> pr.parent_oid
+        )
+        INSERT INTO pgl_validate_partition_parent_map(
+            parent_oid, leaf_oid, first_ordinal,
+            parent_schema, parent_table, leaf_schema, leaf_table
+        )
+        SELECT parent_oid,
+               leaf_oid,
+               min(ordinality),
+               parent_schema,
+               parent_table,
+               leaf_schema,
+               leaf_table
+        FROM partition_leaf
+        GROUP BY parent_oid, leaf_oid, parent_schema, parent_table, leaf_schema, leaf_table
+        ON CONFLICT DO NOTHING;
+
+        WITH input_table AS (
+            SELECT input.input_relid::oid AS input_relid,
+                   input.ordinality
+            FROM unnest(table_list) WITH ORDINALITY AS input(input_relid, ordinality)
+        ),
+        expanded_table AS (
+            SELECT i.input_relid AS relid,
+                   i.ordinality
+            FROM input_table i
+            JOIN pg_class c ON c.oid = i.input_relid
+            WHERE c.relkind <> 'p'
+               OR NOT EXISTS (
+                   SELECT 1
+                   FROM pgl_validate_partition_parent_map ppm
+                   WHERE ppm.parent_oid = i.input_relid
+               )
+            UNION ALL
+            SELECT ppm.leaf_oid AS relid,
+                   ppm.first_ordinal AS ordinality
+            FROM pgl_validate_partition_parent_map ppm
+        ),
+        dedup AS (
+            SELECT relid,
+                   min(ordinality) AS first_ordinal
+            FROM expanded_table
+            GROUP BY relid
+        )
+        SELECT array_agg(relid::regclass ORDER BY first_ordinal, relid::regclass::text)
+        INTO table_list
+        FROM dedup;
+    END IF;
+
+    SELECT count(DISTINCT parent_oid)::int
+    INTO partition_parent_count
+    FROM pgl_validate_partition_parent_map;
+
+    table_count := COALESCE(cardinality(table_list), 0) + COALESCE(partition_parent_count, 0);
     sequence_count := COALESCE(cardinality(sequence_list), 0);
 
     IF table_count = 0 AND sequence_count = 0 THEN
@@ -170,6 +272,9 @@ BEGIN
     IF reference IS NOT NULL THEN
         effective_options := effective_options || jsonb_build_object('provider_node', reference);
     END IF;
+    SELECT array_agg(elem.value ORDER BY elem.value)
+    INTO partition_parent_repsets
+    FROM jsonb_array_elements_text(COALESCE(effective_options->'repsets', '[]'::jsonb)) AS elem(value);
     stored_options :=
         effective_options
         - '_pgl_validate_parent_run_id'
@@ -352,6 +457,135 @@ BEGIN
                 PERFORM pgl_validate.compare_sequence(sequence_oid, peers, internal_options);
             END LOOP;
         END IF;
+
+        FOR partition_parent_rec IN
+            SELECT
+                ppm.parent_oid,
+                ppm.parent_schema,
+                ppm.parent_table,
+                count(*)::int AS leaf_count,
+                array_agg(
+                    format(
+                        '%I.%I=%s',
+                        ppm.leaf_schema,
+                        ppm.leaf_table,
+                        COALESCE(tr.verdict, 'missing_result')
+                    )
+                    ORDER BY ppm.leaf_schema, ppm.leaf_table
+                ) AS leaf_verdicts,
+                count(*) FILTER (WHERE tr.verdict IS NULL)::int AS missing_count,
+                count(*) FILTER (WHERE tr.verdict = 'error')::int AS error_count,
+                count(*) FILTER (WHERE tr.verdict = 'fence_timeout')::int AS fence_timeout_count,
+                count(*) FILTER (WHERE tr.verdict = 'differ')::int AS differ_count,
+                count(*) FILTER (WHERE tr.verdict = 'indeterminate')::int AS indeterminate_count,
+                count(*) FILTER (WHERE tr.verdict = 'degraded')::int AS degraded_count,
+                count(*) FILTER (WHERE tr.verdict = 'approximate')::int AS approximate_count,
+                count(*) FILTER (WHERE tr.verdict = 'partial')::int AS partial_count,
+                count(*) FILTER (WHERE tr.verdict = 'skipped')::int AS skipped_count,
+                count(*) FILTER (WHERE tr.verdict = 'match')::int AS match_count,
+                count(*) FILTER (WHERE tp.validated_property = 'unsupported_mask')::int AS unsupported_mask_count,
+                count(*) FILTER (WHERE tp.validated_property = 'skipped')::int AS skipped_property_count,
+                count(*) FILTER (WHERE tp.validated_property = 'filtered_advisory')::int AS filtered_advisory_count,
+                count(*) FILTER (WHERE tp.validated_property = 'filtered_intersection')::int AS filtered_intersection_count,
+                count(*) FILTER (WHERE tp.validated_property = 'keys_only')::int AS keys_only_count,
+                count(*) FILTER (WHERE tp.validated_property = 'superset')::int AS superset_count,
+                count(*) FILTER (WHERE tp.validated_property = 'keyless')::int AS keyless_count
+            FROM pgl_validate_partition_parent_map ppm
+            LEFT JOIN pgl_validate.table_result tr
+              ON tr.run_id = v_run_id
+             AND tr.schema_name = ppm.leaf_schema
+             AND tr.table_name = ppm.leaf_table
+            LEFT JOIN pgl_validate.table_plan tp
+              ON tp.run_id = v_run_id
+             AND tp.schema_name = ppm.leaf_schema
+             AND tp.table_name = ppm.leaf_table
+            GROUP BY ppm.parent_oid, ppm.parent_schema, ppm.parent_table
+            ORDER BY ppm.parent_schema, ppm.parent_table
+        LOOP
+            SELECT array_agg(a.attname ORDER BY a.attname)
+            INTO partition_parent_cols
+            FROM pg_attribute a
+            WHERE a.attrelid = partition_parent_rec.parent_oid
+              AND a.attnum > 0
+              AND NOT a.attisdropped;
+
+            BEGIN
+                partition_parent_key_cols :=
+                    pgl_validate.comparison_key_cols(partition_parent_rec.parent_oid::regclass);
+            EXCEPTION WHEN others THEN
+                partition_parent_key_cols := NULL;
+            END;
+
+            partition_parent_validated_property := CASE
+                WHEN partition_parent_rec.unsupported_mask_count > 0 THEN 'unsupported_mask'
+                WHEN partition_parent_rec.skipped_property_count > 0 THEN 'skipped'
+                WHEN partition_parent_rec.filtered_advisory_count > 0 THEN 'filtered_advisory'
+                WHEN partition_parent_rec.filtered_intersection_count > 0 THEN 'filtered_intersection'
+                WHEN partition_parent_rec.keys_only_count > 0 THEN 'keys_only'
+                WHEN partition_parent_rec.superset_count > 0 THEN 'superset'
+                WHEN partition_parent_rec.keyless_count = partition_parent_rec.leaf_count THEN 'keyless'
+                ELSE 'full'
+            END;
+
+            partition_parent_verdict := CASE
+                WHEN partition_parent_rec.missing_count > 0 THEN 'indeterminate'
+                WHEN partition_parent_rec.error_count > 0 THEN 'error'
+                WHEN partition_parent_rec.fence_timeout_count > 0 THEN 'fence_timeout'
+                WHEN partition_parent_rec.differ_count > 0 THEN 'differ'
+                WHEN partition_parent_rec.indeterminate_count > 0 THEN 'indeterminate'
+                WHEN partition_parent_rec.degraded_count > 0 THEN 'degraded'
+                WHEN partition_parent_rec.approximate_count > 0 THEN 'approximate'
+                WHEN partition_parent_rec.partial_count > 0 THEN 'partial'
+                WHEN partition_parent_rec.skipped_count > 0 THEN 'skipped'
+                WHEN partition_parent_rec.match_count = partition_parent_rec.leaf_count THEN 'match'
+                ELSE 'partial'
+            END;
+
+            partition_parent_reason := format(
+                'partitioned parent aggregate of %s leaf table(s): %s',
+                partition_parent_rec.leaf_count,
+                array_to_string(partition_parent_rec.leaf_verdicts, ', ')
+            );
+
+            INSERT INTO pgl_validate.table_plan(
+                run_id, schema_name, table_name, key_cols, att_list, repsets,
+                repl_insert, repl_update, repl_delete, repl_truncate,
+                has_row_filter, sync_status, validated_property
+            )
+            VALUES (
+                v_run_id,
+                partition_parent_rec.parent_schema,
+                partition_parent_rec.parent_table,
+                partition_parent_key_cols,
+                partition_parent_cols,
+                COALESCE(partition_parent_repsets, ARRAY[]::text[]),
+                NULL, NULL, NULL, NULL,
+                false, NULL, partition_parent_validated_property
+            )
+            ON CONFLICT (run_id, schema_name, table_name) DO UPDATE
+            SET key_cols = EXCLUDED.key_cols,
+                att_list = EXCLUDED.att_list,
+                repsets = EXCLUDED.repsets,
+                has_row_filter = EXCLUDED.has_row_filter,
+                sync_status = EXCLUDED.sync_status,
+                validated_property = EXCLUDED.validated_property;
+
+            INSERT INTO pgl_validate.table_result(
+                run_id, schema_name, table_name, verdict, reason, finished_at
+            )
+            VALUES (
+                v_run_id,
+                partition_parent_rec.parent_schema,
+                partition_parent_rec.parent_table,
+                partition_parent_verdict,
+                partition_parent_reason,
+                now()
+            )
+            ON CONFLICT (run_id, schema_name, table_name) DO UPDATE
+            SET verdict = EXCLUDED.verdict,
+                reason = EXCLUDED.reason,
+                finished_at = EXCLUDED.finished_at;
+        END LOOP;
 
         IF keep_parent_open THEN
             UPDATE pgl_validate.run
@@ -1038,12 +1272,6 @@ BEGIN
           AND a.attnum > 0
           AND NOT a.attisdropped
           AND NOT co.collisdeterministic
-          AND (
-              cols IS NULL
-              OR cardinality(cols) = 0
-              OR a.attname = ANY (cols)
-              OR a.attname = ANY (COALESCE(key_cols, ARRAY[]::text[]))
-          )
     ) AS collation_rec;
 
     IF cardinality(nondeterministic_collation_columns) > 0 THEN
@@ -1057,7 +1285,7 @@ BEGIN
             v_rel_name,
             'NONDETERMINISTIC_COLLATION',
             format(
-                'non-deterministic collation on compared column(s): %s; validation hashes canonical bytes and remains exact, but equality semantics may be collation-dependent',
+                'non-deterministic collation on table column(s): %s; validation hashes canonical bytes and remains exact, but equality semantics may be collation-dependent',
                 array_to_string(nondeterministic_collation_columns, ', ')
             )
         )
