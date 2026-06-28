@@ -657,6 +657,7 @@ mod tests {
                 id int PRIMARY KEY,
                 price public.{domain_name}
             );
+            INSERT INTO public.{table_name} VALUES (1, '12.34'::money);
             "
         ))
         .unwrap();
@@ -678,6 +679,11 @@ mod tests {
         assert!(
             checksum_sql.contains("pgl_validate.row_digest('{1,1}'::int[], t.id, t.price::money)")
         );
+        let checksum_rows =
+            Spi::get_one::<i64>(&format!("SELECT n_rows FROM ({checksum_sql}) AS checksum"))
+                .unwrap()
+                .unwrap();
+        assert_eq!(checksum_rows, 1);
 
         let localize_sql = Spi::get_one::<String>(&format!(
             "
@@ -697,6 +703,12 @@ mod tests {
             localize_sql
                 .contains("pgl_validate.row_digest('{1}'::int[], t.price::money) AS key_bytes")
         );
+        let localized_rows = Spi::get_one::<i64>(&format!(
+            "SELECT count(*) FROM ({localize_sql}) AS localized"
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(localized_rows, 1);
     }
 
     #[pg_test]
