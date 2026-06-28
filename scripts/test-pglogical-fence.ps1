@@ -722,7 +722,10 @@ SELECT pgl_validate.register_pglogical_peer(
     $targetDsnSql,
     'sub'::name,
     NULL,
-    ARRAY['default']
+    ARRAY['default'],
+    11,
+    601000,
+    31000
 )
 "@ | Out-Null
     $compareResult = Invoke-Sql -Database 'provider' -Sql @"
@@ -767,11 +770,14 @@ SELECT EXISTS (
 SELECT subscription_name::text || ';' ||
        COALESCE(reverse_subscription_name::text, '<null>') || ';' ||
        (replication_sets = ARRAY['default'])::text || ';' ||
-       (provider_dsn = $providerDsnSql)::text
+       (provider_dsn = $providerDsnSql)::text || ';' ||
+       connect_timeout_seconds::text || ';' ||
+       statement_timeout_ms::text || ';' ||
+       lock_timeout_ms::text
 FROM pgl_validate.peer
 WHERE name = 'target'
 "@
-    if ($registeredPeer -ne 'sub;<null>;true;true') {
+    if ($registeredPeer -ne 'sub;<null>;true;true;11;601000;31000') {
         throw "register_pglogical_peer did not persist the expected target peer: $registeredPeer"
     }
 
