@@ -1190,6 +1190,34 @@ WHERE s.sub_id = lss.sync_subid
 INSERT INTO pgl_validate.peer(name, dsn, backend, subscription_name, replication_sets)
 VALUES ('degraded', $degradedDsnSql, 'pglogical', 'sub_degraded', ARRAY['default'])
 "@ | Out-Null
+
+    $degradedDefaultFailed = $false
+    try {
+        Invoke-Sql -Database 'provider' -Sql @"
+SELECT *
+FROM pgl_validate.compare_table(
+    'public.accounts'::regclass,
+    ARRAY['degraded'],
+    jsonb_build_object(
+        'provider_dsn', $providerDsnSql,
+        'provider_node', 'provider',
+        'repsets', jsonb_build_array('default'),
+        'fence_timeout_ms', 30000,
+        'fence_poll_interval_ms', 100
+    )
+)
+"@ | Out-Null
+    }
+    catch {
+        if ($_ -notlike '*does not include pgl_validate_barrier*') {
+            throw
+        }
+        $degradedDefaultFailed = $true
+    }
+    if (-not $degradedDefaultFailed) {
+        throw 'pglogical missing-barrier peer did not fail closed by default'
+    }
+
     $degradedResult = Invoke-Sql -Database 'provider' -Sql @"
 SELECT run_id::text || ';' || verdict
 FROM pgl_validate.compare_table(
