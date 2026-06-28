@@ -181,7 +181,7 @@ jobs:
       - name: Run pgrx pg_test suite
         env:
           PGL_VALIDATE_MSVC_ARCH: ${{ matrix.target.msvc_arch }}
-        run: ./scripts/pgrx-vs.ps1 pwsh -NoProfile -ExecutionPolicy Bypass -File ./scripts/test-pgrx.ps1 -PgMajor ${{ matrix.pg }} -TimeoutSeconds 600
+        run: ./scripts/pgrx-vs.ps1 pwsh -NoProfile -ExecutionPolicy Bypass -File ./scripts/test-pgrx.ps1 -PgMajor ${{ matrix.pg }}
 
       - name: Run pgrx regress suite
         env:

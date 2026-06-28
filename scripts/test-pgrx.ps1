@@ -5,9 +5,6 @@ param(
     [switch] $KeepData,
 
     [ValidateRange(1, 86400)]
-    [int] $TimeoutSeconds = 180,
-
-    [ValidateRange(1, 86400)]
     [int] $BuildTimeoutSeconds = 600,
 
     [Parameter(ValueFromRemainingArguments = $true)]
@@ -109,7 +106,7 @@ function Invoke-PglTimedProcess {
 
     $process = Start-Process @startArgs
     if (-not $process.WaitForExit($Seconds * 1000)) {
-        Write-Warning "$Context exceeded ${Seconds}s; terminating the process tree and cleaning pgrx test clusters."
+        Write-Output "$Context exceeded ${Seconds}s; stopping the process tree."
         Stop-ProcessTree -ProcessId $process.Id
         return 124
     }
@@ -197,11 +194,17 @@ try {
     $testCommand = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $runner) +
         @('cargo', 'pgrx', 'test', "pg$PgMajor") +
         $CargoPgrxArgs
-    $exitCode = Invoke-PglTimedProcess `
-        -FilePath $powershell `
-        -ArgumentList $testCommand `
-        -Context "cargo pgrx test pg$PgMajor" `
-        -Seconds $TimeoutSeconds
+    Push-Location $root
+    try {
+        & $powershell @testCommand
+        $exitCode = $LASTEXITCODE
+    }
+    finally {
+        Pop-Location
+    }
+    if ($exitCode -ne 0) {
+        throw "cargo pgrx test pg$PgMajor exited with code $exitCode."
+    }
 }
 catch {
     Write-Error $_
