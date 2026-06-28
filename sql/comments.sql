@@ -72,6 +72,7 @@ BEGIN
             ('peer', 'dsn', 'libpq connection string used to reach the peer.'),
             ('peer', 'provider_dsn', 'libpq connection string used to reach the local pglogical provider when validating this peer.'),
             ('peer', 'backend', 'Replication backend type for the peer: pglogical, native, or standby.'),
+            ('peer', 'is_local', 'True when this peer row names the database currently executing pgl_validate.'),
             ('peer', 'subscription_name', 'Target-side subscription name used to identify the incoming edge.'),
             ('peer', 'reverse_subscription_name', 'Explicit local pglogical subscription from this peer back to the coordinator, used to include bidirectional reverse edges in the fence vector.'),
             ('peer', 'replication_sets', 'Replication sets expected on this peer when a request does not supply an override.'),

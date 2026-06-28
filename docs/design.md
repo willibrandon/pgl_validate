@@ -484,13 +484,13 @@ Row-level localization uses an analogous generated query returning `(key, pgl_va
 
 Topology, edges, contract, sync state, sequences as in Section 9. Origins for the fence vector come from the subscriptions' origin names; `forward_origins` informs cascade edges.
 
-**Node identity is a database endpoint, not a machine.** A pglogical topology may put two or more pglogical nodes on the same PostgreSQL postmaster, using different databases on the same `host:port` and bidirectional subscriptions between them. This is fully supported and must behave exactly like a cross-host topology: the coordinator opens separate libpq sessions distinguished by `dbname`, fences each directed subscription edge, and compares each database's own snapshot. Sharing host, port, data directory, WAL, or operating-system account must not collapse the topology into a single local participant.
+**Node identity is a database endpoint, not a machine.** A pglogical topology may put two or more pglogical nodes on the same PostgreSQL postmaster, using different databases on the same `host:port` and bidirectional subscriptions between them. This is fully supported and must behave like a cross-host topology: DSNs distinguish databases, and each database keeps its own pglogical node identity.
 
-For exact pglogical validation, each remote database must be named in `pgl_validate.peer` or passed explicitly in the `peers` argument. If a caller runs `compare_table('schema.table')` with no matching `pgl_validate.peer` rows, the run is a local self-check of the current database only; it must report that fact and must not imply that another database on the same instance was validated.
+For pglogical validation, `register_pglogical_peer(...)` registers a database endpoint by name. The command must succeed when the DSN points to the database executing the command; that case is normal setup, not an error and not a request for a subscription to itself.
 
-Each peer entry identifies the remote **database endpoint** and the subscription edge to fence. `pglogical.node` rows alone are not sufficient: they name pglogical nodes, but they do not provide the libpq DSN to the other database, the local provider DSN needed to inject barrier transactions, the subscription to validate, the reverse subscription for bidirectional coverage, or the requested replication-set contract. A same-instance two-database deployment therefore uses `pgl_validate.peer` the same way as a cross-host deployment: `dsn` differs at least by `dbname`, `provider_dsn` reaches the local provider database, `subscription_name` names the remote subscription receiving from the coordinator, and `reverse_subscription_name` names the local subscription receiving from that peer when bidirectional validation is required.
+When the DSN points to another database, registration discovers the subscription edge when unambiguous, installs the validation barrier replication set, and stores the metadata needed by later validation runs. If discovery cannot pick one subscription, the caller can pass `subscription_name`.
 
-Setup must be one idempotent command for the common pglogical case, not manual catalog editing. `pgl_validate.register_pglogical_peer(...)` discovers the remote node, discovers the forward subscription that receives from the local pglogical node when unambiguous, copies that subscription's provider DSN into `peer.provider_dsn`, discovers the local reverse subscription when present, creates/verifies the dedicated barrier repset on both nodes, adds it to the relevant subscriptions, and upserts `pgl_validate.peer`. Re-running the same registration is safe and refreshes the stored metadata. `pgl_validate.unregister_pglogical_peer(...)` removes the registration without modifying the replication topology. During validation, `provider_dsn` defaults from the selected registered pglogical peers when they agree, then from the local pglogical node interface; `provider_node` defaults from the local pglogical node.
+Setup must be idempotent: re-running registration refreshes the stored endpoint row. `pgl_validate.unregister_pglogical_peer(...)` removes the registration without modifying the replication topology.
 
 ### 13.2 Native logical replication (secondary, fully specified)
 
@@ -902,6 +902,7 @@ CREATE TABLE pgl_validate.peer (
     provider_dsn            text,
     backend                 text NOT NULL DEFAULT 'pglogical'
                             CHECK (backend IN ('pglogical','native','standby')),
+    is_local                boolean NOT NULL DEFAULT false,
     subscription_name       name,
     reverse_subscription_name name,
     replication_sets        text[],

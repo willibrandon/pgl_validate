@@ -6,6 +6,7 @@ CREATE TABLE pgl_validate.peer (
     provider_dsn            text,
     backend                 text NOT NULL DEFAULT 'pglogical'
                             CHECK (backend IN ('pglogical','native','standby')),
+    is_local                boolean NOT NULL DEFAULT false,
     subscription_name       name,
     reverse_subscription_name name,
     replication_sets        text[],

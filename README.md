@@ -47,9 +47,8 @@ SELECT *
 FROM pgl_validate.compare_table('public.accounts'::regclass);
 ```
 
-For pglogical validation, register each peer database endpoint. The helper is
-safe to rerun: it refreshes the peer row and verifies the validation barrier
-replication set on the relevant subscriptions.
+For pglogical validation, register the databases you want to compare. The
+helper is safe to rerun.
 
 ```sql
 SELECT *

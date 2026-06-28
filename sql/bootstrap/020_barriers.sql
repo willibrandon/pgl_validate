@@ -212,6 +212,7 @@ DECLARE
     resolved_subscription name;
     resolved_reverse_subscription name;
     resolved_replication_sets text[];
+    endpoint_is_current boolean := false;
     result_row pgl_validate.peer;
 BEGIN
     IF p_peer_name IS NULL OR btrim(p_peer_name) = '' THEN
@@ -245,6 +246,62 @@ BEGIN
         p_lock_timeout_ms
     );
 
+    endpoint_is_current := remote_node_rec.node_name = local_node_rec.node_name;
+
+    IF endpoint_is_current THEN
+        IF p_subscription_name IS NOT NULL THEN
+            PERFORM pgl_validate.ensure_pglogical_subscription_barrier(
+                p_subscription_name
+            );
+        END IF;
+
+        resolved_replication_sets := COALESCE(
+            p_replication_sets,
+            ARRAY['default']::text[]
+        );
+
+        INSERT INTO pgl_validate.peer(
+            name,
+            dsn,
+            provider_dsn,
+            backend,
+            is_local,
+            subscription_name,
+            reverse_subscription_name,
+            replication_sets,
+            connect_timeout_seconds,
+            statement_timeout_ms,
+            lock_timeout_ms
+        )
+        VALUES (
+            p_peer_name,
+            p_peer_dsn,
+            p_peer_dsn,
+            'pglogical',
+            true,
+            p_subscription_name,
+            p_reverse_subscription_name,
+            resolved_replication_sets,
+            p_connect_timeout_seconds,
+            p_statement_timeout_ms,
+            p_lock_timeout_ms
+        )
+        ON CONFLICT (name) DO UPDATE
+        SET dsn = EXCLUDED.dsn,
+            provider_dsn = EXCLUDED.provider_dsn,
+            backend = EXCLUDED.backend,
+            is_local = EXCLUDED.is_local,
+            subscription_name = EXCLUDED.subscription_name,
+            reverse_subscription_name = EXCLUDED.reverse_subscription_name,
+            replication_sets = EXCLUDED.replication_sets,
+            connect_timeout_seconds = EXCLUDED.connect_timeout_seconds,
+            statement_timeout_ms = EXCLUDED.statement_timeout_ms,
+            lock_timeout_ms = EXCLUDED.lock_timeout_ms
+        RETURNING * INTO result_row;
+
+        RETURN result_row;
+    END IF;
+
     SELECT count(*)
     INTO forward_subscription_count
     FROM pgl_validate.remote_pglogical_subscriptions(
@@ -261,9 +318,8 @@ BEGIN
     IF forward_subscription_count = 0 THEN
         IF p_subscription_name IS NULL THEN
             RAISE EXCEPTION
-                'no pglogical subscription on peer % receives from local node %; pass subscription_name explicitly if discovery is ambiguous',
-                p_peer_name,
-                local_node_rec.node_name
+                'could not find a pglogical subscription for %; pass subscription_name explicitly',
+                p_peer_name
                 USING ERRCODE = '02000';
         END IF;
         RAISE EXCEPTION
@@ -275,9 +331,8 @@ BEGIN
 
     IF forward_subscription_count > 1 THEN
         RAISE EXCEPTION
-            'multiple pglogical subscriptions on peer % receive from local node %; pass subscription_name explicitly',
-            p_peer_name,
-            local_node_rec.node_name
+            'multiple pglogical subscriptions match %; pass subscription_name explicitly',
+            p_peer_name
             USING ERRCODE = '0A000';
     END IF;
 
@@ -364,6 +419,7 @@ BEGIN
         dsn,
         provider_dsn,
         backend,
+        is_local,
         subscription_name,
         reverse_subscription_name,
         replication_sets,
@@ -376,6 +432,7 @@ BEGIN
         p_peer_dsn,
         forward_subscription_rec.provider_dsn,
         'pglogical',
+        false,
         resolved_subscription,
         resolved_reverse_subscription,
         resolved_replication_sets,
@@ -387,6 +444,7 @@ BEGIN
     SET dsn = EXCLUDED.dsn,
         provider_dsn = EXCLUDED.provider_dsn,
         backend = EXCLUDED.backend,
+        is_local = EXCLUDED.is_local,
         subscription_name = EXCLUDED.subscription_name,
         reverse_subscription_name = EXCLUDED.reverse_subscription_name,
         replication_sets = EXCLUDED.replication_sets,

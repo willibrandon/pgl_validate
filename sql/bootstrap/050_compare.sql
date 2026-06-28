@@ -1115,6 +1115,12 @@ BEGIN
         END IF;
     END IF;
 
+    SELECT COALESCE(array_agg(p.name ORDER BY p.name), ARRAY[]::text[])
+    INTO peer_names
+    FROM pgl_validate.peer p
+    WHERE p.name = ANY (peer_names)
+      AND NOT p.is_local;
+
     SELECT count(*),
            count(*) FILTER (WHERE p.backend = 'standby'),
            count(*) FILTER (WHERE p.backend = 'pglogical'),
@@ -4521,6 +4527,12 @@ BEGIN
             RAISE EXCEPTION 'unknown pgl_validate peer(s): %', array_to_string(missing_peers, ', ');
         END IF;
     END IF;
+
+    SELECT COALESCE(array_agg(p.name ORDER BY p.name), ARRAY[]::text[])
+    INTO peer_names
+    FROM pgl_validate.peer p
+    WHERE p.name = ANY (peer_names)
+      AND NOT p.is_local;
 
     IF parent_run_id IS NULL THEN
         INSERT INTO pgl_validate.run(status, options, tables_total)

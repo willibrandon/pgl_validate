@@ -712,6 +712,23 @@ SELECT EXISTS (
     Write-Step 'Running compare_table through real pglogical fencing'
     Invoke-Sql -Database 'provider' -Sql @"
 SELECT pgl_validate.register_pglogical_peer(
+    'provider',
+    $providerDsnSql,
+    NULL,
+    NULL,
+    ARRAY['default']
+);
+SELECT pgl_validate.register_pglogical_peer(
+    'provider',
+    $providerDsnSql,
+    NULL,
+    NULL,
+    ARRAY['default'],
+    12,
+    602000,
+    32000
+);
+SELECT pgl_validate.register_pglogical_peer(
     'target',
     $targetDsnSql,
     'sub'::name,
@@ -780,6 +797,31 @@ WHERE name = 'target'
 "@
     if ($registeredPeer -ne 'sub;<null>;true;true;11;601000;31000') {
         throw "register_pglogical_peer did not persist the expected target peer: $registeredPeer"
+    }
+
+    $registeredCurrentPeer = Invoke-Sql -Database 'provider' -Sql @"
+SELECT COALESCE(subscription_name::text, '<null>') || ';' ||
+       COALESCE(reverse_subscription_name::text, '<null>') || ';' ||
+       (replication_sets = ARRAY['default'])::text || ';' ||
+       (provider_dsn = $providerDsnSql)::text || ';' ||
+       is_local::text || ';' ||
+       connect_timeout_seconds::text || ';' ||
+       statement_timeout_ms::text || ';' ||
+       lock_timeout_ms::text
+FROM pgl_validate.peer
+WHERE name = 'provider'
+"@
+    if ($registeredCurrentPeer -ne '<null>;<null>;true;true;true;12;602000;32000') {
+        throw "register_pglogical_peer did not persist the expected current database peer: $registeredCurrentPeer"
+    }
+
+    $registeredCurrentPeerCount = Invoke-Sql -Database 'provider' -Sql @"
+SELECT count(*)::text
+FROM pgl_validate.peer
+WHERE name = 'provider'
+"@
+    if ($registeredCurrentPeerCount -ne '1') {
+        throw "register_pglogical_peer is not idempotent for current database peer: $registeredCurrentPeerCount rows"
     }
 
     $registeredPeerCount = Invoke-Sql -Database 'provider' -Sql @"
