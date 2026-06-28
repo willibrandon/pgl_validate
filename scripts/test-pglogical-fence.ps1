@@ -775,6 +775,15 @@ WHERE name = 'target'
         throw "register_pglogical_peer did not persist the expected target peer: $registeredPeer"
     }
 
+    $registeredPeerCount = Invoke-Sql -Database 'provider' -Sql @"
+SELECT count(*)::text
+FROM pgl_validate.peer
+WHERE name = 'target'
+"@
+    if ($registeredPeerCount -ne '1') {
+        throw "register_pglogical_peer is not idempotent for target peer: $registeredPeerCount rows"
+    }
+
     Write-Step "Validating pglogical direct fan-out through slots $slotName and $fanoutSlotName"
     Invoke-Sql -Database 'provider' -Sql @"
 SELECT pgl_validate.register_pglogical_peer(
