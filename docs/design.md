@@ -121,7 +121,7 @@ Every run records the per-table `validated_property` and stamps the verdict acco
 - **G4** Be **lag-correct** via vector-fence epochs (G1 holds under arbitrary lag and live load).
 - **G5** **Localize** divergence to exact keys (missing/extra/differs).
 - **G6** Honor the **pglogical contract** exactly: repsets, column lists, row filters, action masks, sequences, sync state.
-- **G7** Support **bidirectional / N-way** topologies with a per-origin fence vector.
+- **G7** Support **bidirectional / N-way** topologies with a per-origin fence vector, including pglogical nodes that are different databases on the same PostgreSQL instance.
 - **G8** Be **operable**: async runs, scheduling, progress, resumability, observability.
 - **G9** Be **complete and fully tested**, including real multi-node replication scenarios (repository policy).
 - **G10** Offer **origin-aware, transactional repair** as an explicit, privileged, opt-in operation.
@@ -481,6 +481,12 @@ Row-level localization uses an analogous generated query returning `(key, pgl_va
 
 Topology, edges, contract, sync state, sequences as in Section 9. Origins for the fence vector come from the subscriptions' origin names; `forward_origins` informs cascade edges.
 
+**Node identity is a database endpoint, not a machine.** A pglogical topology may put two or more pglogical nodes on the same PostgreSQL postmaster, using different databases on the same `host:port` and bidirectional subscriptions between them. This is fully supported and must behave exactly like a cross-host topology: the coordinator opens separate libpq sessions distinguished by `dbname`, fences each directed subscription edge, and compares each database's own snapshot. Sharing host, port, data directory, WAL, or operating-system account must not collapse the topology into a single local participant.
+
+For exact pglogical validation, each remote database must be named in `pgl_validate.peer` or passed explicitly in the `peers` argument. If a caller runs `compare_table('schema.table')` with no matching `pgl_validate.peer` rows, the run is a local self-check of the current database only; it must report that fact and must not imply that another database on the same instance was validated.
+
+Each peer entry identifies the remote **database endpoint** and the subscription edge to fence. `pglogical.node` rows alone are not sufficient: they name pglogical nodes, but they do not provide the libpq DSN to the other database, the subscription to validate, the reverse subscription for bidirectional coverage, or the requested replication-set contract. A same-instance two-database deployment therefore uses `pgl_validate.peer` the same way as a cross-host deployment: `dsn` differs at least by `dbname`, `subscription_name` names the remote subscription receiving from the coordinator, and `reverse_subscription_name` names the local subscription receiving from that peer when bidirectional validation is required.
+
 ### 13.2 Native logical replication (secondary, fully specified)
 
 - **Topology/state:** `pg_subscription`, `pg_subscription_rel.srsubstate` (`i` init, `d` data copy, `f` finished copy, `s` sync, `r` ready) — only `r` validated.
@@ -513,7 +519,7 @@ Topology, edges, contract, sync state, sequences as in Section 9. Origins for th
 
 ### 14.2 Connectivity and wire payloads
 
-libpq, non-blocking, one `WaitEventSet` polling N peers, so a chunk fan-out costs ≈ 1× latency. DSNs resolve from explicit args, `pglogical.node_interface.if_dsn`, or `pgl_validate.peer`. Across the wire: `(count, lthash)` per chunk (~2 KB), `(key, row digest)` only for small divergent ranges (32 bytes with `blake3_256`, 64 with `blake3_512`), and (optional, capped) full tuples for confirmed `differs` keys. **Table data is never shipped for comparison.**
+libpq, non-blocking, one `WaitEventSet` polling N peers, so a chunk fan-out costs ≈ 1× latency. DSNs resolve from explicit args, `pglogical.node_interface.if_dsn`, or `pgl_validate.peer`. The DSN is the participant identity for connection purposes: two peers may share `host` and `port` and differ only by `dbname`, which is the normal shape for same-instance pglogical validation. Across the wire: `(count, lthash)` per chunk (~2 KB), `(key, row digest)` only for small divergent ranges (32 bytes with `blake3_256`, 64 with `blake3_512`), and (optional, capped) full tuples for confirmed `differs` keys. **Table data is never shipped for comparison.**
 
 ### 14.3 Parallelism
 
@@ -764,7 +770,7 @@ Per repository policy, **every feature ships with complete regression tests exer
 1. **`#[test]` (pure Rust):** encoding rules (null tag, length framing, name-ordering, send-vs-text selection, float/json policy), LtHash lane math (commutativity, associativity, duplicate sensitivity) and its collision-bound parameters, sorted-digest set-hash, Merkle split/boundary math, FK topological sort, contract parsing.
 2. **`#[pg_test]` (in-server):** `row_digest`/`lthash`/`hash_digest_array` over real tables — order independence (post-`CLUSTER`), parallel-worker equivalence (`max_parallel_workers_per_gather` 0 vs N), all scalar/container/json/numeric/bytea/array/composite/timestamptz types, keyless path.
 3. **`cargo pgrx regress`:** golden output for the SQL API, generated-SQL shape, views, GUCs, schema-issue codes, repair DML.
-4. **Multi-node integration harness (centerpiece):** brings up **two+ real PostgreSQL instances**, installs `pgl_validate` on each, configures **real pglogical replication** (and a native-logical path, and a physical-standby path), runs end-to-end scenarios.
+4. **Multi-node integration harness (centerpiece):** brings up **two+ real PostgreSQL participants** (separate databases, which may be on the same or different PostgreSQL instances), installs `pgl_validate` on each, configures **real pglogical replication** (and a native-logical path, and a physical-standby path), runs end-to-end scenarios.
 
 ### 21.2 Mandatory scenarios (each fully implemented)
 
@@ -776,6 +782,7 @@ Per repository policy, **every feature ships with complete regression tests exer
 | Post-fence DELETE on provider | Cleared by recheck |
 | **Barrier convergence is exact & edge-specific** | Converge on `origin_progress(origin(O→T)) ≥ L_b` (authoritative) with `wait_slot_confirm_lsn(slot, L_b)` and token visibility as corroboration; **cascade test**: a token reaching T via `O→X→T` must NOT mark the direct `O→T` edge converged |
 | **Cascade duplicate token + `conflict_resolution = error`** | In `O→X→T` *and* `O→T` with `forward_origins='{all}'`, the same token arrives twice at T; with no unique constraint the duplicate is a harmless heap row and apply does **not** error/stall (the explicit test the review requires) |
+| **Same-instance pglogical bidirectional databases** | Two pglogical nodes in separate databases on the same postmaster validate through registered peer DSNs and forward/reverse subscriptions; no-peers local self-check is never mistaken for cross-database validation |
 | **pglogical filtered-table id=6 case** (`row_filter.sql:156`) | Row that enters the filter via UPDATE is legitimately absent downstream → reported `advisory`, **never** a confirmed divergence (G-SOUND) |
 | **Native filtered table** (PG ≥ 17) | Filter-enter UPDATE delivered as INSERT → full `S = P_F` validated (stronger than pglogical) |
 | **Degraded fence (no barrier)** | Default **aborts**; with `allow_degraded_fence`, verdict is `degraded` and never `match`/`differ` |
@@ -1386,7 +1393,33 @@ SELECT * FROM pgl_validate.divergences(4217) WHERE status = 'confirmed';
 SELECT * FROM pgl_validate.sequences(4217) WHERE NOT within_contract;
 ```
 
-### B.3 CI gate (synchronous)
+### B.3 Same-instance pglogical databases
+
+```sql
+-- Run in db_alpha. db_beta is another database on the same PostgreSQL instance.
+INSERT INTO pgl_validate.peer(
+    name, dsn, backend, subscription_name, reverse_subscription_name, replication_sets)
+VALUES (
+    'db_beta',
+    'host=localhost port=5432 dbname=db_beta user=postgres',
+    'pglogical',
+    'sub_beta_from_alpha',   -- subscription in db_beta receiving from db_alpha
+    'sub_alpha_from_beta',   -- subscription in db_alpha receiving from db_beta
+    ARRAY['default'])
+ON CONFLICT (name) DO UPDATE
+SET dsn = EXCLUDED.dsn,
+    backend = EXCLUDED.backend,
+    subscription_name = EXCLUDED.subscription_name,
+    reverse_subscription_name = EXCLUDED.reverse_subscription_name,
+    replication_sets = EXCLUDED.replication_sets;
+
+SELECT *
+FROM pgl_validate.compare_table('public.accounts'::regclass, ARRAY['db_beta']);
+```
+
+If `compare_table()` is called with no `peers` argument and no `pgl_validate.peer` rows, it has no remote database to connect to. The result is intentionally a local self-check (`single local participant`). It is not a validation of another database on the same instance.
+
+### B.4 CI gate (synchronous)
 
 ```sql
 -- verdict ∈ match | differ | indeterminate | partial | approximate | degraded | skipped | error
@@ -1395,7 +1428,7 @@ SELECT * FROM pgl_validate.sequences(4217) WHERE NOT within_contract;
 SELECT (pgl_validate.compare_table('public.accounts')).verdict = 'match' AS in_sync;
 ```
 
-### B.4 Inspect the planner-transparent SQL the engine will run
+### B.5 Inspect the planner-transparent SQL the engine will run
 
 ```sql
 SELECT pgl_validate.plan_chunk_sql('public.orders', ARRAY['id'],
@@ -1407,7 +1440,7 @@ SELECT pgl_validate.plan_chunk_sql('public.orders', ARRAY['id'],
 -- EXPLAIN that statement on any node to see the index/parallel plan.
 ```
 
-### B.5 Origin-aware repair from the authoritative node
+### B.6 Origin-aware repair from the authoritative node
 
 ```sql
 SELECT pgl_validate.generate_repair(4217, authoritative => 'node_alpha');   -- review first
