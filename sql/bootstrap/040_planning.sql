@@ -533,7 +533,10 @@ BEGIN
 
     SELECT
         array_agg(pgl_validate.column_encoding_mode(a.atttypid) ORDER BY a.attname),
-        string_agg(format('t.%I', a.attname), ', ' ORDER BY a.attname)
+        string_agg(
+            pgl_validate.digest_value_sql('t', a.attname, a.atttypid),
+            ', ' ORDER BY a.attname
+        )
     INTO enc_modes, digest_args
     FROM pg_attribute a
     WHERE a.attrelid = rel
@@ -667,7 +670,10 @@ BEGIN
 
     SELECT
         array_agg(pgl_validate.column_encoding_mode(a.atttypid) ORDER BY a.attname),
-        string_agg(format('t.%I', a.attname), ', ' ORDER BY a.attname)
+        string_agg(
+            pgl_validate.digest_value_sql('t', a.attname, a.atttypid),
+            ', ' ORDER BY a.attname
+        )
     INTO enc_modes, digest_args
     FROM pg_attribute a
     WHERE a.attrelid = rel
@@ -792,7 +798,10 @@ BEGIN
 
     SELECT
         array_agg(pgl_validate.column_encoding_mode(a.atttypid) ORDER BY a.attname),
-        string_agg(format('t.%I', a.attname), ', ' ORDER BY a.attname)
+        string_agg(
+            pgl_validate.digest_value_sql('t', a.attname, a.atttypid),
+            ', ' ORDER BY a.attname
+        )
     INTO enc_modes, digest_args
     FROM pg_attribute a
     WHERE a.attrelid = rel
@@ -914,7 +923,10 @@ BEGIN
 
     SELECT
         array_agg(pgl_validate.column_encoding_mode(a.atttypid) ORDER BY a.attname),
-        string_agg(format('t.%I', a.attname), ', ' ORDER BY a.attname)
+        string_agg(
+            pgl_validate.digest_value_sql('t', a.attname, a.atttypid),
+            ', ' ORDER BY a.attname
+        )
     INTO enc_modes, digest_args
     FROM pg_attribute a
     WHERE a.attrelid = rel
@@ -924,7 +936,10 @@ BEGIN
 
     SELECT
         array_agg(pgl_validate.column_encoding_mode(a.atttypid) ORDER BY ord.ordinality),
-        string_agg(format('t.%I', a.attname), ', ' ORDER BY ord.ordinality),
+        string_agg(
+            pgl_validate.digest_value_sql('t', a.attname, a.atttypid),
+            ', ' ORDER BY ord.ordinality
+        ),
         string_agg(format('%L, t.%I', a.attname, a.attname), ', ' ORDER BY ord.ordinality),
         string_agg(format('t.%I', a.attname), ', ' ORDER BY ord.ordinality)
     INTO key_enc_modes, key_digest_args, key_text_args, order_args

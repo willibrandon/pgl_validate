@@ -400,8 +400,12 @@ BEGIN
 END
 $$;
 
+COMMENT ON FUNCTION pgl_validate.digest_type_oid(oid) IS
+    'Resolve the SQL type a root-domain column is cast to before value encoding, preserving domain identity in schema signatures while hashing the base value.';
+COMMENT ON FUNCTION pgl_validate.digest_value_sql(text, name, oid) IS
+    'Generate the table-column SQL expression passed to row_digest, including base-type casts for root-domain columns.';
 COMMENT ON FUNCTION pgl_validate.column_encoding_mode(oid) IS
-    'Select the coordinator-pushed row_digest encoding mode for a column type, using binary send only for stable built-ins and enums while recursively falling back to pinned text for unknown or unstable nested type families.';
+    'Select the coordinator-pushed row_digest encoding mode for a column type, using binary send only for stable built-ins and enums while recursively falling back to pinned text for unknown or unstable nested type families; root domains are resolved through their base value type.';
 COMMENT ON FUNCTION pgl_validate.plan_settings_cte(text) IS
     'Build the generated-SQL CTE that pins digest-affecting GUCs on a participant session.';
 COMMENT ON FUNCTION pgl_validate.comparison_key_cols(regclass) IS
@@ -669,6 +673,10 @@ GRANT EXECUTE ON FUNCTION pgl_validate.lthash_combine(
 GRANT EXECUTE ON FUNCTION pgl_validate.lthash_bytes(pgl_validate.lthash_state)
     TO pgl_validate_validate;
 
+GRANT EXECUTE ON FUNCTION pgl_validate.digest_type_oid(oid)
+    TO pgl_validate_discover;
+GRANT EXECUTE ON FUNCTION pgl_validate.digest_value_sql(text, name, oid)
+    TO pgl_validate_discover;
 GRANT EXECUTE ON FUNCTION pgl_validate.column_encoding_mode(oid)
     TO pgl_validate_discover;
 GRANT EXECUTE ON FUNCTION pgl_validate.comparison_key_cols(regclass)

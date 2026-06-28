@@ -264,12 +264,14 @@ mod tests {
             .unwrap()
             .unwrap();
         let domain_name = identifier(&format!("pgl_validate_numeric_domain_{backend_pid}"));
+        let money_domain_name = identifier(&format!("pgl_validate_money_domain_{backend_pid}"));
         let composite_name = identifier(&format!("pgl_validate_composite_{backend_pid}"));
         let enum_name = identifier(&format!("pgl_validate_enum_{backend_pid}"));
 
         Spi::run(&format!(
             "
             CREATE DOMAIN public.{domain_name} AS numeric;
+            CREATE DOMAIN public.{money_domain_name} AS money;
             CREATE TYPE public.{composite_name} AS (amount numeric);
             CREATE TYPE public.{enum_name} AS ENUM ('a', 'b');
             SET LOCAL pgl_validate.json_normalize = on;
@@ -283,6 +285,7 @@ mod tests {
                    pgl_validate.column_encoding_mode('numeric[]'::regtype::oid)::text || ';' ||
                    pgl_validate.column_encoding_mode('json[]'::regtype::oid)::text || ';' ||
                    pgl_validate.column_encoding_mode('public.{domain_name}'::regtype::oid)::text || ';' ||
+                   pgl_validate.column_encoding_mode('public.{money_domain_name}'::regtype::oid)::text || ';' ||
                    pgl_validate.column_encoding_mode('public.{composite_name}'::regtype::oid)::text || ';' ||
                    pgl_validate.column_encoding_mode('int4range'::regtype::oid)::text || ';' ||
                    pgl_validate.column_encoding_mode('point'::regtype::oid)::text || ';' ||
@@ -293,7 +296,7 @@ mod tests {
         .unwrap()
         .unwrap();
 
-        assert_eq!(modes, "1;2;2;2;2;2;2;1;1");
+        assert_eq!(modes, "1;2;2;2;1;2;2;2;1;1");
     }
 
     #[pg_test]
@@ -640,22 +643,20 @@ mod tests {
     }
 
     #[pg_test]
-    fn generated_digest_sql_pins_text_fallback_gucs() {
+    fn generated_digest_sql_casts_root_domains_to_base_type() {
         let backend_pid = Spi::get_one::<i32>("SELECT pg_backend_pid()")
             .unwrap()
             .unwrap();
-        let domain_name = identifier(&format!("pgl_validate_tstz_domain_{backend_pid}"));
-        let table_name = identifier(&format!("pgl_validate_text_fallback_{backend_pid}"));
+        let domain_name = identifier(&format!("pgl_validate_money_domain_{backend_pid}"));
+        let table_name = identifier(&format!("pgl_validate_domain_digest_{backend_pid}"));
 
         Spi::run(&format!(
             "
-            CREATE DOMAIN public.{domain_name} AS timestamptz;
+            CREATE DOMAIN public.{domain_name} AS money;
             CREATE TABLE public.{table_name}(
                 id int PRIMARY KEY,
-                observed_at public.{domain_name}
+                price public.{domain_name}
             );
-            INSERT INTO public.{table_name}
-            VALUES (1, '2026-06-27 01:02:03+00'::timestamptz);
             "
         ))
         .unwrap();
@@ -667,7 +668,66 @@ mod tests {
                 ARRAY['id'],
                 NULL,
                 NULL,
-                ARRAY['observed_at'],
+                ARRAY['id','price']
+            )
+            "
+        ))
+        .unwrap()
+        .unwrap();
+
+        assert!(
+            checksum_sql.contains("pgl_validate.row_digest('{1,1}'::int[], t.id, t.price::money)")
+        );
+
+        let localize_sql = Spi::get_one::<String>(&format!(
+            "
+            SELECT pgl_validate.plan_localize_sql(
+                'public.{table_name}'::regclass,
+                ARRAY['price'],
+                NULL,
+                NULL,
+                ARRAY['id','price']
+            )
+            "
+        ))
+        .unwrap()
+        .unwrap();
+
+        assert!(
+            localize_sql
+                .contains("pgl_validate.row_digest('{1}'::int[], t.price::money) AS key_bytes")
+        );
+    }
+
+    #[pg_test]
+    fn generated_digest_sql_pins_text_fallback_gucs() {
+        let backend_pid = Spi::get_one::<i32>("SELECT pg_backend_pid()")
+            .unwrap()
+            .unwrap();
+        let composite_name = identifier(&format!("pgl_validate_tstz_composite_{backend_pid}"));
+        let table_name = identifier(&format!("pgl_validate_text_fallback_{backend_pid}"));
+
+        Spi::run(&format!(
+            "
+            CREATE TYPE public.{composite_name} AS (observed_at timestamptz);
+            CREATE TABLE public.{table_name}(
+                id int PRIMARY KEY,
+                observed public.{composite_name}
+            );
+            INSERT INTO public.{table_name}
+            VALUES (1, ROW('2026-06-27 01:02:03+00'::timestamptz)::public.{composite_name});
+            "
+        ))
+        .unwrap();
+
+        let checksum_sql = Spi::get_one::<String>(&format!(
+            "
+            SELECT pgl_validate.plan_chunk_sql(
+                'public.{table_name}'::regclass,
+                ARRAY['id'],
+                NULL,
+                NULL,
+                ARRAY['observed'],
                 NULL,
                 NULL,
                 true

@@ -400,6 +400,8 @@ Per replicated column, the canonical encoding is resolved at plan time and pinne
 2. **Canonical text** fallback for types lacking a stable/usable `send`: the value's `out` function under **pinned GUCs** set in the validation session — `extra_float_digits = 3`, `DateStyle = 'ISO, YMD'`, `IntervalStyle = 'iso_8601'`, `bytea_output = 'hex'`, `TimeZone = 'UTC'`, neutral numeric formatting. Text output of a *stored value* is collation-independent (collation governs comparison/order, not representation). Locale-sensitive built-ins such as `money` must use stable binary `send`, not text fallback.
 3. **Unsupported** types (no stable `send`, no stable text — exotic extension types) → **precondition failure for that table**, surfaced explicitly. Never silently wrong.
 
+Root-domain columns are cast to their base value type in generated digest SQL before calling `row_digest`; the domain name, constraints, typmod, and nullability remain part of `schema_signature`. This keeps value encoding deterministic for domains over locale-sensitive stable-send types without hiding domain/schema drift.
+
 **JSON:** default is **exact byte comparison** for `json` (preserves genuinely-stored differences — whitespace, key order, duplicate keys). Normalization via `jsonb` is **opt-in** (`json_normalize = on`), documented as semantics-changing. `jsonb` storage is already canonical, so its `send` is canonical.
 
 **Float policy:** `-0.0`/`+0.0` and `NaN` bit-patterns are normalized by default (`float_signed_zero_distinct`, `float_nan_distinct` GUCs to opt out). With binary `send` these normalizations are applied to the value before encoding.
@@ -552,6 +554,10 @@ pgl_validate.lthash_combine(pgl_validate.lthash_state, pgl_validate.lthash_state
 -- deliberately NOT an aggregate (v2's sorted_digest(bytea) was mis-declared).
 pgl_validate.hash_digest_array(bytea[]) RETURNS bytea IMMUTABLE PARALLEL SAFE;
 -- Usage: SELECT pgl_validate.hash_digest_array(array_agg(rd ORDER BY rd)) FROM (... ) s(rd);
+-- Generated-SQL helpers: root-domain columns are digested as their base value
+-- type while domain identity remains in schema_signature.
+pgl_validate.digest_type_oid(type_oid oid) RETURNS oid STABLE;
+pgl_validate.digest_value_sql(table_alias text, column_name name, type_oid oid) RETURNS text STABLE;
 -- Fence helpers. last_commit_lsn() returns the calling backend's XactLastCommitEnd — the EXACT
 -- end LSN of the barrier commit just made (§8.1), used for the edge's origin-progress check.
 pgl_validate.last_commit_lsn() RETURNS pg_lsn;        -- exact XactLastCommitEnd of this session

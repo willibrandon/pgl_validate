@@ -1,3 +1,52 @@
+-- Resolve the SQL argument type row_digest should see for a table column.
+-- Domains are schema contract, not value encoding contract; schema_signature()
+-- records the domain identity while generated digest SQL casts root-domain
+-- columns to this base type before calling row_digest().
+CREATE FUNCTION pgl_validate.digest_type_oid(type_oid oid)
+RETURNS oid
+LANGUAGE sql
+STABLE
+AS $$
+    WITH RECURSIVE domain_chain(type_oid, depth) AS (
+        SELECT $1, 0
+        UNION ALL
+        SELECT t.typbasetype, domain_chain.depth + 1
+        FROM domain_chain
+        JOIN pg_type t ON t.oid = domain_chain.type_oid
+        WHERE t.typtype = 'd'
+          AND t.typbasetype <> 0
+          AND domain_chain.depth < 32
+    )
+    SELECT domain_chain.type_oid
+    FROM domain_chain
+    ORDER BY domain_chain.depth DESC
+    LIMIT 1
+$$;
+
+-- Return the SQL expression generated checksum queries should pass to
+-- row_digest() for one column.
+CREATE FUNCTION pgl_validate.digest_value_sql(
+    table_alias text,
+    column_name name,
+    type_oid oid
+)
+RETURNS text
+LANGUAGE sql
+STABLE
+AS $$
+    SELECT CASE
+        WHEN pgl_validate.digest_type_oid($3) = $3 THEN
+            format('%I.%I', $1, $2)
+        ELSE
+            format(
+                '%I.%I::%s',
+                $1,
+                $2,
+                format_type(pgl_validate.digest_type_oid($3), NULL::integer)
+            )
+    END
+$$;
+
 -- Pick the coordinator-pushed encoding mode for a column. This is intentionally
 -- conservative for types whose binary send format is less suitable as a
 -- cross-version contract; the coordinator emits the chosen mode positionally in
@@ -54,10 +103,13 @@ AS $$
             ('bit'::regtype::oid),
             ('varbit'::regtype::oid)
     ),
+    digest_type AS (
+        SELECT pgl_validate.digest_type_oid(type_oid) AS oid
+    ),
     expanded_type AS (
         SELECT t.oid, t.typtype, t.typcategory, t.typbasetype, t.typelem, t.typsend
         FROM pg_type t
-        WHERE t.oid = type_oid
+        JOIN digest_type d ON d.oid = t.oid
         UNION ALL
         SELECT child.oid,
                child.typtype,
@@ -74,13 +126,13 @@ AS $$
           END
     )
     SELECT CASE
-        WHEN type_oid = 'json'::regtype::oid
+        WHEN (SELECT oid FROM digest_type) = 'json'::regtype::oid
          AND COALESCE(NULLIF(current_setting('pgl_validate.json_normalize', true), '')::boolean, false) THEN 3
         WHEN EXISTS (
             SELECT 1
             FROM expanded_type e
             WHERE e.oid IN ('json'::regtype::oid, 'numeric'::regtype::oid)
-               OR e.typtype IN ('c', 'd', 'm', 'p', 'r')
+               OR e.typtype IN ('c', 'm', 'p', 'r')
                OR e.typsend = 0
         ) THEN 2
         WHEN EXISTS (
