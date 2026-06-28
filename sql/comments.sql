@@ -7,6 +7,8 @@ COMMENT ON COLUMN pgl_validate.peer.reverse_subscription_name IS
     'Explicit local pglogical subscription from this peer back to the coordinator, used to include bidirectional reverse edges in the fence vector.';
 COMMENT ON TABLE pgl_validate.run IS
     'One validation run, including lifecycle state and summary counts.';
+COMMENT ON SEQUENCE pgl_validate.run_run_id_seq IS
+    'Generates run_id values for pgl_validate.run.';
 COMMENT ON TABLE pgl_validate.run_participant IS
     'Per-run participant metadata and connection status.';
 COMMENT ON TABLE pgl_validate.fence_epoch IS
@@ -19,6 +21,8 @@ COMMENT ON TABLE pgl_validate.fence_attempt IS
     'Observed convergence state for a fenced edge.';
 COMMENT ON TABLE pgl_validate.fence_barrier IS
     'Replicated, non-unique barrier-token table carried by the dedicated barrier repset.';
+COMMENT ON SEQUENCE pgl_validate.fence_barrier_id_seq IS
+    'Generates local surrogate id values for duplicate-safe fence barrier rows.';
 COMMENT ON TABLE pgl_validate.fence_barrier_run IS
     'Coordinator-local linkage between a barrier token and the run edge that injected it.';
 COMMENT ON TABLE pgl_validate.table_plan IS
@@ -47,8 +51,12 @@ COMMENT ON TABLE pgl_validate.schedule IS
     'Persisted validation schedule definitions.';
 COMMENT ON TABLE pgl_validate.worker_task IS
     'Durable background-worker task queue for asynchronous validation orchestration.';
+COMMENT ON SEQUENCE pgl_validate.worker_task_task_id_seq IS
+    'Generates task_id values for pgl_validate.worker_task.';
 COMMENT ON TABLE pgl_validate.repair_run IS
     'Audited repair execution state.';
+COMMENT ON SEQUENCE pgl_validate.repair_run_repair_id_seq IS
+    'Generates repair_id values for pgl_validate.repair_run.';
 COMMENT ON TABLE pgl_validate.repair_result IS
     'Per-key outcome from a repair run.';
 

@@ -57,13 +57,13 @@ WITH documented_object(kind, identity, description) AS (
     FROM pg_namespace n
     WHERE n.nspname = 'pgl_validate'
     UNION ALL
-    SELECT CASE c.relkind WHEN 'r' THEN 'table' WHEN 'v' THEN 'view' ELSE c.relkind::text END,
+    SELECT CASE c.relkind WHEN 'r' THEN 'table' WHEN 'v' THEN 'view' WHEN 'S' THEN 'sequence' ELSE c.relkind::text END,
            c.relname,
            obj_description(c.oid, 'pg_class')
     FROM pg_class c
     JOIN pg_namespace n ON n.oid = c.relnamespace
     WHERE n.nspname = 'pgl_validate'
-      AND c.relkind IN ('r', 'v')
+      AND c.relkind IN ('r', 'S', 'v')
     UNION ALL
     SELECT CASE p.prokind WHEN 'a' THEN 'aggregate' ELSE 'function' END,
            p.proname || '(' || oidvectortypes(p.proargtypes) || ')',
@@ -80,6 +80,17 @@ WITH documented_object(kind, identity, description) AS (
     WHERE n.nspname = 'pgl_validate'
       AND t.typrelid = 0
       AND t.typelem = 0
+    UNION ALL
+    SELECT 'role',
+           r.rolname,
+           shobj_description(r.oid, 'pg_authid')
+    FROM pg_roles r
+    WHERE r.rolname IN (
+        'pgl_validate_validate',
+        'pgl_validate_discover',
+        'pgl_validate_orchestrate',
+        'pgl_validate_repair'
+    )
 )
 SELECT kind, identity
 FROM documented_object

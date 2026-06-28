@@ -76,6 +76,11 @@ $sqlObjectPatterns = @(
         NamePattern = { param($match) "pgl_validate.$($match.Groups[1].Value)" }
     },
     @{
+        Kind = 'SEQUENCE'
+        CreatePattern = '(?im)^\s*CREATE\s+SEQUENCE\s+pgl_validate\.([a-zA-Z_][a-zA-Z0-9_]*)\b'
+        NamePattern = { param($match) "pgl_validate.$($match.Groups[1].Value)" }
+    },
+    @{
         Kind = 'VIEW'
         CreatePattern = '(?im)^\s*CREATE(?:\s+OR\s+REPLACE)?\s+VIEW\s+pgl_validate\.([a-zA-Z_][a-zA-Z0-9_]*)\b'
         NamePattern = { param($match) "pgl_validate.$($match.Groups[1].Value)" }
@@ -172,6 +177,14 @@ foreach ($tableMatch in [regex]::Matches($catalogText, '(?ims)^\s*CREATE\s+TABLE
         [void] $tableColumns.Add($columnName)
         if (-not $commentedColumns.ContainsKey("$tableName.$columnName")) {
             Add-Failure "sql/bootstrap/001_catalog.sql: missing COMMENT ON COLUMN for pgl_validate.$tableName.$columnName."
+        }
+
+        if ($line -match '\bGENERATED\s+(ALWAYS|BY\s+DEFAULT)\s+AS\s+IDENTITY\b') {
+            $sequenceName = "pgl_validate.${tableName}_${columnName}_seq"
+            $commentPattern = "(?im)^\s*COMMENT\s+ON\s+SEQUENCE\s+$([regex]::Escape($sequenceName))(\s|$)"
+            if ($commentsText -notmatch $commentPattern) {
+                Add-Failure "sql/bootstrap/001_catalog.sql: missing COMMENT ON SEQUENCE for $sequenceName."
+            }
         }
     }
     $catalogTableColumns[$tableName] = $tableColumns
