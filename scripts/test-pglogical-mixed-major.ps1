@@ -431,8 +431,8 @@ try {
         -TimeoutSeconds 120 | Out-Null
 
     Write-Step "Starting provider on port $providerPort and target on port $targetPort"
-    $providerSocketOption = Get-PglUnixSocketOption -Directory $target
-    $targetSocketOption = Get-PglUnixSocketOption -Directory $target
+    $providerSocketOption = Get-PglUnixSocketOption -Directory (Join-Path $providerData 'socket')
+    $targetSocketOption = Get-PglUnixSocketOption -Directory (Join-Path $targetData 'socket')
     $providerOptions = (@(
         "-p $providerPort",
         '-h localhost',

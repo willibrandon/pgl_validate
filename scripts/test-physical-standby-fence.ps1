@@ -378,11 +378,12 @@ try {
     )
 
     Write-Step "Starting primary on port $script:PrimaryPort"
-    $socketOption = Get-PglUnixSocketOption -Directory $target
+    $primarySocketOption = Get-PglUnixSocketOption -Directory (Join-Path $primaryData 'socket')
+    $standbySocketOption = Get-PglUnixSocketOption -Directory (Join-Path $standbyData 'socket')
     $primaryOptions = (@(
         "-p $script:PrimaryPort",
         '-h 127.0.0.1',
-        $socketOption,
+        $primarySocketOption,
         '-c wal_level=replica',
         '-c hot_standby=on',
         '-c max_wal_senders=10',
@@ -430,7 +431,7 @@ SELECT pg_create_physical_replication_slot('pgl_validate_standby_slot');
     $standbyOptions = (@(
         "-p $script:StandbyPort",
         '-h 127.0.0.1',
-        $socketOption,
+        $standbySocketOption,
         '-c hot_standby=on'
     ) | Where-Object { $_ }) -join ' '
     Invoke-CheckedProcess `

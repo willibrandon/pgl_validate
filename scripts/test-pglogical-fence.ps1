@@ -503,7 +503,8 @@ try {
         -TimeoutSeconds 120 | Out-Null
 
     Write-Step "Starting pglogical-enabled test cluster on port $script:Port"
-    $socketOption = Get-PglUnixSocketOption -Directory $target
+    $socketOption = Get-PglUnixSocketOption -Directory (Join-Path $data 'socket')
+    $cascadeSocketOption = Get-PglUnixSocketOption -Directory (Join-Path $cascadeData 'socket')
     $serverOptions = (@(
         "-p $script:Port",
         '-h localhost',
@@ -523,7 +524,7 @@ try {
     $cascadeServerOptions = (@(
         "-p $script:CascadePort",
         '-h localhost',
-        $socketOption,
+        $cascadeSocketOption,
         '-c shared_preload_libraries=pglogical',
         '-c wal_level=logical',
         '-c track_commit_timestamp=on',

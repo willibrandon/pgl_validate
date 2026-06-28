@@ -345,7 +345,7 @@ try {
         -TimeoutSeconds 120 | Out-Null
 
     Write-Step "Starting native-logical test cluster on port $script:Port"
-    $socketOption = Get-PglUnixSocketOption -Directory $target
+    $socketOption = Get-PglUnixSocketOption -Directory (Join-Path $data 'socket')
     $serverOptions = (@(
         "-p $script:Port",
         '-h localhost',
