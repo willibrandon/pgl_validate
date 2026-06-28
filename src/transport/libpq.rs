@@ -188,6 +188,15 @@ pub(crate) struct SubscriptionStatus {
     pub(crate) forward_origins_json: String,
 }
 
+/// pglogical local node identity and advertised connection string.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) struct PglogicalLocalNode {
+    /// Local pglogical node name.
+    pub(crate) node_name: String,
+    /// DSN from the node's local interface.
+    pub(crate) dsn: String,
+}
+
 /// Native logical subscription status fetched from a remote target node.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub(crate) struct NativeSubscriptionStatus {
@@ -217,6 +226,25 @@ pub(crate) struct TableSyncStatus {
 pub(crate) struct ForwardingSubscription {
     /// Subscription name on the downstream subscriber.
     pub(crate) subscription_name: String,
+}
+
+/// pglogical subscription discovered on a remote node.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) struct PglogicalSubscriptionSummary {
+    /// Subscription name on the remote node.
+    pub(crate) subscription_name: String,
+    /// Subscription lifecycle status, such as `replicating`.
+    pub(crate) status: String,
+    /// Provider node name reported by pglogical.
+    pub(crate) provider_node: String,
+    /// Provider DSN stored by the subscription.
+    pub(crate) provider_dsn: String,
+    /// Logical replication slot name used by the subscription.
+    pub(crate) slot_name: String,
+    /// JSON text for the subscription replication-set array.
+    pub(crate) replication_sets_json: String,
+    /// JSON text for the subscription forward-origins array.
+    pub(crate) forward_origins_json: String,
 }
 
 /// pglogical conflict-history row fetched from a subscriber.
@@ -898,6 +926,117 @@ pub(crate) fn fetch_subscription_status(
         replication_sets_json: result.value(0, 4)?,
         forward_origins_json: result.value(0, 5)?,
     })
+}
+
+/// Fetch the local pglogical node identity and interface DSN from a remote node.
+pub(crate) fn fetch_pglogical_local_node(
+    dsn: &str,
+    connect_timeout_seconds: i32,
+    statement_timeout_ms: i32,
+    lock_timeout_ms: i32,
+) -> Result<PglogicalLocalNode, String> {
+    let conn = Connection::connect_with_timeout(dsn, connect_timeout_seconds)?;
+    conn.set_query_timeouts(statement_timeout_ms, lock_timeout_ms)?;
+
+    let result = conn.exec(
+        "SELECT n.node_name::text, ni.if_dsn::text \
+         FROM pglogical.local_node ln \
+         JOIN pglogical.node n ON n.node_id = ln.node_id \
+         JOIN pglogical.node_interface ni ON ni.if_id = ln.node_local_interface",
+    )?;
+    result.require_status(PGRES_TUPLES_OK)?;
+    if result.ntuples() != 1 || result.nfields() != 2 {
+        return Err(format!(
+            "expected one pglogical local node row with 2 columns, got {} row(s) and {} column(s)",
+            result.ntuples(),
+            result.nfields()
+        ));
+    }
+
+    Ok(PglogicalLocalNode {
+        node_name: result.value(0, 0)?,
+        dsn: result.value(0, 1)?,
+    })
+}
+
+/// Fetch pglogical subscription summaries from a remote node.
+pub(crate) fn fetch_pglogical_subscriptions(
+    dsn: &str,
+    connect_timeout_seconds: i32,
+    statement_timeout_ms: i32,
+    lock_timeout_ms: i32,
+) -> Result<Vec<PglogicalSubscriptionSummary>, String> {
+    let conn = Connection::connect_with_timeout(dsn, connect_timeout_seconds)?;
+    conn.set_query_timeouts(statement_timeout_ms, lock_timeout_ms)?;
+
+    let result = conn.exec(
+        "SELECT subscription_name, \
+                status, \
+                provider_node, \
+                provider_dsn, \
+                slot_name, \
+                COALESCE(to_json(replication_sets)::text, '[]') AS replication_sets_json, \
+                COALESCE(to_json(forward_origins)::text, '[]') AS forward_origins_json \
+         FROM pglogical.show_subscription_status() \
+         ORDER BY subscription_name",
+    )?;
+    result.require_status(PGRES_TUPLES_OK)?;
+    if result.nfields() != 7 {
+        return Err(format!(
+            "expected seven pglogical subscription columns, got {}",
+            result.nfields()
+        ));
+    }
+
+    let mut rows = Vec::with_capacity(result.ntuples() as usize);
+    for row in 0..result.ntuples() {
+        rows.push(PglogicalSubscriptionSummary {
+            subscription_name: result.value(row, 0)?,
+            status: result.value(row, 1)?,
+            provider_node: result.value(row, 2)?,
+            provider_dsn: result.value(row, 3)?,
+            slot_name: result.value(row, 4)?,
+            replication_sets_json: result.value(row, 5)?,
+            forward_origins_json: result.value(row, 6)?,
+        });
+    }
+
+    Ok(rows)
+}
+
+/// Ensure a remote pglogical subscription carries the pgl_validate barrier set.
+pub(crate) fn ensure_remote_pglogical_barrier_subscription(
+    dsn: &str,
+    subscription_name: &str,
+    connect_timeout_seconds: i32,
+    statement_timeout_ms: i32,
+    lock_timeout_ms: i32,
+) -> Result<(), String> {
+    let conn = Connection::connect_with_timeout(dsn, connect_timeout_seconds)?;
+    conn.set_query_timeouts(statement_timeout_ms, lock_timeout_ms)?;
+
+    let subscription_name = sql_literal(subscription_name);
+    let sql = format!(
+        "SELECT pgl_validate.ensure_pglogical_barrier_repset(); \
+         DO $pgl_validate$ \
+         BEGIN \
+             IF NOT EXISTS ( \
+                 SELECT 1 \
+                 FROM pglogical.show_subscription_status({subscription_name}::name) AS s \
+                 WHERE 'pgl_validate_barrier' = ANY (COALESCE(s.replication_sets, ARRAY[]::text[])) \
+             ) THEN \
+                 PERFORM pglogical.alter_subscription_add_replication_set( \
+                     {subscription_name}::name, \
+                     'pgl_validate_barrier'::name \
+                 ); \
+             END IF; \
+         END \
+         $pgl_validate$;"
+    );
+
+    let result = conn.exec(&sql)?;
+    result.require_status(PGRES_COMMAND_OK)?;
+    Ok(())
 }
 
 /// Fetch native logical subscription status from a remote target node.

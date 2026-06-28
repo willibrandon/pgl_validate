@@ -193,7 +193,6 @@ DECLARE
     info record;
     action_rec record;
     filter_rec record;
-    status_text text;
 BEGIN
     IF to_regprocedure('pglogical.show_repset_table_info(regclass,text[])') IS NULL THEN
         RAISE EXCEPTION 'pglogical extension is not installed in this database'
@@ -296,13 +295,12 @@ BEGIN
 
     sync_status := 'r';
     IF subscription_name IS NOT NULL THEN
-        SELECT s.status
-        INTO status_text
-        FROM pglogical.show_subscription_table(subscription_name, relation) AS s;
-
-        IF status_text IS NOT NULL THEN
-            sync_status := left(status_text, 1)::"char";
-        END IF;
+        SELECT s.sync_status::"char"
+        INTO sync_status
+        FROM pgl_validate.pglogical_subscription_table_sync_status(
+            subscription_name,
+            relation
+        ) AS s;
     ELSE
         SELECT lss.sync_status
         INTO sync_status

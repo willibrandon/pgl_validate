@@ -47,6 +47,25 @@ SELECT *
 FROM pgl_validate.compare_table('public.accounts'::regclass);
 ```
 
+For pglogical validation, register each peer database endpoint once. The helper
+discovers the pglogical node/subscription metadata when it is unambiguous and
+installs the validation barrier replication set on the relevant subscriptions:
+
+```sql
+SELECT *
+FROM pgl_validate.register_pglogical_peer(
+    p_peer_name => 'node_beta',
+    p_peer_dsn  => 'host=localhost port=5432 dbname=db_beta user=postgres'
+);
+
+SELECT *
+FROM pgl_validate.compare_table('public.accounts'::regclass, ARRAY['node_beta']);
+```
+
+Two pglogical nodes may live in separate databases on the same PostgreSQL
+instance. The DSN still identifies the peer because `dbname` is part of the
+endpoint.
+
 On Windows, run the same command through `scripts\pgrx-vs.ps1` so bindgen sees
 the Visual Studio C++ and Windows SDK headers.
 

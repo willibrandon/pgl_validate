@@ -790,12 +790,12 @@ DECLARE
     skipped_peer_details text[] := ARRAY[]::text[];
     edge_seq int := 0;
     current_edge_ids int[] := ARRAY[]::int[];
+    local_pglogical_rec record;
     subscription_rec record;
     reverse_subscription_rec record;
     reverse_subscription_count int;
     subscription_wait_deadline timestamptz;
-    reverse_status_text text;
-    reverse_sync_status "char";
+    reverse_sync_status text;
     table_sync_rec record;
     fence_rec pgl_validate.fence_attempt;
     peer_names text[];
@@ -980,8 +980,7 @@ BEGIN
             USING ERRCODE = '0A000';
     END IF;
     provider_dsn := NULLIF(options->>'provider_dsn', '');
-    provider_node := COALESCE(NULLIF(options->>'provider_node', ''), 'local');
-    provider_node_filter := provider_node;
+    provider_node := NULLIF(options->>'provider_node', '');
     fence_timeout_ms := COALESCE(
         (NULLIF(options->>'fence_timeout_ms', ''))::int,
         NULLIF(current_setting('pgl_validate.fence_timeout_ms', true), '')::int,
@@ -1121,6 +1120,18 @@ BEGIN
     INTO selected_peer_count, standby_peer_count, pglogical_peer_count, native_subscription_peer_count
     FROM pgl_validate.peer p
     WHERE p.name = ANY (peer_names);
+
+    IF pglogical_peer_count > 0 THEN
+        SELECT *
+        INTO local_pglogical_rec
+        FROM pgl_validate.pglogical_local_node();
+
+        provider_dsn := COALESCE(provider_dsn, local_pglogical_rec.dsn);
+        provider_node := COALESCE(provider_node, local_pglogical_rec.node_name);
+    END IF;
+
+    provider_node := COALESCE(provider_node, 'local');
+    provider_node_filter := provider_node;
 
     requested_backend := COALESCE(
         requested_backend,
@@ -1960,25 +1971,22 @@ BEGIN
                         USING ERRCODE = '57014';
                 END IF;
 
-                SELECT s.status
-                INTO reverse_status_text
-                FROM pglogical.show_subscription_table(
+                SELECT s.sync_status, s.sync_status_lsn
+                INTO table_sync_rec
+                FROM pgl_validate.pglogical_subscription_table_sync_status(
                     reverse_subscription_rec.subscription_name::name,
                     p_table_name
                 ) AS s;
 
-                IF reverse_status_text IS NULL THEN
-                    CONTINUE;
-                END IF;
-
-                reverse_sync_status := left(reverse_status_text, 1)::"char";
+                reverse_sync_status := table_sync_rec.sync_status;
                 IF reverse_sync_status <> 'r' THEN
                     partial_mode := true;
                     skipped_peers := skipped_peers || peer_rec.name;
                     skipped_peer_details := skipped_peer_details || format(
-                        '%s reverse sync_status=%s',
+                        '%s reverse sync_status=%s sync_status_lsn=%s',
                         peer_rec.name,
-                        COALESCE(reverse_sync_status::text, '<missing>')
+                        COALESCE(reverse_sync_status, '<missing>'),
+                        COALESCE(table_sync_rec.sync_status_lsn::text, '<none>')
                     );
                     peer_names := array_remove(peer_names, peer_rec.name);
 
@@ -2005,9 +2013,10 @@ BEGIN
                         v_rel_name,
                         'SYNC_NOT_READY',
                         format(
-                            'pglogical reverse subscription %s table sync_status=%s; peer skipped for this table',
+                            'pglogical reverse subscription %s table sync_status=%s sync_status_lsn=%s; peer skipped for this table',
                             reverse_subscription_rec.subscription_name,
-                            COALESCE(reverse_sync_status::text, '<missing>')
+                            COALESCE(reverse_sync_status, '<missing>'),
+                            COALESCE(table_sync_rec.sync_status_lsn::text, '<none>')
                         )
                     )
                     ON CONFLICT DO NOTHING;
@@ -4245,9 +4254,15 @@ BEGIN
         );
     ELSIF differ_count = 0 THEN
         verdict := 'match';
-        IF participant_count = 1 THEN
+        IF participant_count = 1 AND selected_peer_count = 0 THEN
             result_reason := format(
                 'single local participant; no peers registered or requested; validated_property=%s',
+                validated_property
+            );
+        ELSIF participant_count = 1 THEN
+            result_reason := format(
+                'no remote peer completed validation; selected_peer_count=%s; validated_property=%s',
+                selected_peer_count,
                 validated_property
             );
         ELSE
@@ -4417,8 +4432,9 @@ DECLARE
     remote_seq_rec record;
     subscription_rec record;
     fence_rec pgl_validate.fence_attempt;
+    local_pglogical_rec record;
     provider_dsn text := NULLIF(options->>'provider_dsn', '');
-    provider_node text := COALESCE(NULLIF(options->>'provider_node', ''), 'local');
+    provider_node text := NULLIF(options->>'provider_node', '');
     fence_timeout_ms int := COALESCE(
         (NULLIF(options->>'fence_timeout_ms', ''))::int,
         NULLIF(current_setting('pgl_validate.fence_timeout_ms', true), '')::int,
@@ -4524,6 +4540,13 @@ BEGIN
         WHERE p.name = ANY (peer_names)
           AND p.backend = 'pglogical'
     ) THEN
+        SELECT *
+        INTO local_pglogical_rec
+        FROM pgl_validate.pglogical_local_node();
+
+        provider_dsn := COALESCE(provider_dsn, local_pglogical_rec.dsn);
+        provider_node := COALESCE(provider_node, local_pglogical_rec.node_name);
+
         IF provider_dsn IS NULL THEN
             RAISE EXCEPTION
                 'options.provider_dsn is required when comparing pglogical peers'
@@ -4621,6 +4644,8 @@ BEGIN
             END IF;
         END LOOP;
     END IF;
+
+    provider_node := COALESCE(provider_node, 'local');
 
     UPDATE pgl_validate.run
     SET status = 'running'

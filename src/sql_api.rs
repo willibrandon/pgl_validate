@@ -747,6 +747,147 @@ AS 'MODULE_PATHNAME', 'remote_pglogical_subscription_status_wrapper';
         ))
     }
 
+    /// Fetch the remote node's local pglogical identity and interface DSN.
+    #[pg_extern(
+        volatile,
+        parallel_unsafe,
+        sql = r#"
+CREATE FUNCTION pgl_validate.remote_pglogical_local_node(
+    dsn text,
+    connect_timeout_seconds integer DEFAULT 10,
+    statement_timeout_ms integer DEFAULT 600000,
+    lock_timeout_ms integer DEFAULT 30000
+)
+RETURNS TABLE (
+    node_name text,
+    dsn text
+)
+LANGUAGE c
+STRICT
+VOLATILE
+PARALLEL UNSAFE
+AS 'MODULE_PATHNAME', 'remote_pglogical_local_node_wrapper';
+"#
+    )]
+    fn remote_pglogical_local_node(
+        dsn: &str,
+        connect_timeout_seconds: default!(i32, 10),
+        statement_timeout_ms: default!(i32, 600000),
+        lock_timeout_ms: default!(i32, 30000),
+    ) -> TableIterator<'static, (name!(node_name, String), name!(dsn, String))> {
+        let node = transport::libpq::fetch_pglogical_local_node(
+            dsn,
+            connect_timeout_seconds,
+            statement_timeout_ms,
+            lock_timeout_ms,
+        )
+        .unwrap_or_else(|err| pgrx::error!("{err}"));
+
+        TableIterator::once((node.node_name, node.dsn))
+    }
+
+    /// Fetch all pglogical subscriptions from a remote node.
+    #[pg_extern(
+        volatile,
+        parallel_unsafe,
+        sql = r#"
+CREATE FUNCTION pgl_validate.remote_pglogical_subscriptions(
+    dsn text,
+    connect_timeout_seconds integer DEFAULT 10,
+    statement_timeout_ms integer DEFAULT 600000,
+    lock_timeout_ms integer DEFAULT 30000
+)
+RETURNS TABLE (
+    subscription_name text,
+    status text,
+    provider_node text,
+    provider_dsn text,
+    slot_name text,
+    replication_sets_json text,
+    forward_origins_json text
+)
+LANGUAGE c
+STRICT
+VOLATILE
+PARALLEL UNSAFE
+AS 'MODULE_PATHNAME', 'remote_pglogical_subscriptions_wrapper';
+"#
+    )]
+    fn remote_pglogical_subscriptions(
+        dsn: &str,
+        connect_timeout_seconds: default!(i32, 10),
+        statement_timeout_ms: default!(i32, 600000),
+        lock_timeout_ms: default!(i32, 30000),
+    ) -> TableIterator<
+        'static,
+        (
+            name!(subscription_name, String),
+            name!(status, String),
+            name!(provider_node, String),
+            name!(provider_dsn, String),
+            name!(slot_name, String),
+            name!(replication_sets_json, String),
+            name!(forward_origins_json, String),
+        ),
+    > {
+        let rows = transport::libpq::fetch_pglogical_subscriptions(
+            dsn,
+            connect_timeout_seconds,
+            statement_timeout_ms,
+            lock_timeout_ms,
+        )
+        .unwrap_or_else(|err| pgrx::error!("{err}"));
+
+        TableIterator::new(rows.into_iter().map(|row| {
+            (
+                row.subscription_name,
+                row.status,
+                row.provider_node,
+                row.provider_dsn,
+                row.slot_name,
+                row.replication_sets_json,
+                row.forward_origins_json,
+            )
+        }))
+    }
+
+    /// Ensure a remote pglogical subscription includes the barrier replication set.
+    #[pg_extern(
+        volatile,
+        parallel_unsafe,
+        sql = r#"
+CREATE FUNCTION pgl_validate.remote_ensure_pglogical_barrier_subscription(
+    dsn text,
+    subscription_name text,
+    connect_timeout_seconds integer DEFAULT 10,
+    statement_timeout_ms integer DEFAULT 600000,
+    lock_timeout_ms integer DEFAULT 30000
+)
+RETURNS void
+LANGUAGE c
+STRICT
+VOLATILE
+PARALLEL UNSAFE
+AS 'MODULE_PATHNAME', 'remote_ensure_pglogical_barrier_subscription_wrapper';
+"#
+    )]
+    fn remote_ensure_pglogical_barrier_subscription(
+        dsn: &str,
+        subscription_name: &str,
+        connect_timeout_seconds: default!(i32, 10),
+        statement_timeout_ms: default!(i32, 600000),
+        lock_timeout_ms: default!(i32, 30000),
+    ) {
+        transport::libpq::ensure_remote_pglogical_barrier_subscription(
+            dsn,
+            subscription_name,
+            connect_timeout_seconds,
+            statement_timeout_ms,
+            lock_timeout_ms,
+        )
+        .unwrap_or_else(|err| pgrx::error!("{err}"));
+    }
+
     /// Fetch native logical subscription status from a remote target node.
     #[pg_extern(
         volatile,

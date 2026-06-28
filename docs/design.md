@@ -215,7 +215,7 @@ The last row is why a correct validator must be contract-aware: a row-filtered o
 | Node-local execution | **coordinator-generated SQL** run via SPI (local) and libpq (remote) | Planner sees real predicates → index range scans; `EXPLAIN`-able |
 | Transport | **libpq** via `pq-sys`, non-blocking | Same auth/TLS/`pg_hba` as core; one `WaitEventSet` polls N peers |
 | Orchestration | **background worker** (`pgrx::bgworkers`) | Long runs, scheduling, survives disconnect, throttling |
-| Contract source | `pglogical.replication_set*`, `local_sync_status`, `table_data_filtered()`, `show_repset_table_info()`, `show_subscription_table()`, `pg_replication_origin*` | Authoritative; no re-derivation of semantics |
+| Contract source | `pglogical.replication_set*`, `local_sync_status`, `table_data_filtered()`, `show_repset_table_info()`, `show_subscription_status()`, `pg_replication_origin*` | Authoritative; no re-derivation of semantics |
 
 ---
 
@@ -310,7 +310,8 @@ Equality is meaningful only relative to what the topology promises. `pgl_validat
 - `pglogical.show_repset_table_info(relation, repsets) → (relid, nspname, relname, att_list, has_row_filter)` — convenience for column list + filter presence.
 - `pglogical.table_data_filtered(NULL::reltype, relation, repsets) → SETOF reltype` — returns the provider rows that **pass the row filter(s)** for the repsets (`pglogical_functions.c:2086`). It applies the **row filter only**; it does **not** project columns — it returns full `reltype` rows. Column projection is obtained separately from `att_list` (`show_repset_table_info` / `replication_set_table.set_att_list`) and applied by `pgl_validate` when computing the digest.
 - `pglogical.show_subscription_status()` → `status, provider_node, replication_sets, forward_origins` — topology and edges.
-- `pglogical.show_subscription_table(subscription, relation) → status` — per-table sync status from the subscriber side.
+
+`pglogical.show_subscription_table(subscription, relation)` is display-oriented and may return `unknown` for a table that has no `local_sync_status` row. `pgl_validate` must not map that text to a sync-state character. The raw catalog is authoritative: if the subscription exists and has no per-table `local_sync_status` row, the table is treated as ready for validation unless the contract discovery proves it is outside the requested replication set.
 
 ### 9.2 Sync state gate
 
@@ -487,6 +488,8 @@ For exact pglogical validation, each remote database must be named in `pgl_valid
 
 Each peer entry identifies the remote **database endpoint** and the subscription edge to fence. `pglogical.node` rows alone are not sufficient: they name pglogical nodes, but they do not provide the libpq DSN to the other database, the subscription to validate, the reverse subscription for bidirectional coverage, or the requested replication-set contract. A same-instance two-database deployment therefore uses `pgl_validate.peer` the same way as a cross-host deployment: `dsn` differs at least by `dbname`, `subscription_name` names the remote subscription receiving from the coordinator, and `reverse_subscription_name` names the local subscription receiving from that peer when bidirectional validation is required.
 
+Setup must be one command for the common pglogical case, not manual catalog editing. `pgl_validate.register_pglogical_peer(...)` discovers the remote node, discovers the forward subscription that receives from the local pglogical node when unambiguous, discovers the local reverse subscription when present, creates/verifies the dedicated barrier repset on both nodes, adds it to the relevant subscriptions, and upserts `pgl_validate.peer`. `pgl_validate.unregister_pglogical_peer(...)` removes the registration without modifying the replication topology. During validation, `provider_dsn` and `provider_node` default from the local pglogical node interface when not supplied.
+
 ### 13.2 Native logical replication (secondary, fully specified)
 
 - **Topology/state:** `pg_subscription`, `pg_subscription_rel.srsubstate` (`i` init, `d` data copy, `f` finished copy, `s` sync, `r` ready) — only `r` validated.
@@ -575,6 +578,17 @@ pgl_validate.compare(
 
 pgl_validate.compare_table(table_name regclass, peers text[] DEFAULT NULL,
                            options jsonb DEFAULT '{}') RETURNS pgl_validate.table_result;
+pgl_validate.register_pglogical_peer(
+    p_peer_name text,
+    p_peer_dsn text,
+    p_subscription_name name DEFAULT NULL,
+    p_reverse_subscription_name name DEFAULT NULL,
+    p_replication_sets text[] DEFAULT NULL,
+    p_connect_timeout_seconds integer DEFAULT 10,
+    p_statement_timeout_ms integer DEFAULT 600000,
+    p_lock_timeout_ms integer DEFAULT 30000
+) RETURNS pgl_validate.peer;
+pgl_validate.unregister_pglogical_peer(p_peer_name text) RETURNS boolean;
 pgl_validate.cancel(run_id bigint) RETURNS boolean;
 pgl_validate.pause(run_id bigint)  RETURNS boolean;
 pgl_validate.resume(run_id bigint) RETURNS boolean;   -- also resumes a crashed run
@@ -1397,21 +1411,11 @@ SELECT * FROM pgl_validate.sequences(4217) WHERE NOT within_contract;
 
 ```sql
 -- Run in db_alpha. db_beta is another database on the same PostgreSQL instance.
-INSERT INTO pgl_validate.peer(
-    name, dsn, backend, subscription_name, reverse_subscription_name, replication_sets)
-VALUES (
-    'db_beta',
-    'host=localhost port=5432 dbname=db_beta user=postgres',
-    'pglogical',
-    'sub_beta_from_alpha',   -- subscription in db_beta receiving from db_alpha
-    'sub_alpha_from_beta',   -- subscription in db_alpha receiving from db_beta
-    ARRAY['default'])
-ON CONFLICT (name) DO UPDATE
-SET dsn = EXCLUDED.dsn,
-    backend = EXCLUDED.backend,
-    subscription_name = EXCLUDED.subscription_name,
-    reverse_subscription_name = EXCLUDED.reverse_subscription_name,
-    replication_sets = EXCLUDED.replication_sets;
+SELECT *
+FROM pgl_validate.register_pglogical_peer(
+    p_peer_name => 'db_beta',
+    p_peer_dsn  => 'host=localhost port=5432 dbname=db_beta user=postgres'
+);
 
 SELECT *
 FROM pgl_validate.compare_table('public.accounts'::regclass, ARRAY['db_beta']);

@@ -411,6 +411,16 @@ COMMENT ON FUNCTION pgl_validate.native_table_contract(regclass, text[], name) I
     'Resolve native logical publication actions, effective column list, exact row filter, sync state, and validated property for a relation.';
 COMMENT ON FUNCTION pgl_validate.ensure_pglogical_barrier_repset() IS
     'Create or verify the dedicated insert-only pglogical replication set that carries fence barrier tokens.';
+COMMENT ON FUNCTION pgl_validate.pglogical_local_node() IS
+    'Return the current database''s pglogical node name and local interface DSN.';
+COMMENT ON FUNCTION pgl_validate.pglogical_subscription_table_sync_status(name, regclass) IS
+    'Return raw pglogical per-table synchronization state for a local subscription, treating missing table-sync rows as ready.';
+COMMENT ON FUNCTION pgl_validate.ensure_pglogical_subscription_barrier(name) IS
+    'Ensure a local pglogical subscription includes the pgl_validate barrier replication set.';
+COMMENT ON FUNCTION pgl_validate.register_pglogical_peer(text, text, name, name, text[], integer, integer, integer) IS
+    'Register or update a pglogical peer, discover forward and reverse subscriptions when unambiguous, and install the barrier replication set on those subscriptions.';
+COMMENT ON FUNCTION pgl_validate.unregister_pglogical_peer(text) IS
+    'Remove a pglogical peer registration without changing the replication topology.';
 COMMENT ON FUNCTION pgl_validate.ensure_native_barrier_publication(text) IS
     'Create or verify the dedicated insert-only native logical publication that carries fence barrier tokens.';
 COMMENT ON FUNCTION pgl_validate.fence_pglogical_edge(bigint, integer, integer, text, text, text, text, text, text, text, text[], integer, integer, integer, integer, integer) IS
@@ -554,6 +564,12 @@ COMMENT ON FUNCTION pgl_validate.remote_standby_replay_lag(text, pg_lsn, integer
     'Fetch physical-standby recovery state, replay LSN, and time lag relative to a primary WAL LSN.';
 COMMENT ON FUNCTION pgl_validate.remote_pglogical_subscription_status(text, text, integer, integer, integer) IS
     'Fetch pglogical subscription status from a remote target over libpq with bounded timeouts.';
+COMMENT ON FUNCTION pgl_validate.remote_pglogical_local_node(text, integer, integer, integer) IS
+    'Fetch a remote node''s pglogical node name and local interface DSN over libpq with bounded timeouts.';
+COMMENT ON FUNCTION pgl_validate.remote_pglogical_subscriptions(text, integer, integer, integer) IS
+    'Fetch pglogical subscription summaries from a remote node over libpq with bounded timeouts.';
+COMMENT ON FUNCTION pgl_validate.remote_ensure_pglogical_barrier_subscription(text, text, integer, integer, integer) IS
+    'Ensure a remote pglogical subscription includes the pgl_validate barrier replication set.';
 COMMENT ON FUNCTION pgl_validate.remote_native_subscription_status(text, text, integer, integer, integer) IS
     'Fetch native logical subscription status from a remote target over libpq with bounded timeouts.';
 COMMENT ON FUNCTION pgl_validate.remote_pglogical_table_sync_status(text, text, text, text, integer, integer, integer) IS
@@ -655,6 +671,8 @@ GRANT EXECUTE ON FUNCTION pgl_validate.column_encoding_mode(oid)
 GRANT EXECUTE ON FUNCTION pgl_validate.comparison_key_cols(regclass)
     TO pgl_validate_discover;
 GRANT EXECUTE ON FUNCTION pgl_validate.pglogical_table_contract(regclass, text[], name)
+    TO pgl_validate_discover;
+GRANT EXECUTE ON FUNCTION pgl_validate.pglogical_subscription_table_sync_status(name, regclass)
     TO pgl_validate_discover;
 GRANT EXECUTE ON FUNCTION pgl_validate.native_table_contract(regclass, text[], name)
     TO pgl_validate_discover;

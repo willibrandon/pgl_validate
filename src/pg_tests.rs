@@ -3781,7 +3781,7 @@ mod tests {
     }
 
     #[pg_test]
-    fn compare_table_refuses_unfenced_pglogical_peer() {
+    fn compare_table_without_pglogical_node_reports_setup_error() {
         Spi::run(
             "
             CREATE TABLE unfenced_pglogical_peer(id int PRIMARY KEY, value text);
@@ -3801,7 +3801,7 @@ mod tests {
                 BEGIN
                     PERFORM pgl_validate.compare_table('unfenced_pglogical_peer'::regclass);
                 EXCEPTION WHEN others THEN
-                    IF SQLERRM = 'options.provider_dsn is required when comparing pglogical peers' THEN
+                    IF SQLERRM = 'pglogical extension is not installed in this database' THEN
                         rejected := true;
                     ELSE
                         RAISE;
@@ -3809,7 +3809,7 @@ mod tests {
                 END;
 
                 IF NOT rejected THEN
-                    RAISE EXCEPTION 'expected compare_table to reject an unfenced pglogical peer';
+                    RAISE EXCEPTION 'expected compare_table to reject a pglogical peer without local pglogical setup';
                 END IF;
             END
             $$;
@@ -3819,11 +3819,47 @@ mod tests {
     }
 
     #[pg_test]
+    fn unregister_pglogical_peer_removes_only_pglogical_registration() {
+        Spi::run(
+            "
+            DELETE FROM pgl_validate.peer;
+            INSERT INTO pgl_validate.peer(name, dsn, backend)
+            VALUES
+                ('pglogical_peer', 'dbname=' || current_database(), 'pglogical'),
+                ('native_peer', 'dbname=' || current_database(), 'native');
+            ",
+        )
+        .unwrap();
+
+        let outcome = Spi::get_one::<String>(
+            "
+            SELECT pgl_validate.unregister_pglogical_peer('pglogical_peer')::text || ';' ||
+                   pgl_validate.unregister_pglogical_peer('pglogical_peer')::text || ';' ||
+                   EXISTS (
+                       SELECT 1
+                       FROM pgl_validate.peer
+                       WHERE name = 'native_peer'
+                   )::text
+            ",
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(outcome, "true;false;true");
+    }
+
+    #[pg_test]
     fn compare_table_skip_peer_fence_timeout_returns_partial() {
         let dsn = local_dsn();
+        let backend_pid = Spi::get_one::<i32>("SELECT pg_backend_pid()")
+            .unwrap()
+            .unwrap();
+        let node_name = identifier(&format!("pgl_validate_skip_local_{backend_pid}"));
 
         Spi::run(&format!(
             "
+            CREATE EXTENSION pglogical;
+            SELECT pglogical.create_node({node_name}, 'dbname=' || current_database());
             CREATE TABLE skip_peer_timeout_target(id int PRIMARY KEY, value text);
             INSERT INTO skip_peer_timeout_target VALUES (1, 'same');
             DELETE FROM pgl_validate.peer;
@@ -3846,6 +3882,7 @@ mod tests {
                 1000
             );
             ",
+            node_name = sql_literal(&node_name),
         ))
         .unwrap();
 
@@ -5592,6 +5629,110 @@ mod tests {
 
         assert!(!has_row_filter);
         assert_eq!(att_count, 3);
+    }
+
+    #[pg_test]
+    fn pglogical_subscription_table_sync_status_uses_raw_sync_catalog() {
+        let backend_pid = Spi::get_one::<i32>("SELECT pg_backend_pid()")
+            .unwrap()
+            .unwrap();
+        let table_name = identifier(&format!("pglogical_sync_ready_{backend_pid}"));
+        let local_node = identifier(&format!("pgl_validate_sync_local_{backend_pid}"));
+        let remote_node = identifier(&format!("pgl_validate_sync_remote_{backend_pid}"));
+        let subscription_name = identifier(&format!("pgl_validate_sync_sub_{backend_pid}"));
+        let remote_node_id = 1_000_000_000_i64 + i64::from(backend_pid);
+        let remote_interface_id = 1_100_000_000_i64 + i64::from(backend_pid);
+        let subscription_id = 1_200_000_000_i64 + i64::from(backend_pid);
+
+        Spi::run(&format!(
+            "
+            CREATE EXTENSION pglogical;
+            SELECT pglogical.create_node({local_node}, 'dbname=' || current_database());
+            CREATE TABLE public.{table_name}(id int PRIMARY KEY);
+
+            INSERT INTO pglogical.node(node_id, node_name)
+            VALUES ({remote_node_id}::oid, {remote_node});
+            INSERT INTO pglogical.node_interface(if_id, if_name, if_nodeid, if_dsn)
+            VALUES ({remote_interface_id}::oid, {remote_node}, {remote_node_id}::oid, 'dbname=' || current_database());
+            INSERT INTO pglogical.subscription(
+                sub_id,
+                sub_name,
+                sub_origin,
+                sub_target,
+                sub_origin_if,
+                sub_target_if,
+                sub_slot_name,
+                sub_replication_sets,
+                sub_forward_origins
+            )
+            SELECT
+                {subscription_id}::oid,
+                {subscription_name},
+                {remote_node_id}::oid,
+                ln.node_id,
+                {remote_interface_id}::oid,
+                ln.node_local_interface,
+                {subscription_name},
+                ARRAY['default'],
+                ARRAY[]::text[]
+            FROM pglogical.local_node ln;
+            ",
+            local_node = sql_literal(&local_node),
+            remote_node = sql_literal(&remote_node),
+            subscription_name = sql_literal(&subscription_name),
+        ))
+        .unwrap();
+
+        let missing_row_status = Spi::get_one::<String>(&format!(
+            "
+            SELECT sync_status
+            FROM pgl_validate.pglogical_subscription_table_sync_status(
+                {subscription_name}::name,
+                'public.{table_name}'::regclass
+            )
+            ",
+            subscription_name = sql_literal(&subscription_name)
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(missing_row_status, "r");
+
+        Spi::run(&format!(
+            "
+            INSERT INTO pglogical.local_sync_status(
+                sync_kind,
+                sync_subid,
+                sync_nspname,
+                sync_relname,
+                sync_status,
+                sync_statuslsn
+            )
+            VALUES (
+                'd',
+                {subscription_id}::oid,
+                'public',
+                {table_name},
+                'd',
+                '0/30'
+            );
+            ",
+            table_name = sql_literal(&table_name)
+        ))
+        .unwrap();
+
+        let raw_status = Spi::get_one::<String>(&format!(
+            "
+            SELECT sync_status || ';' || sync_status_lsn::text
+            FROM pgl_validate.pglogical_subscription_table_sync_status(
+                {subscription_name}::name,
+                'public.{table_name}'::regclass
+            )
+            ",
+            subscription_name = sql_literal(&subscription_name)
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(raw_status, "d;0/30");
     }
 
     #[pg_test]

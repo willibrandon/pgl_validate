@@ -685,8 +685,13 @@ SELECT EXISTS (
 
     Write-Step 'Running compare_table through real pglogical fencing'
     Invoke-Sql -Database 'provider' -Sql @"
-INSERT INTO pgl_validate.peer(name, dsn, backend, subscription_name, replication_sets)
-VALUES ('target', $targetDsnSql, 'pglogical', 'sub', ARRAY['default'])
+SELECT pgl_validate.register_pglogical_peer(
+    'target',
+    $targetDsnSql,
+    'sub'::name,
+    NULL,
+    ARRAY['default']
+)
 "@ | Out-Null
     $compareResult = Invoke-Sql -Database 'provider' -Sql @"
 SELECT run_id::text || ';' || verdict
@@ -728,15 +733,26 @@ SELECT EXISTS (
         throw 'compare_table did not record a converged fence'
     }
 
+    $registeredPeer = Invoke-Sql -Database 'provider' -Sql @"
+SELECT subscription_name::text || ';' ||
+       COALESCE(reverse_subscription_name::text, '<null>') || ';' ||
+       (replication_sets = ARRAY['default'])::text
+FROM pgl_validate.peer
+WHERE name = 'target'
+"@
+    if ($registeredPeer -ne 'sub;<null>;true') {
+        throw "register_pglogical_peer did not persist the expected target peer: $registeredPeer"
+    }
+
     Write-Step "Validating pglogical direct fan-out through slots $slotName and $fanoutSlotName"
     Invoke-Sql -Database 'provider' -Sql @"
-INSERT INTO pgl_validate.peer(name, dsn, backend, subscription_name, replication_sets)
-VALUES ('fanout', $fanoutDsnSql, 'pglogical', 'sub_fanout', ARRAY['default'])
-ON CONFLICT (name) DO UPDATE
-SET dsn = EXCLUDED.dsn,
-    backend = EXCLUDED.backend,
-    subscription_name = EXCLUDED.subscription_name,
-    replication_sets = EXCLUDED.replication_sets
+SELECT pgl_validate.register_pglogical_peer(
+    'fanout',
+    $fanoutDsnSql,
+    'sub_fanout'::name,
+    NULL,
+    ARRAY['default']
+)
 "@ | Out-Null
     $fanoutResult = Invoke-Sql -Database 'provider' -Sql @"
 SELECT run_id::text || ';' || verdict
@@ -956,12 +972,12 @@ SELECT pglogical.create_subscription(
         -TimeoutSeconds $TimeoutSeconds
     Wait-SqlEqual `
         -Database 'provider' `
-        -Sql "SELECT COALESCE((SELECT left(status, 1) FROM pglogical.show_subscription_table('sub_from_target'::name, 'public.bidir_accounts'::regclass)), '<missing>')" `
+        -Sql "SELECT sync_status FROM pgl_validate.pglogical_subscription_table_sync_status('sub_from_target'::name, 'public.bidir_accounts'::regclass)" `
         -Expected 'r' `
         -TimeoutSeconds $TimeoutSeconds
     Wait-SqlEqual `
         -Database 'provider' `
-        -Sql "SELECT COALESCE((SELECT left(status, 1) FROM pglogical.show_subscription_table('sub_from_fanout'::name, 'public.bidir_accounts'::regclass)), '<missing>')" `
+        -Sql "SELECT sync_status FROM pgl_validate.pglogical_subscription_table_sync_status('sub_from_fanout'::name, 'public.bidir_accounts'::regclass)" `
         -Expected 'r' `
         -TimeoutSeconds $TimeoutSeconds
     $reverseSlotName = Wait-SubscriptionReady `
@@ -978,16 +994,20 @@ SELECT pglogical.create_subscription(
         -TimeoutSeconds $TimeoutSeconds
 
     Invoke-Sql -Database 'provider' -Sql @"
-UPDATE pgl_validate.peer
-SET replication_sets = ARRAY['pgl_validate_bidir'],
-    reverse_subscription_name = 'sub_from_target'
-WHERE name = 'target'
-"@ | Out-Null
-    Invoke-Sql -Database 'provider' -Sql @"
-UPDATE pgl_validate.peer
-SET replication_sets = ARRAY['pgl_validate_bidir'],
-    reverse_subscription_name = 'sub_from_fanout'
-WHERE name = 'fanout'
+SELECT pgl_validate.register_pglogical_peer(
+    'target',
+    $targetDsnSql,
+    'sub'::name,
+    'sub_from_target'::name,
+    ARRAY['pgl_validate_bidir']
+);
+SELECT pgl_validate.register_pglogical_peer(
+    'fanout',
+    $fanoutDsnSql,
+    'sub_fanout'::name,
+    'sub_from_fanout'::name,
+    ARRAY['pgl_validate_bidir']
+)
 "@ | Out-Null
     $bidirectionalResult = Invoke-Sql -Database 'provider' -Sql @"
 SELECT run_id::text || ';' || verdict
@@ -2110,8 +2130,13 @@ SELECT pglogical.create_subscription(
         -ProviderDatabase 'seq_provider' `
         -TimeoutSeconds $TimeoutSeconds
     Invoke-Sql -Database 'seq_provider' -Sql @"
-INSERT INTO pgl_validate.peer(name, dsn, backend, subscription_name, replication_sets)
-VALUES ('seq_target', $sequenceTargetDsnSql, 'pglogical', 'seq_sub', ARRAY['default'])
+SELECT pgl_validate.register_pglogical_peer(
+    'seq_target',
+    $sequenceTargetDsnSql,
+    'seq_sub'::name,
+    NULL,
+    ARRAY['default']
+)
 "@ | Out-Null
     Invoke-Sql -Database 'seq_provider' -Sql @"
 SELECT setval('public.account_seq'::regclass, 10, true);
