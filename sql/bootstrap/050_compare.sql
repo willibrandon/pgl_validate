@@ -4276,12 +4276,12 @@ BEGIN
         verdict := 'match';
         IF participant_count = 1 AND selected_peer_count = 0 THEN
             result_reason := format(
-                'single local participant; no peers registered or requested; validated_property=%s',
+                'local-only check; no peer names were passed and pgl_validate.peer has no rows; validated_property=%s',
                 validated_property
             );
         ELSIF participant_count = 1 THEN
             result_reason := format(
-                'no remote peer completed validation; selected_peer_count=%s; validated_property=%s',
+                'local-only check; no selected remote peer completed validation; selected_peer_count=%s; validated_property=%s',
                 selected_peer_count,
                 validated_property
             );

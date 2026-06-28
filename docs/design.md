@@ -1422,7 +1422,7 @@ SELECT *
 FROM pgl_validate.compare_table('public.accounts'::regclass, ARRAY['db_beta']);
 ```
 
-If `compare_table()` is called with no `peers` argument and no `pgl_validate.peer` rows, it has no remote database to connect to. The result is intentionally a local self-check (`single local participant`). It is not a validation of another database on the same instance.
+If `compare_table()` is called with no `peers` argument and no `pgl_validate.peer` rows, it has no remote database to connect to. The result is intentionally a local-only self-check (`local-only check; no peer names were passed and pgl_validate.peer has no rows`). It is not a validation of another database on the same instance.
 
 ### B.4 CI gate (synchronous)
 
