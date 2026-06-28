@@ -70,6 +70,7 @@ BEGIN
         FROM (VALUES
             ('peer', 'name', 'Stable peer name used in validation requests and run catalogs.'),
             ('peer', 'dsn', 'libpq connection string used to reach the peer.'),
+            ('peer', 'provider_dsn', 'libpq connection string used to reach the local pglogical provider when validating this peer.'),
             ('peer', 'backend', 'Replication backend type for the peer: pglogical, native, or standby.'),
             ('peer', 'subscription_name', 'Target-side subscription name used to identify the incoming edge.'),
             ('peer', 'reverse_subscription_name', 'Explicit local pglogical subscription from this peer back to the coordinator, used to include bidirectional reverse edges in the fence vector.'),

@@ -47,9 +47,9 @@ SELECT *
 FROM pgl_validate.compare_table('public.accounts'::regclass);
 ```
 
-For pglogical validation, register each peer database endpoint once. The helper
-discovers the pglogical node/subscription metadata when it is unambiguous and
-installs the validation barrier replication set on the relevant subscriptions:
+For pglogical validation, register each peer database endpoint. The helper is
+safe to rerun: it refreshes the peer row and verifies the validation barrier
+replication set on the relevant subscriptions.
 
 ```sql
 SELECT *

@@ -3,6 +3,7 @@ CREATE SCHEMA IF NOT EXISTS pgl_validate;
 CREATE TABLE pgl_validate.peer (
     name                    text PRIMARY KEY,
     dsn                     text NOT NULL,
+    provider_dsn            text,
     backend                 text NOT NULL DEFAULT 'pglogical'
                             CHECK (backend IN ('pglogical','native','standby')),
     subscription_name       name,

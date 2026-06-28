@@ -691,6 +691,13 @@ SELECT pgl_validate.register_pglogical_peer(
     'sub'::name,
     NULL,
     ARRAY['default']
+);
+SELECT pgl_validate.register_pglogical_peer(
+    'target',
+    $targetDsnSql,
+    'sub'::name,
+    NULL,
+    ARRAY['default']
 )
 "@ | Out-Null
     $compareResult = Invoke-Sql -Database 'provider' -Sql @"
@@ -699,8 +706,6 @@ FROM pgl_validate.compare_table(
     'public.accounts'::regclass,
     ARRAY['target'],
     jsonb_build_object(
-        'provider_dsn', $providerDsnSql,
-        'provider_node', 'provider',
         'repsets', jsonb_build_array('default'),
         'fence_timeout_ms', 30000,
         'fence_poll_interval_ms', 100
@@ -736,11 +741,12 @@ SELECT EXISTS (
     $registeredPeer = Invoke-Sql -Database 'provider' -Sql @"
 SELECT subscription_name::text || ';' ||
        COALESCE(reverse_subscription_name::text, '<null>') || ';' ||
-       (replication_sets = ARRAY['default'])::text
+       (replication_sets = ARRAY['default'])::text || ';' ||
+       (provider_dsn = $providerDsnSql)::text
 FROM pgl_validate.peer
 WHERE name = 'target'
 "@
-    if ($registeredPeer -ne 'sub;<null>;true') {
+    if ($registeredPeer -ne 'sub;<null>;true;true') {
         throw "register_pglogical_peer did not persist the expected target peer: $registeredPeer"
     }
 
@@ -760,8 +766,6 @@ FROM pgl_validate.compare_table(
     'public.accounts'::regclass,
     ARRAY['target','fanout'],
     jsonb_build_object(
-        'provider_dsn', $providerDsnSql,
-        'provider_node', 'provider',
         'repsets', jsonb_build_array('default'),
         'fence_timeout_ms', 30000,
         'fence_poll_interval_ms', 100
@@ -1015,8 +1019,6 @@ FROM pgl_validate.compare_table(
     'public.bidir_accounts'::regclass,
     ARRAY['target','fanout'],
     jsonb_build_object(
-        'provider_dsn', $providerDsnSql,
-        'provider_node', 'provider',
         'repsets', jsonb_build_array('pgl_validate_bidir'),
         'fence_timeout_ms', 30000,
         'fence_poll_interval_ms', 100

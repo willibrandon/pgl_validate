@@ -362,6 +362,7 @@ BEGIN
     INSERT INTO pgl_validate.peer(
         name,
         dsn,
+        provider_dsn,
         backend,
         subscription_name,
         reverse_subscription_name,
@@ -373,6 +374,7 @@ BEGIN
     VALUES (
         p_peer_name,
         p_peer_dsn,
+        forward_subscription_rec.provider_dsn,
         'pglogical',
         resolved_subscription,
         resolved_reverse_subscription,
@@ -383,6 +385,7 @@ BEGIN
     )
     ON CONFLICT (name) DO UPDATE
     SET dsn = EXCLUDED.dsn,
+        provider_dsn = EXCLUDED.provider_dsn,
         backend = EXCLUDED.backend,
         subscription_name = EXCLUDED.subscription_name,
         reverse_subscription_name = EXCLUDED.reverse_subscription_name,

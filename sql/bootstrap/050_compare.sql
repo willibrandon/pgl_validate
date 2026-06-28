@@ -777,6 +777,8 @@ DECLARE
     table_in_native_publication boolean := false;
     requested_backend text;
     provider_dsn text;
+    peer_provider_dsn text;
+    peer_provider_dsn_count int := 0;
     provider_node text;
     provider_node_filter text;
     nondeterministic_collation_columns text[];
@@ -1126,7 +1128,25 @@ BEGIN
         INTO local_pglogical_rec
         FROM pgl_validate.pglogical_local_node();
 
-        provider_dsn := COALESCE(provider_dsn, local_pglogical_rec.dsn);
+        SELECT min(p.provider_dsn),
+               count(DISTINCT p.provider_dsn)
+        INTO peer_provider_dsn, peer_provider_dsn_count
+        FROM pgl_validate.peer p
+        WHERE p.name = ANY (peer_names)
+          AND p.backend = 'pglogical'
+          AND p.provider_dsn IS NOT NULL;
+
+        IF provider_dsn IS NULL THEN
+            IF peer_provider_dsn_count = 1 THEN
+                provider_dsn := peer_provider_dsn;
+            ELSIF peer_provider_dsn_count > 1 THEN
+                RAISE EXCEPTION
+                    'selected pglogical peers record multiple provider DSNs; pass options.provider_dsn explicitly'
+                    USING ERRCODE = '0A000';
+            ELSE
+                provider_dsn := local_pglogical_rec.dsn;
+            END IF;
+        END IF;
         provider_node := COALESCE(provider_node, local_pglogical_rec.node_name);
     END IF;
 
@@ -4434,6 +4454,8 @@ DECLARE
     fence_rec pgl_validate.fence_attempt;
     local_pglogical_rec record;
     provider_dsn text := NULLIF(options->>'provider_dsn', '');
+    peer_provider_dsn text;
+    peer_provider_dsn_count int := 0;
     provider_node text := NULLIF(options->>'provider_node', '');
     fence_timeout_ms int := COALESCE(
         (NULLIF(options->>'fence_timeout_ms', ''))::int,
@@ -4544,7 +4566,25 @@ BEGIN
         INTO local_pglogical_rec
         FROM pgl_validate.pglogical_local_node();
 
-        provider_dsn := COALESCE(provider_dsn, local_pglogical_rec.dsn);
+        SELECT min(p.provider_dsn),
+               count(DISTINCT p.provider_dsn)
+        INTO peer_provider_dsn, peer_provider_dsn_count
+        FROM pgl_validate.peer p
+        WHERE p.name = ANY (peer_names)
+          AND p.backend = 'pglogical'
+          AND p.provider_dsn IS NOT NULL;
+
+        IF provider_dsn IS NULL THEN
+            IF peer_provider_dsn_count = 1 THEN
+                provider_dsn := peer_provider_dsn;
+            ELSIF peer_provider_dsn_count > 1 THEN
+                RAISE EXCEPTION
+                    'selected pglogical peers record multiple provider DSNs; pass options.provider_dsn explicitly'
+                    USING ERRCODE = '0A000';
+            ELSE
+                provider_dsn := local_pglogical_rec.dsn;
+            END IF;
+        END IF;
         provider_node := COALESCE(provider_node, local_pglogical_rec.node_name);
 
         IF provider_dsn IS NULL THEN
