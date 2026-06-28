@@ -277,31 +277,45 @@ $packageName = "pgl_validate-$version-pg$PgMajor-$Platform"
 if ([string]::IsNullOrWhiteSpace($PackageDirectory)) {
     $PackageDirectory = Join-Path (Join-Path $root 'target') (Join-Path 'package' $packageName)
 }
+$PackageDirectory = (Resolve-Path -LiteralPath $PackageDirectory).Path
 
 $wxs = Join-Path (Join-Path (Join-Path $root 'packaging') 'windows') 'pgl_validate.wxs'
 $licenseRtf = Join-Path (Join-Path (Join-Path $root 'packaging') 'windows') 'license.rtf'
 $msiPath = Join-Path $ArtifactDir "$packageName.msi"
+$wixPdbPath = [IO.Path]::ChangeExtension($msiPath, '.wixpdb')
 
 Test-PglPathUnderRoot -Path $msiPath -AllowedRoot $root | Out-Null
+Test-PglPathUnderRoot -Path $wixPdbPath -AllowedRoot $root | Out-Null
 Test-PglWindowsPackageLayout -Directory $PackageDirectory
 
 New-Item -ItemType Directory -Force -Path $ArtifactDir | Out-Null
 if (Test-Path -LiteralPath $msiPath) {
     Remove-Item -LiteralPath $msiPath -Force
 }
+if (Test-Path -LiteralPath $wixPdbPath) {
+    Remove-Item -LiteralPath $wixPdbPath -Force
+}
 
-& $wix build `
+$wixOutput = & $wix build `
     -arch x64 `
     -o $msiPath `
+    -pdbtype none `
     -ext WixToolset.UI.wixext `
     -d "VERSION=$version" `
     -d "MSI_VERSION=$msiVersion" `
     -d "PG_VERSION=$PgMajor" `
     -d "PackageDir=$PackageDirectory" `
     -d "LicenseRtf=$licenseRtf" `
-    $wxs
-if ($LASTEXITCODE -ne 0) {
-    throw "wix build exited with code $LASTEXITCODE."
+    $wxs 2>&1
+$wixExitCode = $LASTEXITCODE
+$wixOutput | ForEach-Object { Write-Output $_ }
+if ($wixExitCode -ne 0) {
+    throw "wix build exited with code $wixExitCode."
+}
+
+$wixWarnings = @($wixOutput | Where-Object { $_.ToString() -match '\bwarning\s+WIX\d+:' })
+if ($wixWarnings.Count -gt 0) {
+    throw "wix build emitted warning(s): $($wixWarnings -join '; ')"
 }
 
 if ($VerifyInstall) {
