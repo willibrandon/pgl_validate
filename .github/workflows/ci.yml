@@ -194,8 +194,13 @@ jobs:
         run: ./scripts/pgrx-vs.ps1 pwsh -NoProfile -ExecutionPolicy Bypass -File ./scripts/test-async-worker.ps1 -PgMajor ${{ matrix.pg }} -TimeoutSeconds 180
 
       - name: Clean test clusters
-        if: always()
+        if: always() && runner.os != 'Windows'
         run: ./scripts/stop-pgrx-test-clusters.ps1 -RemoveData
+
+      - name: Clean test clusters
+        if: always() && runner.os == 'Windows'
+        shell: powershell
+        run: .\scripts\stop-pgrx-test-clusters.ps1 -RemoveData
 
   pglogical:
     name: pglogical pg${{ matrix.pg }} / ${{ matrix.target.platform }}
@@ -284,8 +289,13 @@ jobs:
         run: ./scripts/pgrx-vs.ps1 pwsh -NoProfile -ExecutionPolicy Bypass -File ./scripts/test-pglogical-fence.ps1 -PgMajor ${{ matrix.pg }} -TimeoutSeconds 300
 
       - name: Clean test clusters
-        if: always()
+        if: always() && runner.os != 'Windows'
         run: ./scripts/stop-pgrx-test-clusters.ps1 -RemoveData
+
+      - name: Clean test clusters
+        if: always() && runner.os == 'Windows'
+        shell: powershell
+        run: .\scripts\stop-pgrx-test-clusters.ps1 -RemoveData
 
   pglogical-vanilla:
     name: vanilla pglogical pg${{ matrix.pg }} / ${{ matrix.target.platform }}
@@ -348,8 +358,13 @@ jobs:
         run: ./scripts/pgrx-vs.ps1 pwsh -NoProfile -ExecutionPolicy Bypass -File ./scripts/test-pglogical-fence.ps1 -PgMajor ${{ matrix.pg }} -TimeoutSeconds 300
 
       - name: Clean test clusters
-        if: always()
+        if: always() && runner.os != 'Windows'
         run: ./scripts/stop-pgrx-test-clusters.ps1 -RemoveData
+
+      - name: Clean test clusters
+        if: always() && runner.os == 'Windows'
+        shell: powershell
+        run: .\scripts\stop-pgrx-test-clusters.ps1 -RemoveData
 
   pglogical-mixed-major:
     name: pglogical mixed pg15-to-pg18 / ${{ matrix.target.platform }}
@@ -437,8 +452,13 @@ jobs:
         run: ./scripts/pgrx-vs.ps1 pwsh -NoProfile -ExecutionPolicy Bypass -File ./scripts/test-pglogical-mixed-major.ps1 -ProviderPgMajor 15 -TargetPgMajor 18 -TimeoutSeconds 300 -BuildTimeoutSeconds 600
 
       - name: Clean test clusters
-        if: always()
+        if: always() && runner.os != 'Windows'
         run: ./scripts/stop-pgrx-test-clusters.ps1 -RemoveData
+
+      - name: Clean test clusters
+        if: always() && runner.os == 'Windows'
+        shell: powershell
+        run: .\scripts\stop-pgrx-test-clusters.ps1 -RemoveData
 
   replication-harnesses:
     name: ${{ matrix.backend }} pg${{ matrix.pg }} / ${{ matrix.target.platform }}
@@ -530,5 +550,10 @@ jobs:
         run: ./scripts/pgrx-vs.ps1 pwsh -NoProfile -ExecutionPolicy Bypass -File ./scripts/test-physical-standby-fence.ps1 -PgMajor ${{ matrix.pg }} -TimeoutSeconds 300
 
       - name: Clean test clusters
-        if: always()
+        if: always() && runner.os != 'Windows'
         run: ./scripts/stop-pgrx-test-clusters.ps1 -RemoveData
+
+      - name: Clean test clusters
+        if: always() && runner.os == 'Windows'
+        shell: powershell
+        run: .\scripts\stop-pgrx-test-clusters.ps1 -RemoveData
