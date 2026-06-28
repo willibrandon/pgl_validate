@@ -379,7 +379,6 @@ try {
 
     Write-Step "Starting primary on port $script:PrimaryPort"
     $primarySocketOption = Get-PglUnixSocketOption -Directory (Join-Path $primaryData 'socket')
-    $standbySocketOption = Get-PglUnixSocketOption -Directory (Join-Path $standbyData 'socket')
     $primaryOptions = (@(
         "-p $script:PrimaryPort",
         '-h 127.0.0.1',
@@ -428,6 +427,7 @@ SELECT pg_create_physical_replication_slot('pgl_validate_standby_slot');
     Write-WindowsPathAccess -Path $standbyPgControl
 
     Write-Step "Starting physical standby on port $script:StandbyPort"
+    $standbySocketOption = Get-PglUnixSocketOption -Directory (Join-Path $standbyData 'socket')
     $standbyOptions = (@(
         "-p $script:StandbyPort",
         '-h 127.0.0.1',
