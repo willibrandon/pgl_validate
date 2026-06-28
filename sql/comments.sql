@@ -498,6 +498,8 @@ COMMENT ON FUNCTION pgl_validate.generate_repair(bigint, text) IS
     'Generate reviewable node-labeled DML and sequence setval statements for confirmed divergences using the selected authoritative node.';
 COMMENT ON FUNCTION pgl_validate.apply_repair(bigint, text, text, text, text, boolean) IS
     'Apply target-labeled generated repair statements after explicit target confirmation, using a loopback peer for origin-aware local repairs, then run focused revalidation and record repair_run and repair_result audit rows.';
+COMMENT ON FUNCTION pgl_validate._conflict_tuple_matches_key(jsonb, jsonb) IS
+    'Return whether a pglogical conflict-history tuple image contains a divergent key, accepting both typed JSON values and pglogical stringified scalar output.';
 COMMENT ON FUNCTION pgl_validate.correlate_conflict_history(bigint, interval, integer) IS
     'Attach pglogical conflict-history rows to confirmed divergences when tuple JSON contains the divergent key.';
 COMMENT ON FUNCTION pgl_validate.run_status(bigint) IS

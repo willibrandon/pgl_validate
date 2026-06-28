@@ -413,6 +413,29 @@ function Wait-SqlEqual {
     throw "timed out waiting for SQL result '$Expected' on ${Database}; last result: $last"
 }
 
+function Set-PglogicalConflictResolution {
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [string] $Value,
+        [int] $Port = $script:Port,
+        [string] $Database = 'provider'
+    )
+
+    if (-not $PSCmdlet.ShouldProcess("pglogical.conflict_resolution on port $Port", "Set to $Value")) {
+        return
+    }
+
+    $literal = ConvertTo-SqlLiteral $Value
+    Invoke-Sql -Database 'postgres' -Port $Port -Sql "ALTER SYSTEM SET pglogical.conflict_resolution = $literal" | Out-Null
+    Invoke-Sql -Database 'postgres' -Port $Port -Sql 'SELECT pg_reload_conf()' | Out-Null
+    Wait-SqlEqual `
+        -Database $Database `
+        -Sql 'SHOW pglogical.conflict_resolution' `
+        -Expected $Value `
+        -Port $Port `
+        -TimeoutSeconds $TimeoutSeconds
+}
+
 function Wait-AdvisoryLockHeld {
     param(
         [string] $Database,
@@ -487,6 +510,7 @@ try {
         $socketOption,
         '-c shared_preload_libraries=pglogical',
         '-c wal_level=logical',
+        '-c track_commit_timestamp=on',
         '-c max_worker_processes=20',
         '-c max_replication_slots=20',
         '-c max_wal_senders=20'
@@ -502,6 +526,7 @@ try {
         $socketOption,
         '-c shared_preload_libraries=pglogical',
         '-c wal_level=logical',
+        '-c track_commit_timestamp=on',
         '-c max_worker_processes=20',
         '-c max_replication_slots=20',
         '-c max_wal_senders=20'
@@ -1060,6 +1085,175 @@ WHERE re.run_id = $bidirectionalRunId
     if ($bidirectionalFenceShape -ne '2;2;2') {
         throw "N-way bidirectional pglogical fence vector was not recorded: $bidirectionalFenceShape using reverse slots $reverseSlotName and $fanoutReverseSlotName"
     }
+
+    Write-Step 'Validating real pglogical keep_local bidirectional conflict detection'
+    $priorConflictResolution = Invoke-Sql -Database 'provider' -Sql 'SHOW pglogical.conflict_resolution'
+    Set-PglogicalConflictResolution -Value 'keep_local'
+    $hasConflictHistory = Invoke-Sql -Database 'target' -Sql @"
+SELECT (
+    to_regclass('pglogical.conflict_history') IS NOT NULL AND
+    to_regprocedure('pglogical.conflict_history_ensure_partition(date)') IS NOT NULL AND
+    current_setting('pglogical.conflict_history_enabled', true) IS NOT NULL
+)::text
+"@
+    if ($hasConflictHistory -eq 'true') {
+        Invoke-Sql -Database 'postgres' -Sql "ALTER SYSTEM SET pglogical.conflict_history_enabled = 'on'" | Out-Null
+        Invoke-Sql -Database 'postgres' -Sql "ALTER SYSTEM SET pglogical.conflict_history_store_tuples = 'on'" | Out-Null
+        Invoke-Sql -Database 'postgres' -Sql 'SELECT pg_reload_conf()' | Out-Null
+        Wait-SqlEqual `
+            -Database 'provider' `
+            -Sql 'SHOW pglogical.conflict_history_enabled' `
+            -Expected 'on' `
+            -TimeoutSeconds $TimeoutSeconds
+        Invoke-Sql -Database 'provider' -Sql 'SELECT pglogical.conflict_history_ensure_partition(CURRENT_DATE)' | Out-Null
+        Invoke-Sql -Database 'target' -Sql 'SELECT pglogical.conflict_history_ensure_partition(CURRENT_DATE)' | Out-Null
+    }
+
+    Invoke-Sql -Database 'provider' -Sql "INSERT INTO public.bidir_accounts VALUES (1, 'base')" | Out-Null
+    Wait-SqlEqual `
+        -Database 'target' `
+        -Sql "SELECT value FROM public.bidir_accounts WHERE id = 1" `
+        -Expected 'base' `
+        -TimeoutSeconds $TimeoutSeconds
+
+    Invoke-Sql -Database 'target' -Sql "SELECT pglogical.alter_subscription_disable('sub', true)" | Out-Null
+    Invoke-Sql -Database 'provider' -Sql "SELECT pglogical.alter_subscription_disable('sub_from_target', true)" | Out-Null
+
+    $providerConflictLsn = Invoke-Sql -Database 'provider' -Sql @"
+WITH changed AS (
+    UPDATE public.bidir_accounts
+    SET value = 'provider-conflict'
+    WHERE id = 1
+    RETURNING 1
+)
+SELECT pg_current_wal_lsn()
+FROM changed
+"@
+    $targetConflictLsn = Invoke-Sql -Database 'target' -Sql @"
+WITH changed AS (
+    UPDATE public.bidir_accounts
+    SET value = 'target-conflict'
+    WHERE id = 1
+    RETURNING 1
+)
+SELECT pg_current_wal_lsn()
+FROM changed
+"@
+    Invoke-Sql -Database 'provider' -Sql "SELECT pglogical.alter_subscription_enable('sub_from_target', true)" | Out-Null
+    $reverseSlotName = Wait-SubscriptionReady `
+        -SubscriberDatabase 'provider' `
+        -SubscriptionName 'sub_from_target' `
+        -ProviderDatabase 'target' `
+        -StableReadyPolls 12 `
+        -TimeoutSeconds $TimeoutSeconds
+    $targetConflictLsnSql = ConvertTo-SqlLiteral $targetConflictLsn
+    $reverseSlotSql = ConvertTo-SqlLiteral $reverseSlotName
+    Invoke-Sql -Database 'target' -Sql "SELECT pglogical.wait_slot_confirm_lsn($reverseSlotSql, ${targetConflictLsnSql}::pg_lsn)" | Out-Null
+    Wait-SqlEqual `
+        -Database 'provider' `
+        -Sql "SELECT value FROM public.bidir_accounts WHERE id = 1" `
+        -Expected 'provider-conflict' `
+        -TimeoutSeconds $TimeoutSeconds
+
+    Invoke-Sql -Database 'target' -Sql "SELECT pglogical.alter_subscription_enable('sub', true)" | Out-Null
+    $slotName = Wait-SubscriptionReady `
+        -SubscriberDatabase 'target' `
+        -SubscriptionName 'sub' `
+        -ProviderDatabase 'provider' `
+        -StableReadyPolls 12 `
+        -TimeoutSeconds $TimeoutSeconds
+    $providerConflictLsnSql = ConvertTo-SqlLiteral $providerConflictLsn
+    $slotSql = ConvertTo-SqlLiteral $slotName
+    Invoke-Sql -Database 'provider' -Sql "SELECT pglogical.wait_slot_confirm_lsn($slotSql, ${providerConflictLsnSql}::pg_lsn)" | Out-Null
+    Wait-SqlEqual `
+        -Database 'target' `
+        -Sql "SELECT value FROM public.bidir_accounts WHERE id = 1" `
+        -Expected 'target-conflict' `
+        -TimeoutSeconds $TimeoutSeconds
+
+    $keepLocalResult = Invoke-Sql -Database 'provider' -Sql @"
+SELECT run_id::text || ';' || verdict
+FROM pgl_validate.compare_table(
+    'public.bidir_accounts'::regclass,
+    ARRAY['target'],
+    jsonb_build_object(
+        'repsets', jsonb_build_array('pgl_validate_bidir'),
+        'fence_timeout_ms', 30000,
+        'fence_poll_interval_ms', 100
+    )
+)
+"@
+    $keepLocalParts = $keepLocalResult.Split(';', 2)
+    if ($keepLocalParts.Count -ne 2) {
+        throw "unexpected keep_local compare_table result: $keepLocalResult"
+    }
+    $keepLocalRunId = $keepLocalParts[0]
+    $keepLocalVerdict = $keepLocalParts[1]
+    if ($keepLocalVerdict -ne 'differ') {
+        throw "real keep_local conflict should remain a divergence, saw: $keepLocalResult"
+    }
+
+    $keepLocalEvidence = Invoke-Sql -Database 'provider' -Sql @"
+SELECT d.classification || ';' ||
+       d.status || ';' ||
+       d.node || ';' ||
+       count(DISTINCT re.edge_id) FILTER (
+           WHERE re.provider_node = 'provider'
+             AND re.target_node = 'target'
+             AND fa.status = 'converged'
+       )::text || ';' ||
+       count(DISTINCT re.edge_id) FILTER (
+           WHERE re.provider_node = 'target'
+             AND re.target_node = 'provider'
+             AND fa.status = 'converged'
+       )::text
+FROM pgl_validate.divergence d
+JOIN pgl_validate.run_edge re ON re.run_id = d.run_id
+JOIN pgl_validate.fence_attempt fa ON fa.run_id = re.run_id
+                                  AND fa.edge_id = re.edge_id
+WHERE d.run_id = $keepLocalRunId
+  AND d.schema_name = 'public'
+  AND d.table_name = 'bidir_accounts'
+  AND d.node = 'target'
+GROUP BY d.classification, d.status, d.node
+"@
+    if ($keepLocalEvidence -ne 'differs;confirmed;target;1;1') {
+        throw "real keep_local conflict was not confirmed with both directed edges fenced: $keepLocalEvidence"
+    }
+
+    if ($hasConflictHistory -eq 'true') {
+        $keepLocalConflictHistory = Invoke-Sql -Database 'provider' -Sql @"
+SELECT EXISTS (
+    SELECT 1
+    FROM pgl_validate.conflict_evidence($keepLocalRunId)
+    WHERE node = 'target'
+      AND conflict_type = 'update_update'
+      AND resolution = 'keep_local'
+)::text
+"@
+        if ($keepLocalConflictHistory -ne 'true') {
+            throw 'real keep_local conflict was not attached as pglogical conflict evidence'
+        }
+    }
+
+    Set-PglogicalConflictResolution -Value $priorConflictResolution
+    Invoke-Sql -Database 'target' -Sql "SELECT pglogical.alter_subscription_disable('sub', true)" | Out-Null
+    Invoke-Sql -Database 'provider' -Sql "SELECT pglogical.alter_subscription_disable('sub_from_target', true)" | Out-Null
+    Invoke-Sql -Database 'provider' -Sql "SELECT pglogical.alter_subscription_enable('sub_from_target', true)" | Out-Null
+    $reverseSlotName = Wait-SubscriptionReady `
+        -SubscriberDatabase 'provider' `
+        -SubscriptionName 'sub_from_target' `
+        -ProviderDatabase 'target' `
+        -StableReadyPolls 3 `
+        -TimeoutSeconds $TimeoutSeconds
+    Invoke-Sql -Database 'target' -Sql "SELECT pglogical.alter_subscription_enable('sub', true)" | Out-Null
+    $slotName = Wait-SubscriptionReady `
+        -SubscriberDatabase 'target' `
+        -SubscriptionName 'sub' `
+        -ProviderDatabase 'provider' `
+        -StableReadyPolls 3 `
+        -TimeoutSeconds $TimeoutSeconds
+
     Invoke-Sql -Database 'provider' -Sql @"
 UPDATE pgl_validate.peer
 SET replication_sets = ARRAY['default'],
@@ -1984,6 +2178,7 @@ FROM pgl_validate.remote_observe_barrier(
     }
 
     Write-Step 'Validating duplicate cascade barrier tokens do not stall pglogical apply'
+    Set-PglogicalConflictResolution -Value 'error' -Port $script:CascadePort -Database 'cascade'
     Invoke-Sql -Database 'cascade' -Port $script:CascadePort -Sql @"
 SELECT pglogical.create_subscription(
     'sub_direct_provider',

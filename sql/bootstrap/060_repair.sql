@@ -1,3 +1,42 @@
+CREATE FUNCTION pgl_validate._conflict_tuple_matches_key(
+    tuple_doc jsonb,
+    key_doc jsonb
+)
+RETURNS boolean
+LANGUAGE sql
+IMMUTABLE
+PARALLEL SAFE
+AS $$
+    SELECT tuple_doc IS NOT NULL
+       AND key_doc IS NOT NULL
+       AND jsonb_typeof(key_doc) = 'object'
+       AND NOT EXISTS (
+           SELECT 1
+           FROM jsonb_each(key_doc) AS k(key_name, key_value)
+           WHERE NOT (
+               tuple_doc ? k.key_name
+               AND (
+                   tuple_doc -> k.key_name = k.key_value
+                   OR (
+                       jsonb_typeof(k.key_value) = 'boolean'
+                       AND jsonb_typeof(tuple_doc -> k.key_name) = 'string'
+                       AND tuple_doc ->> k.key_name = ANY (
+                           CASE
+                               WHEN k.key_value = 'true'::jsonb THEN ARRAY['true', 't']
+                               ELSE ARRAY['false', 'f']
+                           END
+                       )
+                   )
+                   OR (
+                       jsonb_typeof(k.key_value) IN ('number', 'string')
+                       AND jsonb_typeof(tuple_doc -> k.key_name) = 'string'
+                       AND tuple_doc ->> k.key_name = k.key_value #>> '{}'
+                   )
+               )
+           )
+       )
+$$;
+
 CREATE FUNCTION pgl_validate.correlate_conflict_history(
     p_run_id bigint,
     lookback interval DEFAULT interval '24 hours',
@@ -90,12 +129,18 @@ BEGIN
                 array_remove(ARRAY[
                     CASE
                         WHEN c.local_tuple_json IS NOT NULL
-                         AND c.local_tuple_json::jsonb @> d.key_text::jsonb
+                         AND pgl_validate._conflict_tuple_matches_key(
+                             c.local_tuple_json::jsonb,
+                             d.key_text::jsonb
+                         )
                         THEN 'local_tuple_key'
                     END,
                     CASE
                         WHEN c.remote_tuple_json IS NOT NULL
-                         AND c.remote_tuple_json::jsonb @> d.key_text::jsonb
+                         AND pgl_validate._conflict_tuple_matches_key(
+                             c.remote_tuple_json::jsonb,
+                             d.key_text::jsonb
+                         )
                         THEN 'remote_tuple_key'
                     END
                 ]::text[], NULL)
@@ -111,8 +156,20 @@ BEGIN
                 peer_rec.statement_timeout_ms,
                 peer_rec.lock_timeout_ms
             ) AS c
-              ON (c.local_tuple_json IS NOT NULL AND c.local_tuple_json::jsonb @> d.key_text::jsonb)
-              OR (c.remote_tuple_json IS NOT NULL AND c.remote_tuple_json::jsonb @> d.key_text::jsonb)
+              ON (
+                  c.local_tuple_json IS NOT NULL
+                  AND pgl_validate._conflict_tuple_matches_key(
+                      c.local_tuple_json::jsonb,
+                      d.key_text::jsonb
+                  )
+              )
+              OR (
+                  c.remote_tuple_json IS NOT NULL
+                  AND pgl_validate._conflict_tuple_matches_key(
+                      c.remote_tuple_json::jsonb,
+                      d.key_text::jsonb
+                  )
+              )
             WHERE d.run_id = p_run_id
               AND d.schema_name = table_rec.schema_name
               AND d.table_name = table_rec.table_name

@@ -6594,15 +6594,15 @@ mod tests {
                     (
                         now(), '1'::oid, 'sub', 'update_update', 'keep_local',
                         'public', {table_name}, {index_name},
-                        '{{\"id\": 1, \"value\": \"local\"}}'::jsonb,
-                        '{{\"id\": 1, \"value\": \"remote\"}}'::jsonb,
+                        '{{\"id\": \"1\", \"value\": \"local\"}}'::jsonb,
+                        '{{\"id\": \"1\", \"value\": \"remote\"}}'::jsonb,
                         1, now(), '0/16B6C50'::pg_lsn
                     ),
                     (
                         now(), '1'::oid, 'sub', 'update_update', 'keep_local',
                         'public', {table_name}, {index_name},
-                        '{{\"id\": 2, \"value\": \"local\"}}'::jsonb,
-                        '{{\"id\": 2, \"value\": \"remote\"}}'::jsonb,
+                        '{{\"id\": \"2\", \"value\": \"local\"}}'::jsonb,
+                        '{{\"id\": \"2\", \"value\": \"remote\"}}'::jsonb,
                         1, now(), '0/16B6C60'::pg_lsn
                     );
                 ",
