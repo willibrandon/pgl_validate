@@ -118,6 +118,16 @@ mod tests {
     }
 
     #[pg_test]
+    fn column_encoding_mode_uses_send_for_money() {
+        let mode =
+            Spi::get_one::<i32>("SELECT pgl_validate.column_encoding_mode('money'::regtype::oid)")
+                .unwrap()
+                .unwrap();
+
+        assert_eq!(mode, 1);
+    }
+
+    #[pg_test]
     fn row_digest_normalizes_float_signed_zero_by_default() {
         let float4_digest =
             Spi::get_one::<Vec<u8>>("SELECT pgl_validate.row_digest(ARRAY[1], '-0'::float4)")

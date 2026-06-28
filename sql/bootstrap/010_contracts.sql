@@ -45,6 +45,7 @@ AS $$
             ('interval'::regtype::oid),
             ('float4'::regtype::oid),
             ('float8'::regtype::oid),
+            ('money'::regtype::oid),
             ('jsonb'::regtype::oid),
             ('inet'::regtype::oid),
             ('cidr'::regtype::oid),
