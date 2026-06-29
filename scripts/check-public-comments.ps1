@@ -5,9 +5,9 @@ param(
 $ErrorActionPreference = 'Stop'
 
 $workspace = (Resolve-Path -LiteralPath $Root).Path
-$commentsPath = Join-Path $workspace 'sql/comments.sql'
+$commentsPath = Join-Path $workspace 'sql/finalize.sql'
 if (-not (Test-Path -LiteralPath $commentsPath)) {
-    throw "Missing SQL comments file: $commentsPath"
+    throw "Missing SQL finalization file: $commentsPath"
 }
 
 $commentsText = Get-Content -LiteralPath $commentsPath -Raw

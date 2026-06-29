@@ -610,7 +610,6 @@ COMMENT ON FUNCTION pgl_validate.lthash_state_lthash_state_combine(pgl_validate.
     'Parallel combine function for the pgl_validate.lthash aggregate.';
 COMMENT ON AGGREGATE pgl_validate.lthash(bytea) IS
     'Order-independent, duplicate-sensitive LtHash aggregate over row digests.';
-
 DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'pgl_validate_validate') THEN

@@ -246,6 +246,8 @@ DECLARE
     info record;
     action_rec record;
     filter_rec record;
+    requested_repsets text[];
+    missing_repset text;
 BEGIN
     IF to_regprocedure('pglogical.show_repset_table_info(regclass,text[])') IS NULL THEN
         RAISE EXCEPTION 'pglogical extension is not installed in this database'
@@ -268,8 +270,31 @@ BEGIN
         WHERE rst.set_reloid = relation;
     ELSE
         SELECT array_agg(DISTINCT requested.repset ORDER BY requested.repset)
-        INTO repsets
+        INTO requested_repsets
         FROM unnest(input_repsets) AS requested(repset);
+
+        SELECT requested.repset
+        INTO missing_repset
+        FROM unnest(requested_repsets) AS requested(repset)
+        WHERE NOT EXISTS (
+            SELECT 1
+            FROM pglogical.replication_set rs
+            WHERE rs.set_name::text = requested.repset
+        )
+        ORDER BY requested.repset
+        LIMIT 1;
+
+        IF missing_repset IS NOT NULL THEN
+            RAISE EXCEPTION 'replication set % not found', missing_repset
+                USING ERRCODE = '22023';
+        END IF;
+
+        SELECT array_agg(DISTINCT rs.set_name::text ORDER BY rs.set_name::text)
+        INTO repsets
+        FROM pglogical.replication_set_table rst
+        JOIN pglogical.replication_set rs ON rs.set_id = rst.set_id
+        WHERE rst.set_reloid = relation
+          AND rs.set_name::text = ANY (requested_repsets);
     END IF;
 
     IF repsets IS NULL OR cardinality(repsets) = 0 THEN
@@ -308,8 +333,10 @@ BEGIN
            bool_or(rs.replicate_delete) AS repl_delete,
            bool_or(rs.replicate_truncate) AS repl_truncate
     INTO action_rec
-    FROM pglogical.replication_set rs
-    WHERE rs.set_name::text = ANY (repsets);
+    FROM pglogical.replication_set_table rst
+    JOIN pglogical.replication_set rs ON rs.set_id = rst.set_id
+    WHERE rst.set_reloid = relation
+      AND rs.set_name::text = ANY (repsets);
 
     repl_insert := COALESCE(action_rec.repl_insert, false);
     repl_update := COALESCE(action_rec.repl_update, false);

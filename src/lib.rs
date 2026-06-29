@@ -32,9 +32,14 @@ extension_sql_file!(
     requires = ["bootstrap_contracts"]
 );
 extension_sql_file!(
+    "../sql/bootstrap/025_fence_records.sql",
+    name = "bootstrap_fence_records",
+    requires = ["bootstrap_barriers"]
+);
+extension_sql_file!(
     "../sql/bootstrap/030_fencing.sql",
     name = "bootstrap_fencing",
-    requires = ["bootstrap_barriers"]
+    requires = ["bootstrap_fence_records"]
 );
 extension_sql_file!(
     "../sql/bootstrap/035_throttle.sql",
@@ -71,7 +76,7 @@ extension_sql_file!(
     name = "bootstrap_fence_maintenance",
     requires = ["bootstrap_reporting"]
 );
-extension_sql_file!("../sql/comments.sql", name = "comments", finalize);
+extension_sql_file!("../sql/finalize.sql", name = "finalize", finalize);
 
 static PARANOID_CONFIRM: GucSetting<bool> = GucSetting::<bool>::new(false);
 static PARANOID_CONFIRM_MAX_ROWS: GucSetting<i32> = GucSetting::<i32>::new(1000);

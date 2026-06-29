@@ -213,7 +213,7 @@ The last row is why a correct validator must be contract-aware: a row-filtered o
 | Chunk accumulator | **`#[pg_aggregate]` LtHash over `bytea`** | Concrete-typed (implementable in pgrx), additive ⇒ parallel-safe & combinable, collision-resistant |
 | Cryptographic confirm | **sorted-digest BLAKE3** per localized chunk | True set hash for clean-dismissal/divergence certainty |
 | Node-local execution | **coordinator-generated SQL** run via SPI (local) and libpq (remote) | Planner sees real predicates → index range scans; `EXPLAIN`-able |
-| Transport | **libpq** via `pq-sys`, non-blocking | Same auth/TLS/`pg_hba` as core; one `WaitEventSet` polls N peers |
+| Transport | **libpq** via minimal FFI, non-blocking | Same auth/TLS/`pg_hba` as core; one `WaitEventSet` polls N peers |
 | Orchestration | **background worker** (`pgrx::bgworkers`) | Long runs, scheduling, survives disconnect, throttling |
 | Contract source | `pglogical.replication_set*`, `local_sync_status`, `table_data_filtered()`, `show_repset_table_info()`, `show_subscription_status()`, `pg_replication_origin*` | Authoritative; no re-derivation of semantics |
 
@@ -568,7 +568,10 @@ pgl_validate.last_commit_lsn() RETURNS pg_lsn;        -- exact XactLastCommitEnd
 -- normal path.) Barrier cleanup is likewise driven by the coordinator (§8.1 retention).
 -- Introspection of the SQL the engine WILL generate (planner-transparent, EXPLAIN-able):
 pgl_validate.plan_chunk_sql(rel regclass, key_cols text[], lo bytea, hi bytea,
-                            cols text[], repsets text[] DEFAULT NULL) RETURNS text STABLE;
+                            cols text[], repsets text[] DEFAULT NULL,
+                            row_filter_sql text DEFAULT NULL,
+                            include_set_hash boolean DEFAULT false,
+                            hash_algorithm text DEFAULT NULL) RETURNS text STABLE;
 ```
 
 ### 15.2 Orchestration
@@ -754,12 +757,12 @@ Reporting surfaces: `runs`, `run_progress` (chunks done/total, ETA, bytes scanne
 
 ```
 pgl_validate/
-├── Cargo.toml                 # cdylib; features pg15..pg18; deps: pgrx, pq-sys, blake3
+├── Cargo.toml                 # cdylib; features pg15..pg18; deps: pgrx, blake3, serde, uuid
 ├── pgl_validate.control
 ├── sql/
-│   ├── bootstrap/             # extension_sql_file!: catalogs, contracts, barriers, fencing,
-│   │                           # planning SQL, compare orchestration, repair, reporting, cleanup
-│   └── comments.sql            # SQL object comments and privilege-role descriptions
+│   ├── bootstrap/             # extension_sql_file!: catalogs, contracts, barriers, fence records,
+│   │                           # fencing, planning SQL, compare orchestration, repair, reporting, cleanup
+│   └── finalize.sql            # SQL object comments, privilege roles, revokes, and grants
 ├── src/
 │   ├── lib.rs                 # pg_module_magic!, _PG_init (GUCs, optional launcher worker)
 │   ├── sql_api.rs             # pgrx SQL bindings, aggregate, libpq wrappers, worker launcher
@@ -767,7 +770,7 @@ pgl_validate/
 │   │   ├── encode.rs          # canonical per-type encoding: send vs pinned-text vs error  (#[test])
 │   │   ├── row_digest.rs      # raw-fcinfo VARIADIC "any" scalar; framing; BLAKE3            (#[pg_test])
 │   │   └── lthash.rs          # LtHash lanes + sorted-digest; #[pg_aggregate]               (#[test]/#[pg_test])
-│   ├── transport/             # libpq fan-out, remote checksums/localization, DSN handling
+│   ├── transport/             # minimal libpq FFI fan-out, remote checksums/localization, DSN handling
 │   ├── worker.rs              # dynamic run worker + optional static launcher/scheduler
 │   └── pg_tests.rs            # in-server regression coverage for SQL and Rust surfaces
 └── tests/                     # cargo pgrx regress + multi-node harness (Section 21)
@@ -1445,9 +1448,13 @@ SELECT (pgl_validate.compare_table('public.accounts')).verdict = 'match' AS in_s
 ```sql
 SELECT pgl_validate.plan_chunk_sql('public.orders', ARRAY['id'],
        lo => NULL, hi => NULL, cols => ARRAY['id','amount','status']);
--- => SELECT count(*), pgl_validate.lthash(
---           pgl_validate.row_digest('{2,1,1}'::int[], t."amount", t."id", t."status"))
---    FROM public.orders t WHERE true;
+-- => WITH pgl_validate_settings AS MATERIALIZED (... pinned digest GUCs ...)
+--    SELECT count(*)::bigint AS n_rows,
+--           pgl_validate.lthash_bytes(pgl_validate.lthash(
+--               pgl_validate.row_digest('{2,1,1}'::int[], t."amount", t."id", t."status")
+--           )) AS lthash,
+--           NULL::bytea AS set_hash
+--    FROM pgl_validate_settings, public.orders t WHERE true;
 -- Note: enc[] is first; columns follow as VARIADIC "any" args sorted by name, never an ARRAY[...].
 -- EXPLAIN that statement on any node to see the index/parallel plan.
 ```

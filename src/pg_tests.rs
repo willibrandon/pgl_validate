@@ -5916,6 +5916,61 @@ mod tests {
     }
 
     #[pg_test]
+    fn pglogical_contract_ignores_requested_repsets_without_table_membership() {
+        let backend_pid = Spi::get_one::<i32>("SELECT pg_backend_pid()")
+            .unwrap()
+            .unwrap();
+        let table_name = identifier(&format!("pglogical_contract_repsets_{backend_pid}"));
+        let member_repset = identifier(&format!("pgl_validate_member_repset_{backend_pid}"));
+        let unrelated_repset = identifier(&format!("pgl_validate_unrelated_repset_{backend_pid}"));
+        let node_name = identifier(&format!("pgl_validate_contract_repsets_node_{backend_pid}"));
+
+        Spi::run(&format!(
+            "
+            CREATE EXTENSION pglogical;
+            SELECT pglogical.create_node({node}, 'dbname=' || current_database());
+            CREATE TABLE public.{table_name}(
+                id int PRIMARY KEY,
+                value text
+            );
+            SELECT pglogical.create_replication_set({member_repset}, true, false, false, false);
+            SELECT pglogical.create_replication_set({unrelated_repset}, true, true, true, true);
+            SELECT pglogical.replication_set_add_table(
+                {member_repset},
+                'public.{table_name}'::regclass,
+                false
+            );
+            ",
+            node = sql_literal(&node_name),
+            member_repset = sql_literal(&member_repset),
+            unrelated_repset = sql_literal(&unrelated_repset)
+        ))
+        .unwrap();
+
+        let contract_sql = format!(
+            "
+            SELECT array_to_string(repsets, ',') || ';' ||
+                   validated_property || ';' ||
+                   repl_update::text || ';' ||
+                   repl_delete::text || ';' ||
+                   repl_truncate::text
+            FROM pgl_validate.pglogical_table_contract(
+                'public.{table_name}'::regclass,
+                ARRAY[{member_repset},{unrelated_repset}]
+            )
+            ",
+            member_repset = sql_literal(&member_repset),
+            unrelated_repset = sql_literal(&unrelated_repset)
+        );
+        let contract = Spi::get_one::<String>(&contract_sql).unwrap().unwrap();
+
+        assert_eq!(
+            contract,
+            format!("{member_repset};keys_only;false;false;false")
+        );
+    }
+
+    #[pg_test]
     fn compare_expands_pglogical_repset_into_parent_run() {
         let backend_pid = Spi::get_one::<i32>("SELECT pg_backend_pid()")
             .unwrap()
