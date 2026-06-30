@@ -36,7 +36,8 @@ Use `stop-pgrx-test-clusters.ps1 -RemoveData` when a local run is interrupted.
 ## Packaging
 
 - `package-pgrx.ps1` builds the release archive from `cargo pgrx package`:
-  `.tar.gz` for Linux and macOS, `.zip` for Windows.
+  `.tar.gz` for Linux and macOS, `.zip` for Windows. It also verifies native
+  loader metadata so release artifacts do not retain build-runner paths.
 - `package-windows-msi.ps1` builds the Windows x64 MSI from the pgrx package
   directory using WiX v5. Use `-VerifyInstall` to run a silent per-machine
   install/uninstall into a temporary PostgreSQL root from an elevated shell; it

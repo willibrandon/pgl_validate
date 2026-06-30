@@ -137,6 +137,23 @@ function Test-PglPackageLayout {
         throw "Package is missing the generated extension SQL $sql."
     }
 
+    Get-PglPackageSharedLibrary -PackageDirectory $PackageDirectory | Out-Null
+
+    foreach ($rootFile in @('LICENSE', 'README.md')) {
+        $path = Join-Path $PackageDirectory $rootFile
+        if (-not (Test-Path -LiteralPath $path)) {
+            throw "Package is missing $path."
+        }
+    }
+}
+
+<#
+.SYNOPSIS
+Returns the single pgl_validate shared library from a package directory.
+#>
+function Get-PglPackageSharedLibrary {
+    param([string] $PackageDirectory)
+
     $libraries = @(
         Get-ChildItem -LiteralPath $PackageDirectory -Recurse -Force -File -Filter 'pgl_validate.*' -ErrorAction SilentlyContinue |
             Where-Object { $_.Extension -in @('.dll', '.so', '.dylib') }
@@ -148,11 +165,174 @@ function Test-PglPackageLayout {
         throw "Package contains multiple pgl_validate shared libraries: $($libraries.FullName -join ', ')."
     }
 
-    foreach ($rootFile in @('LICENSE', 'README.md')) {
-        $path = Join-Path $PackageDirectory $rootFile
-        if (-not (Test-Path -LiteralPath $path)) {
-            throw "Package is missing $path."
+    return $libraries[0]
+}
+
+<#
+.SYNOPSIS
+Returns true when loader metadata still points at a build-time pgrx installation.
+#>
+function Test-PglBuildPathLeak {
+    param([string] $Text)
+
+    if ([string]::IsNullOrWhiteSpace($Text)) {
+        return $false
+    }
+
+    return $Text -match '(/Users/runner|/home/runner|\.pgrx|pgrx-install)'
+}
+
+<#
+.SYNOPSIS
+Rewrites macOS package load commands so libpq is resolved from the installed PostgreSQL library directory.
+#>
+function Invoke-PglMacOSPackageLoadCommandFixup {
+    param([string] $LibraryPath)
+
+    $otool = Get-PglCommandSource -Name 'otool'
+    $installNameTool = Get-PglCommandSource -Name 'install_name_tool'
+    $codesign = Get-PglCommandSource -Name 'codesign'
+    foreach ($tool in @(@{ Name = 'otool'; Path = $otool }, @{ Name = 'install_name_tool'; Path = $installNameTool }, @{ Name = 'codesign'; Path = $codesign })) {
+        if (-not $tool.Path) {
+            throw "$($tool.Name) is required to package macOS release artifacts."
         }
+    }
+
+    $changed = $false
+    $loadCommands = @(& $otool -L $LibraryPath)
+    if ($LASTEXITCODE -ne 0) {
+        throw "otool -L exited with code $LASTEXITCODE for $LibraryPath."
+    }
+
+    $libpqInstallNames = @(
+        $loadCommands |
+            Select-Object -Skip 1 |
+            ForEach-Object { ($_ -split '\s+')[0].Trim() } |
+            Where-Object { $_ -and ($_.EndsWith('/libpq.5.dylib', [StringComparison]::Ordinal) -or $_ -eq 'libpq.5.dylib') } |
+            Sort-Object -Unique
+    )
+
+    foreach ($installName in $libpqInstallNames) {
+        if ($installName -ne '@rpath/libpq.5.dylib') {
+            & $installNameTool -change $installName '@rpath/libpq.5.dylib' $LibraryPath
+            if ($LASTEXITCODE -ne 0) {
+                throw "install_name_tool -change exited with code $LASTEXITCODE for $installName."
+            }
+            $changed = $true
+        }
+    }
+
+    $dylibId = @(& $otool -D $LibraryPath)
+    if ($LASTEXITCODE -ne 0) {
+        throw "otool -D exited with code $LASTEXITCODE for $LibraryPath."
+    }
+    if (($dylibId | Select-Object -Skip 1 | Select-Object -First 1) -ne '@rpath/pgl_validate.dylib') {
+        & $installNameTool -id '@rpath/pgl_validate.dylib' $LibraryPath
+        if ($LASTEXITCODE -ne 0) {
+            throw "install_name_tool -id exited with code $LASTEXITCODE for $LibraryPath."
+        }
+        $changed = $true
+    }
+
+    $loaderMetadata = @(& $otool -l $LibraryPath)
+    if ($LASTEXITCODE -ne 0) {
+        throw "otool -l exited with code $LASTEXITCODE for $LibraryPath."
+    }
+
+    $rpaths = @(
+        $loaderMetadata |
+            Where-Object { $_ -match '^\s*path\s+(.+?)\s+\(offset\s+\d+\)' } |
+            ForEach-Object { $Matches[1] }
+    )
+    foreach ($rpath in $rpaths) {
+        if (Test-PglBuildPathLeak -Text $rpath) {
+            & $installNameTool -delete_rpath $rpath $LibraryPath
+            if ($LASTEXITCODE -ne 0) {
+                throw "install_name_tool -delete_rpath exited with code $LASTEXITCODE for $rpath."
+            }
+            $changed = $true
+        }
+    }
+
+    if ($rpaths -notcontains '@loader_path') {
+        & $installNameTool -add_rpath '@loader_path' $LibraryPath
+        if ($LASTEXITCODE -ne 0) {
+            throw "install_name_tool -add_rpath exited with code $LASTEXITCODE for $LibraryPath."
+        }
+        $changed = $true
+    }
+
+    if ($changed) {
+        & $codesign --force --sign - $LibraryPath
+        if ($LASTEXITCODE -ne 0) {
+            throw "codesign exited with code $LASTEXITCODE for $LibraryPath."
+        }
+    }
+
+    $verifiedLoadCommands = @(& $otool -L $LibraryPath)
+    if ($LASTEXITCODE -ne 0) {
+        throw "otool -L exited with code $LASTEXITCODE while verifying $LibraryPath."
+    }
+    $verifiedId = @(& $otool -D $LibraryPath)
+    if ($LASTEXITCODE -ne 0) {
+        throw "otool -D exited with code $LASTEXITCODE while verifying $LibraryPath."
+    }
+    $verifiedLoaderMetadata = @(& $otool -l $LibraryPath)
+    if ($LASTEXITCODE -ne 0) {
+        throw "otool -l exited with code $LASTEXITCODE while verifying $LibraryPath."
+    }
+
+    $verifiedText = (($verifiedLoadCommands + $verifiedId + $verifiedLoaderMetadata) -join "`n")
+    if (Test-PglBuildPathLeak -Text $verifiedText) {
+        throw "macOS package library still references a build-time pgrx path: $LibraryPath."
+    }
+    if (-not ($verifiedLoadCommands | Where-Object { $_ -match '^\s*@rpath/libpq\.5\.dylib\s+' })) {
+        throw "macOS package library does not load libpq through @rpath: $LibraryPath."
+    }
+    if (-not ($verifiedLoaderMetadata | Where-Object { $_ -match '^\s*path\s+@loader_path\s+\(offset\s+\d+\)' })) {
+        throw "macOS package library is missing @loader_path LC_RPATH: $LibraryPath."
+    }
+}
+
+<#
+.SYNOPSIS
+Verifies Linux package loader metadata does not contain build-runner paths.
+#>
+function Test-PglLinuxPackageLoadCommand {
+    param([string] $LibraryPath)
+
+    $readelf = Get-PglCommandSource -Name 'readelf'
+    if (-not $readelf) {
+        throw 'readelf is required to verify Linux release artifacts.'
+    }
+
+    $dynamicSection = @(& $readelf -d $LibraryPath)
+    if ($LASTEXITCODE -ne 0) {
+        throw "readelf -d exited with code $LASTEXITCODE for $LibraryPath."
+    }
+    $dynamicText = ($dynamicSection -join "`n")
+    if (Test-PglBuildPathLeak -Text $dynamicText) {
+        throw "Linux package library references a build-time pgrx path: $LibraryPath."
+    }
+}
+
+<#
+.SYNOPSIS
+Normalizes platform-specific shared-library metadata before archiving a package.
+#>
+function Invoke-PglPackageLoadCommandFixup {
+    param(
+        [string] $PackageDirectory,
+        [string] $PackagePlatform
+    )
+
+    $library = Get-PglPackageSharedLibrary -PackageDirectory $PackageDirectory
+    if ($PackagePlatform.StartsWith('macos-', [StringComparison]::OrdinalIgnoreCase)) {
+        Invoke-PglMacOSPackageLoadCommandFixup -LibraryPath $library.FullName
+        return
+    }
+    if ($PackagePlatform.StartsWith('linux-', [StringComparison]::OrdinalIgnoreCase)) {
+        Test-PglLinuxPackageLoadCommand -LibraryPath $library.FullName
     }
 }
 
@@ -375,6 +555,7 @@ Invoke-PglPackage -PgConfig $pgConfig -PackageDirectory $packageDirectory
 Copy-Item -LiteralPath (Join-Path $root 'LICENSE') -Destination (Join-Path $packageDirectory 'LICENSE') -Force
 Copy-Item -LiteralPath (Join-Path $root 'README.md') -Destination (Join-Path $packageDirectory 'README.md') -Force
 Test-PglPackageLayout -PackageDirectory $packageDirectory -Version $version
+Invoke-PglPackageLoadCommandFixup -PackageDirectory $packageDirectory -PackagePlatform $packagePlatform
 New-PglPackageArchive `
     -PackageDirectory $packageDirectory `
     -PackageName $packageName `
