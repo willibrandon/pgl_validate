@@ -182,7 +182,7 @@ function Test-PglBuildPathLeak {
     return $Text -match '(/Users/runner|/home/runner|\.pgrx|pgrx-install)'
 }
 
-function Get-PglMacOSDependencyInstallNames {
+function Get-PglMacOSDependencyInstallName {
     param([string[]] $LoadCommands)
 
     return @(
@@ -214,7 +214,7 @@ function Get-PglMacOSDylibId {
     return $null
 }
 
-function Get-PglMacOSRpaths {
+function Get-PglMacOSRpath {
     param([string[]] $LoaderMetadata)
 
     return @(
@@ -224,7 +224,7 @@ function Get-PglMacOSRpaths {
     )
 }
 
-function Get-PglMacOSLoadCommandValues {
+function Get-PglMacOSLoadCommandValue {
     param(
         [string[]] $LoadCommands,
         [string[]] $DylibId,
@@ -232,9 +232,9 @@ function Get-PglMacOSLoadCommandValues {
     )
 
     $values = @(
-        Get-PglMacOSDependencyInstallNames -LoadCommands $LoadCommands
+        Get-PglMacOSDependencyInstallName -LoadCommands $LoadCommands
         Get-PglMacOSDylibId -DylibId $DylibId
-        Get-PglMacOSRpaths -LoaderMetadata $LoaderMetadata
+        Get-PglMacOSRpath -LoaderMetadata $LoaderMetadata
     )
 
     return @(
@@ -267,7 +267,7 @@ function Invoke-PglMacOSPackageLoadCommandFixup {
     }
 
     $libpqInstallNames = @(
-        Get-PglMacOSDependencyInstallNames -LoadCommands $loadCommands |
+        Get-PglMacOSDependencyInstallName -LoadCommands $loadCommands |
             Where-Object { $_ -and ($_.EndsWith('/libpq.5.dylib', [StringComparison]::Ordinal) -or $_ -eq 'libpq.5.dylib') } |
             Sort-Object -Unique
     )
@@ -299,7 +299,7 @@ function Invoke-PglMacOSPackageLoadCommandFixup {
         throw "otool -l exited with code $LASTEXITCODE for $LibraryPath."
     }
 
-    $rpaths = @(Get-PglMacOSRpaths -LoaderMetadata $loaderMetadata)
+    $rpaths = @(Get-PglMacOSRpath -LoaderMetadata $loaderMetadata)
     foreach ($rpath in $rpaths) {
         if (Test-PglBuildPathLeak -Text $rpath) {
             & $installNameTool -delete_rpath $rpath $LibraryPath
@@ -338,7 +338,7 @@ function Invoke-PglMacOSPackageLoadCommandFixup {
         throw "otool -l exited with code $LASTEXITCODE while verifying $LibraryPath."
     }
 
-    $verifiedLoadCommandValues = Get-PglMacOSLoadCommandValues `
+    $verifiedLoadCommandValues = Get-PglMacOSLoadCommandValue `
         -LoadCommands $verifiedLoadCommands `
         -DylibId $verifiedId `
         -LoaderMetadata $verifiedLoaderMetadata
@@ -349,7 +349,7 @@ function Invoke-PglMacOSPackageLoadCommandFixup {
     if ($verifiedLoadCommandValues -notcontains '@rpath/libpq.5.dylib') {
         throw "macOS package library does not load libpq through @rpath: $LibraryPath."
     }
-    if ((Get-PglMacOSRpaths -LoaderMetadata $verifiedLoaderMetadata) -notcontains '@loader_path') {
+    if ((Get-PglMacOSRpath -LoaderMetadata $verifiedLoaderMetadata) -notcontains '@loader_path') {
         throw "macOS package library is missing @loader_path LC_RPATH: $LibraryPath."
     }
 }
