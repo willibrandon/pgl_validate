@@ -28,17 +28,10 @@ history is used only as report enrichment; validation does not depend on it.
 
 ## Quick Start
 
-Install with pgrx against the PostgreSQL major you want to use. Replace
-`/path/to/pg_config` with the `pg_config` for that PostgreSQL installation:
-
-```sh
-cargo pgrx install \
-  --pg-config /path/to/pg_config \
-  --no-default-features \
-  --features pg18
-```
-
-Then, in the target database:
+Install the extension for your platform and PostgreSQL major: download a release
+package from the [releases page](https://github.com/willibrandon/pgl_validate/releases),
+or build it from source (see [Development](#development)). Then, in the target
+database:
 
 ```sql
 CREATE EXTENSION pgl_validate;
@@ -93,9 +86,6 @@ FROM pgl_validate.apply_repair(
 Repair is explicit and privileged; nothing changes until you call
 `apply_repair`.
 
-On Windows, run the same command through `scripts\pgrx-vs.ps1` so bindgen sees
-the Visual Studio C++ and Windows SDK headers.
-
 ## Development
 
 Use Rust stable with `cargo-pgrx` 0.19.1.
@@ -104,6 +94,19 @@ Use Rust stable with `cargo-pgrx` 0.19.1.
 rustup default stable
 cargo install --locked cargo-pgrx --version 0.19.1
 ```
+
+Build and install against the PostgreSQL major you target, pointing
+`--pg-config` at that installation:
+
+```sh
+cargo pgrx install \
+  --pg-config /path/to/pg_config \
+  --no-default-features \
+  --features pg18
+```
+
+On Windows, run that command through `scripts\pgrx-vs.ps1` so bindgen can see
+the Visual Studio C++ and Windows SDK headers.
 
 Common checks:
 
