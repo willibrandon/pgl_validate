@@ -65,6 +65,34 @@ Two pglogical nodes may live in separate databases on the same PostgreSQL
 instance. The DSN still identifies the peer because `dbname` is part of the
 endpoint.
 
+When a comparison reports differences, `generate_repair` renders the confirmed
+divergences as SQL keyed to whichever node you treat as authoritative (`local`
+is the database you are connected to), so you can read them before anything
+runs:
+
+```sql
+SELECT pgl_validate.generate_repair(run_id => 42, authoritative => 'local');
+```
+
+`apply_repair` runs that same set against the target and re-validates in the
+same call. It writes under its own replication origin so the change stays on the
+target, touches only the keys the run already confirmed, and never modifies the
+authoritative node. `confirm` must equal `target`, a deliberate guard against
+repairing the wrong database:
+
+```sql
+SELECT *
+FROM pgl_validate.apply_repair(
+    run_id        => 42,
+    authoritative => 'local',
+    target        => 'node_beta',
+    confirm       => 'node_beta'
+);
+```
+
+Repair is explicit and privileged; nothing changes until you call
+`apply_repair`.
+
 On Windows, run the same command through `scripts\pgrx-vs.ps1` so bindgen sees
 the Visual Studio C++ and Windows SDK headers.
 
