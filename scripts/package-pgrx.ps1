@@ -182,6 +182,68 @@ function Test-PglBuildPathLeak {
     return $Text -match '(/Users/runner|/home/runner|\.pgrx|pgrx-install)'
 }
 
+function Get-PglMacOSDependencyInstallNames {
+    param([string[]] $LoadCommands)
+
+    return @(
+        $LoadCommands |
+            Select-Object -Skip 1 |
+            ForEach-Object {
+                $line = $_.Trim()
+                if (-not [string]::IsNullOrWhiteSpace($line)) {
+                    ($line -split '\s+', 2)[0]
+                }
+            } |
+            Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    )
+}
+
+function Get-PglMacOSDylibId {
+    param([string[]] $DylibId)
+
+    $id = $DylibId |
+        Select-Object -Skip 1 |
+        ForEach-Object { $_.Trim() } |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+        Select-Object -First 1
+
+    if (-not [string]::IsNullOrWhiteSpace($id)) {
+        return $id
+    }
+
+    return $null
+}
+
+function Get-PglMacOSRpaths {
+    param([string[]] $LoaderMetadata)
+
+    return @(
+        $LoaderMetadata |
+            Where-Object { $_ -match '^\s*path\s+(.+?)\s+\(offset\s+\d+\)' } |
+            ForEach-Object { $Matches[1] }
+    )
+}
+
+function Get-PglMacOSLoadCommandValues {
+    param(
+        [string[]] $LoadCommands,
+        [string[]] $DylibId,
+        [string[]] $LoaderMetadata
+    )
+
+    $values = @(
+        Get-PglMacOSDependencyInstallNames -LoadCommands $LoadCommands
+        Get-PglMacOSDylibId -DylibId $DylibId
+        Get-PglMacOSRpaths -LoaderMetadata $LoaderMetadata
+    )
+
+    return @(
+        $values |
+            Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+            Sort-Object -Unique
+    )
+}
+
 <#
 .SYNOPSIS
 Rewrites macOS package load commands so libpq is resolved from the installed PostgreSQL library directory.
@@ -205,9 +267,7 @@ function Invoke-PglMacOSPackageLoadCommandFixup {
     }
 
     $libpqInstallNames = @(
-        $loadCommands |
-            Select-Object -Skip 1 |
-            ForEach-Object { ($_ -split '\s+')[0].Trim() } |
+        Get-PglMacOSDependencyInstallNames -LoadCommands $loadCommands |
             Where-Object { $_ -and ($_.EndsWith('/libpq.5.dylib', [StringComparison]::Ordinal) -or $_ -eq 'libpq.5.dylib') } |
             Sort-Object -Unique
     )
@@ -239,11 +299,7 @@ function Invoke-PglMacOSPackageLoadCommandFixup {
         throw "otool -l exited with code $LASTEXITCODE for $LibraryPath."
     }
 
-    $rpaths = @(
-        $loaderMetadata |
-            Where-Object { $_ -match '^\s*path\s+(.+?)\s+\(offset\s+\d+\)' } |
-            ForEach-Object { $Matches[1] }
-    )
+    $rpaths = @(Get-PglMacOSRpaths -LoaderMetadata $loaderMetadata)
     foreach ($rpath in $rpaths) {
         if (Test-PglBuildPathLeak -Text $rpath) {
             & $installNameTool -delete_rpath $rpath $LibraryPath
@@ -282,14 +338,18 @@ function Invoke-PglMacOSPackageLoadCommandFixup {
         throw "otool -l exited with code $LASTEXITCODE while verifying $LibraryPath."
     }
 
-    $verifiedText = (($verifiedLoadCommands + $verifiedId + $verifiedLoaderMetadata) -join "`n")
-    if (Test-PglBuildPathLeak -Text $verifiedText) {
-        throw "macOS package library still references a build-time pgrx path: $LibraryPath."
+    $verifiedLoadCommandValues = Get-PglMacOSLoadCommandValues `
+        -LoadCommands $verifiedLoadCommands `
+        -DylibId $verifiedId `
+        -LoaderMetadata $verifiedLoaderMetadata
+    $leakedLoadCommandValues = @($verifiedLoadCommandValues | Where-Object { Test-PglBuildPathLeak -Text $_ })
+    if ($leakedLoadCommandValues.Count -gt 0) {
+        throw "macOS package library still references build-time pgrx path(s) in load command values for $LibraryPath`: $($leakedLoadCommandValues -join ', ')."
     }
-    if (-not ($verifiedLoadCommands | Where-Object { $_ -match '^\s*@rpath/libpq\.5\.dylib\s+' })) {
+    if ($verifiedLoadCommandValues -notcontains '@rpath/libpq.5.dylib') {
         throw "macOS package library does not load libpq through @rpath: $LibraryPath."
     }
-    if (-not ($verifiedLoaderMetadata | Where-Object { $_ -match '^\s*path\s+@loader_path\s+\(offset\s+\d+\)' })) {
+    if ((Get-PglMacOSRpaths -LoaderMetadata $verifiedLoaderMetadata) -notcontains '@loader_path') {
         throw "macOS package library is missing @loader_path LC_RPATH: $LibraryPath."
     }
 }
