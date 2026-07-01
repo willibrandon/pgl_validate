@@ -2,4 +2,5 @@ comment = 'Cross-node data validation for pglogical and logical replication'
 default_version = '0.1.0'
 module_pathname = '$libdir/pgl_validate'
 relocatable = false
+schema = pgl_validate
 superuser = false

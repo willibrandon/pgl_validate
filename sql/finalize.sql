@@ -1,6 +1,3 @@
-COMMENT ON SCHEMA pgl_validate IS
-    'Cross-node data validation objects for pglogical-first replication topologies.';
-
 COMMENT ON TABLE pgl_validate.peer IS
     'Named connection targets, replication-set metadata, and remote-query timeouts used by the coordinator when resolving peers.';
 COMMENT ON COLUMN pgl_validate.peer.reverse_subscription_name IS

@@ -6,6 +6,11 @@ SELECT 'extension' AS subject, extversion
 FROM pg_extension
 WHERE extname = 'pgl_validate';
 
+SELECT e.extname, n.nspname AS extension_schema
+FROM pg_extension e
+JOIN pg_namespace n ON n.oid = e.extnamespace
+WHERE e.extname = 'pgl_validate';
+
 SELECT p.proname,
        p.prokind,
        oidvectortypes(p.proargtypes) AS args,
@@ -51,12 +56,6 @@ WHERE table_schema = 'pgl_validate'
 ORDER BY table_name;
 
 WITH documented_object(kind, identity, description) AS (
-    SELECT 'schema',
-           n.nspname,
-           obj_description(n.oid, 'pg_namespace')
-    FROM pg_namespace n
-    WHERE n.nspname = 'pgl_validate'
-    UNION ALL
     SELECT CASE c.relkind WHEN 'r' THEN 'table' WHEN 'v' THEN 'view' WHEN 'S' THEN 'sequence' ELSE c.relkind::text END,
            c.relname,
            obj_description(c.oid, 'pg_class')

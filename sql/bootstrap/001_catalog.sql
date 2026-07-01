@@ -1,5 +1,3 @@
-CREATE SCHEMA IF NOT EXISTS pgl_validate;
-
 CREATE TABLE pgl_validate.peer (
     name                    text PRIMARY KEY,
     dsn                     text NOT NULL,

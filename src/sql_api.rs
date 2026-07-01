@@ -43,7 +43,6 @@ fn last_commit_lsn() -> i64 {
     unsafe { pg_sys::XactLastCommitEnd as i64 }
 }
 
-#[pg_schema]
 mod pgl_validate {
     use super::digest;
     use super::transport;

@@ -66,11 +66,6 @@ $sqlFiles += Get-ChildItem -LiteralPath (Join-Path $workspace 'src') -Filter '*.
 
 $sqlObjectPatterns = @(
     @{
-        Kind = 'SCHEMA'
-        CreatePattern = '(?im)^\s*CREATE\s+SCHEMA(?:\s+IF\s+NOT\s+EXISTS)?\s+pgl_validate\b'
-        NamePattern = { 'pgl_validate' }
-    },
-    @{
         Kind = 'TABLE'
         CreatePattern = '(?im)^\s*CREATE\s+TABLE\s+pgl_validate\.([a-zA-Z_][a-zA-Z0-9_]*)\b'
         NamePattern = { param($match) "pgl_validate.$($match.Groups[1].Value)" }
